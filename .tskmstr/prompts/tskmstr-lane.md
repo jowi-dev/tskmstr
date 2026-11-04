@@ -14,9 +14,16 @@ beyond the named ticket.
      unblock it.
 2. Work only `<KEY>`. If you discover unrelated bugs or cleanup along the
    way, note them (a follow-up ticket, a TODO) instead of fixing them here.
+3. Before reading code, run thatch `memory_recall` for `<KEY>`, for the
+   area it touches, and for this lane's branch name. Prior sessions may
+   already have investigated it.
 
 ## Workflow
 
+- Investigate with the `thatch-code-archaeology` skill, then plan and
+  keep a checklist with the `thatch-coding-workflow` skill.
+- Write work-in-progress notes (decisions, gotchas, status) as thatch
+  memories scoped to this lane's branch.
 - Test-driven: write a failing test before writing the implementation that
   makes it pass, for every behavior change.
 - Keep commits small and focused, one logical change per commit, imperative
@@ -46,7 +53,13 @@ git push -u origin HEAD
 tm pr create --title "<KEY>: <short summary>" --body "<what changed and why>"
 ```
 
+- Draft the `--body` with the `thatch-pr-description` skill.
 - If `tm ready` returned `3` (stackable), add `--base <blocking PR's branch>`.
 - Do not end the session without a PR URL. If `tm pr create` fails, retry
   once, then report the exact error in your final message.
 - Include the PR URL in your final message.
+
+## Wrap up
+
+Before the final message, record what this session learned with the
+`thatch-session-reflection` skill.

@@ -57,10 +57,23 @@ runner's built-in default model (`opus` for claude,
 leaves the key unset, and runs then resolve their model through the rest of
 the chain described in "Which model a launch uses".
 
-The scaffolded lane prompt is a generic skeleton, so after everything is
-written the wizard offers to launch an agent-assisted setup session
-(GitHub issue #30): an interactive session, in the repo root, prompted to
-explore the repo, verify the build/test/lint/format gates that actually
+The scaffolded lane prompt gives lane runs the same thatch session shape
+the create, audit and review prompts have (GitHub issue #205): recall
+project and branch-scoped memory for the ticket before reading code,
+investigate with the `thatch-code-archaeology` skill and plan with
+`thatch-coding-workflow`, keep work-in-progress notes as memories scoped
+to the lane's branch, draft the `tm pr create` body with
+`thatch-pr-description`, and record what the session learned with
+`thatch-session-reflection` before the final message. There is no
+self-review step: `/thatch:self-review` is interactive, and the post-PR
+review loop covers review. `tm check` reports any of those skills that
+isn't installed. Existing lane prompts are never rewritten, so a repo
+onboarded earlier adopts the steps by hand or through the setup session.
+
+Beyond that, the scaffolded lane prompt is a generic skeleton, so after
+everything is written the wizard offers to launch an agent-assisted setup
+session (GitHub issue #30): an interactive session, in the repo root,
+prompted to explore the repo, verify the build/test/lint/format gates that actually
 exist here, fill the scaffolded lane and thatch session prompts out in
 place, and author any session skills the config references but that exist
 nowhere on disk —
@@ -101,7 +114,8 @@ the read-only counterpart: it reports whether a repo already onboarded by
 newer than this binary expects) and the same structural presence checks
 `tm init` re-runs on every visit — a configured lane's missing prompt
 file, a lane whose `subagent` key names a definition that doesn't exist,
-a configured session's missing skill, a relative `prompt_file` still
+a configured session's missing skill, a skill a lane prompt names (as
+"the `name` skill") that isn't installed, a relative `prompt_file` still
 pointing at the legacy top-level `prompts/` directory instead of the
 canonical `.tskmstr/prompts/`. It also names every expected config key
 (registered in `src/config/manifest.rs`'s `EXPECTED_CONFIG_KEYS`) that is
@@ -113,7 +127,8 @@ with no safe default for the repo's backend (Jira's workflow status names
 are the board's own) isn't reported. It never writes anything and
 never diffs a scaffolded asset's *content*: lane prompts and skills are
 meant to be edited after `tm init` writes them, so only their presence is
-checked (see `docs/decisions/0007-asset-schema-version.md`).
+checked (a lane prompt is read only to learn which skills it names; see
+`docs/decisions/0007-asset-schema-version.md`).
 
 When any configured prompt names a thatch skill (a `thatch-<name>` token
 or a `/thatch:<name>` command in a lane prompt file, or in the
@@ -235,7 +250,7 @@ tm auth status
 | `tm ticket search <TEXT>` | Search the configured default project for open (non-`Done`) tickets matching `<TEXT>`, most recently updated first |
 | `tm ready [--json]` | List your To Do tickets in rank order, each marked ready, stackable (on which branch), needs audit, waiting (on a blocker's live lane run), or blocked (and why), with how many others each unblocks; `--json` for scripts |
 | `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready, stackable, not audited, waiting, or blocked. Exits `0` (ready), `3` (stackable), `4` (not audited), or `1` (waiting/blocked/error) |
-| `tm graph [EPIC] [--json \| --mermaid]` | Show the epic unlock graph: every open epic (plus Done epics linked to one) with its `(done/total)` child progress and which epics it unlocks or is unlocked by. Record "A unlocks B" with `tm ticket link A --blocks B`. `EPIC` scopes it to the epics connected to that one; `--json` prints the versioned document described in [docs/graph-format.md](docs/graph-format.md), `--mermaid` a flowchart. Unlocks cycles warn on stderr and still exit `0` |
+| `tm graph [EPIC] [--json \| --mermaid \| --html]` | Show the epic unlock graph: every open epic (plus Done epics linked to one) with its `(done/total)` child progress and which epics it unlocks or is unlocked by. Record "A unlocks B" with `tm ticket link A --blocks B`. `EPIC` scopes it to the epics connected to that one; `--json` prints the versioned document described in [docs/graph-format.md](docs/graph-format.md), `--mermaid` a flowchart, and `--html` a self-contained page that colors each epic by availability and shows its child progress (`tm graph --html > plan.html` to share it; it needs no network). Unlocks cycles warn on stderr and still exit `0` |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
@@ -272,7 +287,7 @@ tm auth status
 | `tm work start [<dir>]` | Attach to (or create) the tmux session for `<dir>`, defaulting to `cwd` |
 | `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<scope>-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
-| `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
+| `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch. The agent triages the comments with `thatch-review-response`, fixes the ones that hold up, declines the rest with a one-line reason, and posts nothing to GitHub; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
 | `tm review auto <KEY> [--foreground]` | Run thatch auto-review rounds over `<KEY>`'s lane-run branch: each round is an interactive `auto-review` run in a `review` window of the ticket's `tm-<scope>-<key>` session (`review-2` for round 2). Its confirmed findings are appended to the worktree's vdiff comment store, and findings at or above `[work.auto_review].fix_threshold` start an interactive `tm review fix` pass in a `fix` / `fix-N` window. The loop waits for each step's signal file for up to `round_timeout_mins` and leaves the windows open. Stops on a clean round, or flags the round for review at `max_review_rounds` or when a step never signals. Detaches by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`; see "Auto-review" below |
 | `tm review import <KEY> [--fix]` | Import the unresolved human review threads on `<KEY>`'s PR into the worktree's vdiff comment store, once each, skipping review bots and comments tm or vdiff posted. `--fix` then runs `tm review fix <KEY> --fg` unless the ticket is at `[dispatch] max_fix_rounds`; see "Importing a GitHub review" below |
 
@@ -1472,6 +1487,11 @@ status. Tickets without a parent epic render without either line, and
 their cards keep their usual height. If the epics can't be loaded, the
 board still loads, without epic lines, and the status line says why.
 
+Epics themselves never appear as cards on the ticket board, under any
+assignee filter: nobody works an epic directly, so the board, the priority
+view, `tm ready`, and `tm dispatch` all leave them out. Press `E` to see and
+move them in the epics view instead; see "The epics view" below.
+
 | Key | Action |
 |---|---|
 | `j` / `Down` | Move selection down |
@@ -1483,6 +1503,8 @@ board still loads, without epic lines, and the status line says why.
 | `r` | Refresh from Jira |
 | `o` | Open the selected ticket in the browser |
 | `f` | Open the assignee filter picker (board only) |
+| `E` | Switch between the ticket board and the epics view (board only); see "The epics view" below |
+| `e` | Open the epic filter picker; see "Filtering the board by epic" below (board only) |
 | `i` / `/` | Start searching the board's cards; see "Searching the board" below (board only) |
 | `A` | Open the assign picker for the selected ticket (board only) |
 | `p` | Open the priority (stack-rank) view (board only) |
@@ -1512,6 +1534,43 @@ cached for the rest of the session). `j`/`k` navigate the list, `Enter`
 applies the highlighted filter and refetches the board, `Esc`/`q` closes the
 picker without changing anything. The currently active filter is marked with
 a leading `*`.
+
+### The epics view
+
+Pressing `E` on the board swaps its cards for every open epic in
+`default_project_key` (Jira issues of the `epic_issue_type`, GitHub issues
+labeled `tm:epic`), in the same status columns. The status line reads
+`View: Epics`. `h`/`j`/`k`/`l`, `Enter`, the "Move to" transition window,
+`r`, `o`, and search all work as they do on tickets, so moving an epic as
+its children finish is the same as moving a ticket. Done epics are hidden,
+the same way the board hides done tickets; `tm graph` still shows them.
+
+Keys that only make sense on a workable ticket do nothing in the epics view
+except set a status-line message: `w` (lane run), `m` (manual session), `a`
+(audit), `M` and `Space` (merge), and `f` and `e` (the assignee and epic
+filters do not apply to epics). Press `E` again to return to the ticket
+board under the assignee and epic filters you left it with.
+
+### Filtering the board by epic
+
+Pressing `e` on the board opens a floating picker listing `All epics`, `No
+epic`, and each epic that the loaded cards belong to, shown as `KEY  Title`
+and sorted by key. `j`/`k` navigate, `Enter` applies the highlighted choice,
+`Esc`/`q` closes the picker without changing anything. The active choice is
+marked with a leading `*`.
+
+Choosing an epic narrows every column to that epic's child cards; `No epic`
+shows only cards with no parent, and `All epics` clears the filter. Columns
+keep their order and stay on screen when empty, every column title reads
+`shown/total` while the filter is applied, and the status line shows `Epic:
+KEY  Title`.
+
+Like the search, the epic filter works on the cards the board has already
+loaded, so it combines with the `f` assignee filter and the `i`/`/` search
+and survives `r` refreshes and `f` refetches. The picker only offers epics
+with at least one loaded card. The one exception is the active epic: if a
+refetch leaves it with no cards, the board shows empty columns and the
+picker keeps the epic listed, rather than clearing the filter.
 
 ### Searching the board
 
@@ -1817,6 +1876,18 @@ passes `--model`, so an enterprise-managed claude model pin never applies.
 Since an audit is where digging quality matters most, it is worth setting
 deliberately.
 
+The audit's investigation step is `/thatch:refine` run on the ticket's
+PROPOSED APPROACH, so the approach's premises are checked against the code
+before a lane runs it (GitHub issue #206). The `.tskmstr/prompts/audit.md`
+scaffold `tm init` writes carries this step. The plain default prompt,
+`/ticket-audit {key}`, does not name refine, because tm only checks that the
+prompt's leading skill is installed and refine comes from the thatch plugin.
+The audit still checks links, blockers and lane size itself, writes refine's
+revisions back to the ticket body, and only then records a verdict with `tm
+ticket audit <KEY> --record`. If you use your own `ticket-audit` skill, add a
+`/thatch:refine` step on the ticket's PROPOSED APPROACH so the default or a
+custom `prompt` gets the same investigation.
+
 Each card with a live `audit` window (or a live audit run) shows a badge:
 `audit: starting` (window up, run not registered yet), `audit: running`, `audit:
 waiting` (bold yellow — Claude stopped or asked a question and is waiting
@@ -2024,7 +2095,14 @@ Pressing `F` dispatches `tm review fix <KEY>` as a watched-child launch, the
 same shape as `w`/`b`: `tm review fix` resolves the ticket's lane run,
 renders its captured `vdiff` comments via `vdiff --export-comments`, and
 dispatches a tracked run in the ticket's existing worktree and branch — no
-new worktree, no new branch. The pass itself runs interactively in a `fix`
+new worktree, no new branch. The agent does not fix every comment blindly:
+it triages them with thatch's `thatch-review-response` skill (legitimate,
+intentional, false positive, unlikely edge case), merges comments that share
+a root cause, fixes and commits the legitimate ones, and ends with each
+comment's outcome: fixed, declined with a one-line reason, or merged with
+another. It uses only the skill's triage and fix steps: it never replies to
+a review thread or posts a summary comment, since vdiff owns the comment
+state. The pass itself runs interactively in a `fix`
 window of the ticket's `tm-<scope>-<key>` session (`fix-2` for a second pass), so
 `tmux attach -t tm-<scope>-<key>` shows it alongside the ticket's other actions. Its run rows
 use `kind = "review-fix"`, so they never shadow the lane run and show up
@@ -2060,9 +2138,13 @@ worktree's vdiff comment store, `<git-dir>/vdiff/comments.json`. Each round:
 5. Otherwise starts an interactive `tm review fix <KEY>` pass in a `fix`
    window (`fix-2` for round 2). The pass is done once the agent writes
    `<git-dir>/vdiff/auto-review/fix-<loop>-<round>.done`, holding
-   `{"succeeded": true}` or `{"succeeded": false}`. Then tm moves the
+   `{"succeeded": true}` or `{"succeeded": false}`, plus a `declined`
+   array of `{"comment": "<path:start-end>", "reason": "..."}` for each
+   comment the pass triaged as not needing a change. Then tm moves the
    consumed store to `<git-dir>/vdiff/archive/<round>.json` so the next
-   round never re-reads comments with stale line anchors.
+   round never re-reads comments with stale line anchors. The next round's
+   prompt lists the declines with their reasons, so `thatch-review-followup`
+   checks each reason instead of re-reporting the finding as unaddressed.
 
 **The windows are yours to watch and steer.** Attach to the ticket's
 session to read a round or type into it. The loop does not wait for claude
@@ -2133,7 +2215,7 @@ so the badge stays at `needs you` until another round runs.
 
 The prompt is rendered per round with `{key}`, `{round}`, `{skill}`,
 `{findings_file}`, `{archive}` and `{prior}` (a sentence pointing a
-follow-up round at the archive). With `auto = true`, a `tm pr watch` that
+follow-up round at the archive, then the previous fix pass's declines). With `auto = true`, a `tm pr watch` that
 finds every bot done with nothing unresolved launches `tm review auto` for
 the ticket. A watch that hands off to a bugbot cleanup session does not
 chain, because tm can't see that interactive session finish.

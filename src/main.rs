@@ -221,7 +221,8 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             epic,
             json,
             mermaid,
-        } => run_graph(epic, json, mermaid, &paths, &keychain, env_token),
+            html,
+        } => run_graph(epic, json, mermaid, html, &paths, &keychain, env_token),
         Command::Board => run_board(&paths, &keychain, env_token),
         Command::Overview => run_overview(),
         Command::Runs {
@@ -2216,13 +2217,14 @@ fn run_ready(
 }
 
 /// `tm graph [EPIC]`: build the configured backend's provider and run
-/// [`tskmstr::cli::graph::run`] against stdout and stderr. `json` and
-/// `mermaid` pick the output format (clap keeps them exclusive); neither
-/// means text.
+/// [`tskmstr::cli::graph::run`] against stdout and stderr. `json`,
+/// `mermaid`, and `html` pick the output format (clap keeps them
+/// exclusive); none means text.
 fn run_graph(
     epic: Option<String>,
     json: bool,
     mermaid: bool,
+    html: bool,
     paths: &ConfigPaths,
     keychain: &dyn KeychainStore,
     env_token: Option<String>,
@@ -2234,6 +2236,8 @@ fn run_graph(
         tskmstr::cli::graph::GraphFormat::Json
     } else if mermaid {
         tskmstr::cli::graph::GraphFormat::Mermaid
+    } else if html {
+        tskmstr::cli::graph::GraphFormat::Html
     } else {
         tskmstr::cli::graph::GraphFormat::Text
     };

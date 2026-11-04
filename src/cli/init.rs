@@ -278,7 +278,7 @@ pub fn run_init(
         SessionSection {
             table: "create",
             question: "Configure ticket create sessions ([work.create], the board's `c` key)?",
-            default_prompt: "/ticket-create",
+            default_prompt: ctx.runner.default_create_prompt(),
             prompt_file_name: "create",
             thatch_template: CREATE_THATCH_TEMPLATE,
             dir_fallback_to_audit: false,
@@ -286,7 +286,7 @@ pub fn run_init(
         SessionSection {
             table: "review_watch",
             question: "Configure review-watch sessions ([work.review_watch])?",
-            default_prompt: "/bugbot-triage {key} {findings_file}",
+            default_prompt: ctx.runner.default_cleanup_prompt_template(),
             prompt_file_name: "review",
             thatch_template: REVIEW_THATCH_TEMPLATE,
             dir_fallback_to_audit: true,
@@ -294,7 +294,7 @@ pub fn run_init(
         SessionSection {
             table: "audit",
             question: "Configure ticket audit sessions ([work.audit], the board's `a` key)?",
-            default_prompt: "/ticket-audit {key}",
+            default_prompt: ctx.runner.default_audit_prompt_template(),
             prompt_file_name: "audit",
             thatch_template: AUDIT_THATCH_TEMPLATE,
             dir_fallback_to_audit: false,
@@ -550,8 +550,9 @@ fn setup_session_prompt(tasks: &SetupTasks) -> String {
         }
         prompt.push_str(
             "\nKeep the skeleton's shape — single-ticket scope, run `tm ready <KEY>` \
-             first and stop when blocked, test-driven changes, small imperative-mood \
-             commits — and replace the placeholder \"Before finishing\" comment with \
+             first and stop when blocked, the thatch recall, archaeology, \
+             PR-description and reflection steps, test-driven changes, small \
+             imperative-mood commits — and replace the placeholder \"Before finishing\" comment with \
              the verified gate commands in the order a run must leave them green.\n",
         );
     }
@@ -709,15 +710,21 @@ without `--audited` and it waits for `tm ticket audit`.
      project-specific detail the create session should know. -->
 ";
 
-/// Thatch scaffold for `[work.audit]`: recall memory for `{key}`, audit with
-/// the `thatch-ticket-description` skill, write findings back, leave repo
-/// context. `{key}` is substituted at launch.
+/// Thatch scaffold for `[work.audit]`: recall memory for `{key}`, run
+/// `/thatch:refine` on the ticket's PROPOSED APPROACH, check what refine does
+/// not (links, blockers, lane size), write refine's revisions back to the
+/// ticket body, then record the verdict (GitHub issue #206). `{key}` is
+/// substituted at launch.
 const AUDIT_THATCH_TEMPLATE: &str = "\
 # Audit ticket {key}
 
-Audit ticket {key}: check that its description still matches reality and is
-actionable. Keep the ticket body human-readable; keep detailed findings in
-thatch memory.
+Audit ticket {key}: check that its description still matches reality, that
+its proposed approach holds up against the code, and that a headless lane run
+can carry it out without a human. Keep the ticket body human-readable; keep
+detailed findings in thatch memory.
+
+Start with `tm ticket audit {key}` to read the ticket, its links, and its last
+audit.
 
 ## Recall thatch memory first
 
@@ -726,10 +733,29 @@ plans, decisions, and related tickets — so the audit is grounded in what the
 project already knows. The `thatch-code-archaeology` skill helps when the ticket
 touches unfamiliar code.
 
-## Audit with the thatch skill
+## Refine the proposed approach
 
-Use the `thatch-ticket-description` skill to judge the description against
-reality and rewrite it where it has drifted, without inventing requirements.
+Run `/thatch:refine` on the ticket's PROPOSED APPROACH section as the plan to
+refine. Use refine as it is; do not change how it works. It checks the plan's
+premises against the code and revises the plan until its reviewer agrees.
+
+## Check what refine does not
+
+Refine does not check links, blockers, or lane size, and the verdict depends on
+them. Confirm the ticket's links and blockers are right, and that one lane run
+can finish it. Ask the user about any gap you cannot close from the code.
+
+## Write the ticket back
+
+Use the `thatch-ticket-description` skill to write refine's revisions back to
+the ticket body, along with anything else that has drifted, without inventing
+requirements. Do this before recording a verdict: a `ready` verdict needs the
+revised body on the ticket.
+
+## Record the verdict
+
+Record the verdict with `tm ticket audit {key} --record ready` or
+`tm ticket audit {key} --record needs-work --notes \"<why>\"`.
 
 ## Write findings back to thatch memory
 
@@ -847,7 +873,8 @@ struct SessionSection {
     /// The confirm question enabling the section.
     question: &'static str,
     /// The prompt the section runs when none is configured, whose leading
-    /// `/skill` is checked for existence.
+    /// `/skill` is checked for existence. It is the agent runner's default,
+    /// so it matches what a launch actually uses.
     default_prompt: &'static str,
     /// Stem of the thatch prompt file scaffolded under `.tskmstr/prompts/`
     /// (e.g. `"create"`, `"review"`, `"audit"`).
@@ -1682,26 +1709,43 @@ pub(crate) fn resolve_repo_relative(value: &str, repo_dir: &Path, home: &Path) -
 /// missing.
 pub(crate) fn lane_prompt_template(lane: &str) -> String {
     format!(
-        "# {lane} work lane\n\
-         \n\
-         Autonomous work session for a single ticket in this repository. Do\n\
-         not scope-creep beyond the named ticket.\n\
-         \n\
-         ## Start\n\
-         \n\
-         1. Run `tm ready <KEY>` and stop if it reports the ticket blocked.\n\
-         2. Work only `<KEY>`. Note unrelated bugs or cleanup as follow-ups\n\
-            instead of fixing them here.\n\
-         \n\
-         ## Workflow\n\
-         \n\
-         - Write a failing test before the implementation that makes it pass.\n\
-         - Keep commits small and focused, one logical change per commit.\n\
-         \n\
-         ## Before finishing\n\
-         \n\
-         <!-- List the checks a run must leave green, e.g. your formatter,\n\
-              linter, and test suite. -->\n"
+        r#"# {lane} work lane
+
+Autonomous work session for a single ticket in this repository. Do
+not scope-creep beyond the named ticket.
+
+## Start
+
+1. Run `tm ready <KEY>` and stop if it reports the ticket blocked.
+2. Work only `<KEY>`. Note unrelated bugs or cleanup as follow-ups
+   instead of fixing them here.
+3. Before reading code, run thatch `memory_recall` for `<KEY>`, for the
+   area it touches, and for this lane's branch name. Prior sessions may
+   already have investigated it.
+
+## Workflow
+
+- Investigate with the `thatch-code-archaeology` skill, then plan and
+  keep a checklist with the `thatch-coding-workflow` skill.
+- Write work-in-progress notes (decisions, gotchas, status) as thatch
+  memories scoped to this lane's branch.
+- Write a failing test before the implementation that makes it pass.
+- Keep commits small and focused, one logical change per commit.
+
+## Before finishing
+
+<!-- List the checks a run must leave green, e.g. your formatter,
+     linter, and test suite. -->
+
+## Open the pull request
+
+Draft the `tm pr create` body with the `thatch-pr-description` skill.
+
+## Wrap up
+
+Before the final message, record what this session learned with the
+`thatch-session-reflection` skill.
+"#
     )
 }
 
@@ -2480,6 +2524,52 @@ mod tests {
         let prompt_path = repo_dir.join(".tskmstr/prompts/repo-lane.md");
         let template = std::fs::read_to_string(&prompt_path).expect("starter prompt scaffolded");
         assert!(template.contains("work lane"), "template body: {template}");
+        assert_thatch_steps(&template);
+    }
+
+    /// The five thatch steps GitHub issue #205 adds to the starter lane
+    /// prompt: recall, archaeology + plan, branch-scoped notes, PR
+    /// description, reflect.
+    fn assert_thatch_steps(template: &str) {
+        for step in [
+            "memory_recall",
+            "`thatch-code-archaeology` skill",
+            "`thatch-coding-workflow` skill",
+            "scoped to this lane's branch",
+            "`thatch-pr-description` skill",
+            "`thatch-session-reflection` skill",
+        ] {
+            assert!(template.contains(step), "missing `{step}` in: {template}");
+        }
+    }
+
+    #[test]
+    fn lane_prompt_template_names_the_thatch_steps_in_order() {
+        let template = lane_prompt_template("widget");
+        assert_thatch_steps(&template);
+        let position = |needle: &str| template.find(needle).expect(needle);
+        assert!(position("memory_recall") < position("thatch-code-archaeology"));
+        assert!(position("thatch-coding-workflow") < position("thatch-pr-description"));
+        assert!(position("thatch-pr-description") < position("thatch-session-reflection"));
+        assert!(
+            !template.contains("self-review"),
+            "self-review is interactive and stays out of lanes: {template}"
+        );
+    }
+
+    #[test]
+    fn every_skill_the_lane_template_names_is_one_tm_check_resolves() {
+        // `tm check` flags a lane prompt's named skills that aren't
+        // installed; a skill phrased any other way would slip past it.
+        assert_eq!(
+            crate::cli::check::named_skills(&lane_prompt_template("widget")),
+            vec![
+                "thatch-code-archaeology",
+                "thatch-coding-workflow",
+                "thatch-pr-description",
+                "thatch-session-reflection",
+            ]
+        );
     }
 
     #[test]
@@ -3557,6 +3647,25 @@ mod tests {
         assert!(
             audit.contains("## Repo-specific context"),
             "audit.md must have the context marker: {audit}"
+        );
+        // GitHub issue #206: refine runs on the ticket's approach, and its
+        // revisions reach the ticket body before the verdict is recorded.
+        let refine = audit
+            .find("/thatch:refine")
+            .unwrap_or_else(|| panic!("audit.md must run /thatch:refine: {audit}"));
+        assert!(
+            audit.contains("PROPOSED APPROACH"),
+            "audit.md must aim refine at the ticket's approach: {audit}"
+        );
+        let write_back = audit
+            .find("write refine's revisions back")
+            .unwrap_or_else(|| panic!("audit.md must write refine's revisions back: {audit}"));
+        let verdict = audit
+            .find("tm ticket audit {key} --record")
+            .unwrap_or_else(|| panic!("audit.md must record the verdict: {audit}"));
+        assert!(
+            refine < write_back && write_back < verdict,
+            "refine, then write-back, then verdict: {audit}"
         );
 
         // review.md: thatch memory recall + write-back + thatch-review-* skills
