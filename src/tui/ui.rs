@@ -19,6 +19,7 @@ use ratatui::widgets::{
 };
 
 use crate::agent::AgentRunner;
+use crate::blocker_stacking::Readiness;
 use crate::cli::runs::format_age;
 use crate::runs::overview::{LIFECYCLE_COLUMNS, Stage};
 use crate::runs::system::SystemHeader;
@@ -1781,6 +1782,7 @@ fn draw_detail_window(frame: &mut Frame, app: &App) {
                     Span::raw(format!("{}  {}", epic.key, epic.summary)),
                 ]));
             }
+            lines.extend(readiness_lines(&ticket.readiness));
             lines.push(Line::from(Span::styled(ticket.url.clone(), theme::DIM)));
             lines.push(Line::from(""));
             // `split('\n')`, not `.lines()`: a trailing blank line in the
@@ -1806,6 +1808,33 @@ fn draw_detail_window(frame: &mut Frame, app: &App) {
         .wrap(Wrap { trim: false })
         .scroll((app.detail_scroll, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// The detail overlay's `Readiness:` line: why the card carries its marker
+/// (GitHub issue #193), in `tm ready`'s words. A needs-audit ticket gets a
+/// second line naming the two board keys that clear the gate.
+fn readiness_lines(readiness: &Readiness) -> Vec<Line<'static>> {
+    let text = match readiness {
+        Readiness::Ready => "ready".to_string(),
+        Readiness::Stackable { blocker_key } => format!("stackable on {blocker_key}'s PR"),
+        Readiness::NeedsAudit { reason } => format!("needs audit ({reason})"),
+        Readiness::Blocked { .. } => format!(
+            "blocked by {}",
+            readiness.blocker_labels().unwrap_or_default().join(", ")
+        ),
+        Readiness::Unknown => "unknown (blockers could not be checked)".to_string(),
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Readiness: ", theme::SECTION_HEADER),
+        Span::styled(text, theme::readiness_style(readiness)),
+    ])];
+    if matches!(readiness, Readiness::NeedsAudit { .. }) {
+        lines.push(Line::from(Span::styled(
+            "  a audit session, Y mark audited",
+            theme::DIM,
+        )));
+    }
+    lines
 }
 
 /// A window title rendered bold, for every floating window's border title.
@@ -2702,6 +2731,57 @@ mod tests {
         let text = buffer_text(&render(&app));
         assert!(text.contains("[PROJ-1]"));
         assert!(text.contains("A longer description"));
+    }
+
+    #[test]
+    fn detail_overlay_explains_a_needs_audit_ticket_and_names_both_keys() {
+        use crate::blocker_stacking::Readiness;
+        let app = App {
+            columns: group_into_columns(
+                vec![TicketSummary {
+                    readiness: Readiness::NeedsAudit {
+                        reason: "last audit was needs-work".to_string(),
+                    },
+                    ..ticket("PROJ-1")
+                }],
+                &[],
+            ),
+            screen: Screen::Detail,
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(
+            text.contains("Readiness: needs audit (last audit was needs-work)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("a audit session, Y mark audited"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn detail_overlay_names_a_blocked_tickets_blockers() {
+        use crate::blocker_stacking::Readiness;
+        let app = App {
+            columns: group_into_columns(
+                vec![TicketSummary {
+                    readiness: Readiness::Blocked {
+                        blocker_keys: vec!["PROJ-8".to_string(), "PROJ-9".to_string()],
+                        via_epic: None,
+                    },
+                    ..ticket("PROJ-1")
+                }],
+                &[],
+            ),
+            screen: Screen::Detail,
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(
+            text.contains("Readiness: blocked by PROJ-8, PROJ-9"),
+            "{text}"
+        );
     }
 
     #[test]
