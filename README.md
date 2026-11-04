@@ -276,7 +276,7 @@ tm auth status
 | `tm dispatch on\|off [--scope S \| --all]` | Turn autopilot on or off. `on` inside a repo also records the repo for `tick --all`; `off --all` is the kill switch |
 | `tm dispatch status` | Per scope: on or off, running lanes, last tick, time since the last launch, and the refusal blocking it now (with how long it has lasted) |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
-| `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `auto-review`, `review-watch`, `bugbot-cleanup`, `merge-conflict`, `setup`) |
+| `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `auto-review`, `review-watch`, `bugbot-cleanup`, `merge-conflict`, `setup`, `walkthrough`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
 | `tm runs --by-retro [--kind <KIND>]` | Print cost totals grouped by shipped-ticket retro verdict (clean / defect, from `tm ticket retro`) instead of listing individual runs; tickets with a recorded verdict but no run are counted separately rather than as a `$0` run |
 | `tm runs start --ticket <KEY> --lane <LANE> --worktree <PATH> [--branch] [--pid] [--kind <KIND>]` | Record the start of a run (`--kind` defaults to `lane`); prints the new run id |
@@ -989,7 +989,8 @@ Every agent tm launches gets an explicit `--model`: lane runs and their
 usage-limit fallbacks, `tm review fix`/`auto`, `tm merge` conflict sessions
 (single and batch), the `tm ticket retro --defect` session, the
 `tm init`/`tm update` setup session, the board's
-audit, create and review_watch cleanup sessions, and the usage probe. None
+audit, create, walkthrough and review_watch cleanup sessions, and the
+usage probe. None
 of them falls through to the agent CLI's own default, so an
 enterprise-pinned claude model is overridden too. A launch on runner R
 takes the first of these that R accepts (GitHub issue #143):
@@ -997,7 +998,7 @@ takes the first of these that R accepts (GitHub issue #143):
 1. `tm work run --model` (lane runs only);
 2. the surface's own key: the lane's `model` (lane runs, review fix/auto),
    `[work.merge] model`, `[work.retro] model`, `[work.audit] model`,
-   `[work.create] model`, or
+   `[work.create] model`, `[work.walkthrough] model`, or
    `[work.review_watch] model` (which falls back to `[work.audit] model`).
    The setup session has no key of its own;
 3. `[work] default_model`;
@@ -1123,7 +1124,7 @@ commands, not an agent tm builds. Each launch checks two things:
   With no such runs it falls back to a built-in default for its kind:
   `lane_memory_estimate_gb` for `lane` and `review-fix` runs, which build
   and test like a lane, and 1 GB for `auto-review`, `audit`, `create`,
-  `bugbot-cleanup`, `merge-conflict` and `setup` runs. Every running agent
+  `bugbot-cleanup`, `merge-conflict`, `setup` and `walkthrough` runs. Every running agent
   counts, whatever its kind, at the larger of its own peak so far and its
   kind's estimate, so a run that is quiet now but will build later still
   holds its share. A `review-watch` row is a small `gh` poller, not an
@@ -1577,6 +1578,7 @@ move them in the epics view instead; see "The epics view" below.
 | `v` | Open the run-detail overlay for the selected ticket's latest run, any `kind` (board only) |
 | `L` | Open the selected ticket's latest run's log file in `less` (board only); see "`tm runs logs`" below |
 | `V` | Open the selected ticket's lane-run worktree in `vdiff` for review (board only); see "Board-launched vdiff review loop" below |
+| `W` | Open a change walkthrough of the selected ticket's lane PR in a `walkthrough` window of its session (board only); see "Board-launched change walkthroughs" below |
 | `F` | Dispatch a fix pass over the review comments `vdiff` captured for the selected ticket (board only); see "Board-launched vdiff review loop" below |
 | `M` | Merge the selected ticket's open PR, after a confirmation prompt naming the PR and the post-merge status: runs the full `tm merge <KEY>` flow in the background, board stays responsive (board only); with tickets queued via `Space`, confirms and merges the whole queue in one `tm merge KEY1 KEY2 ...` instead; see "Merging from the board" below |
 | `Space` | Toggle the selected ticket in or out of the merge queue, marked `+` on its card (board only; on the priority screen `Space` grabs/drops instead) |
@@ -2215,6 +2217,39 @@ lane run sets a status-line message immediately; one with a lane run but no
 captured comments launches the child, which resolves quickly (like every
 watched-child launch) and reports "no comments captured" (or similar) in the
 status line without leaving a `review-fix` run behind.
+
+### Board-launched change walkthroughs
+
+Pressing `W` on a board ticket opens an interactive agent session in its
+lane worktree that runs the `thatch-change-walkthrough` skill over the
+lane's pull request, so you start reviewing from an explanation of the
+change instead of the raw diff.
+
+The key reads the ticket's latest `kind = "lane"` run from the runs DB. It
+needs three things from it: a worktree that still exists, a recorded PR
+URL (written when the lane finishes after opening its PR), and nothing
+already live in the ticket's `walkthrough` window. When one is missing the
+status line says which, and nothing launches. Otherwise the launch goes
+through the same memory and usage admission as the board's other agent
+sessions and pre-registers a `kind = "walkthrough"` run. The session then
+starts in a `walkthrough` window of the ticket's `tm-<scope>-<key>` session
+(`walkthrough-2` when an earlier one's dead window still holds the name).
+It launches detached, like `a`; press `s` to attach.
+
+The prompt is configurable under `[work.walkthrough]`, and every field is
+optional:
+
+```toml
+[work.walkthrough]
+# prompt = "..."                                  # optional; ships a built-in default prompt
+# prompt_file = ".tskmstr/prompts/walkthrough.md"  # optional; see [work.audit]'s prompt_file above
+# model = "opus"                                   # optional; see "Which model a launch uses"
+```
+
+`prompt` and `prompt_file` are mutually exclusive, as in the other session
+sections. Both support `{key}` (the ticket key) and `{pr}` (the lane's PR
+URL). Leave both unset and tm asks the agent to use the
+`thatch-change-walkthrough` skill on the PR's diff against its base branch.
 
 ### Auto-review
 
