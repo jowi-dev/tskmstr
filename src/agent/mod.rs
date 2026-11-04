@@ -864,6 +864,29 @@ pub trait AgentRunner: Sync {
          explain why, and continue with the next ticket."
     }
 
+    /// Prompt for the short headless session a successful `tm merge` starts
+    /// to consolidate the merged branches' thatch memories (GitHub issue
+    /// #208). The one placeholder, `{branch_list}`, is substituted by the
+    /// caller (`crate::work::merge`) with one `- <branch>` line per merged
+    /// branch.
+    ///
+    /// The session checks for branch-scoped memories itself because
+    /// `thatch list` does not show branch scope, so tm cannot skip an empty
+    /// branch before launching. Runner-neutral for the same reason as
+    /// [`AgentRunner::default_merge_conflict_prompt_template`]: it names
+    /// thatch's MCP tools, which every runner reaches the same way.
+    fn default_memory_consolidation_prompt_template(&self) -> &'static str {
+        "These git branches were just merged and deleted:\n\n\
+         {branch_list}\n\n\
+         Your job is bounded: consolidate their thatch memories. Using thatch's MCP tools on \
+         this repository's project store, list the memories scoped to each branch \
+         (memory_list with that branch). If no branch has any, stop now and do nothing else. \
+         Otherwise, for each branch that has memories, save one unscoped archived record \
+         (memory_remember) summarizing what the branch delivered and any decisions, gotchas, \
+         or follow-ups still worth knowing, then forget the branch-scoped originals \
+         (memory_forget). Do not change code, git state, or tickets."
+    }
+
     /// Deploy this runner's telemetry artifacts (hook scripts + a settings
     /// file, for `claude`) into `deploy_dir`, returning the settings path
     /// [`InvocationInputs::settings_path`] should carry, or `Ok(None)` for a

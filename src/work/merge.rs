@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::agent::{AgentRunner, InvocationInputs, RunMode};
+use crate::agent::{AgentInvocation, AgentRunner, InvocationInputs, RunMode, shell_quote};
 use crate::cli::pr::{PrCliError, resolve_watch_repo_root};
 use crate::config::{BackendIdentity, LaneConfig, MergeConfig};
 use crate::github::gh_cli::{GhCli, GhError};
@@ -93,6 +93,15 @@ pub const MERGE_CONFLICT_KIND: &str = "merge-conflict";
 /// (the row's own `ticket` holds only the first).
 pub const MERGE_BATCH_EVENT: &str = "merge-batch";
 
+/// Base name (before [`unique_window_name`] suffixing) of the tmux window
+/// the post-merge memory-consolidation session runs in (GitHub issue #208).
+pub const MERGE_MEMORY_WINDOW_BASE: &str = "memory";
+
+/// The run kind the memory-consolidation session is admitted under. No run
+/// row is recorded for it: the session is headless with no supervisor to
+/// finish a row, so the kind only keys admission's memory estimate.
+pub const MERGE_MEMORY_KIND: &str = "merge-memory";
+
 /// Errors returned by [`run_merge`].
 #[derive(Debug, Error)]
 pub enum MergeError {
@@ -112,6 +121,16 @@ pub enum MergeError {
     /// A `tmux` shell-out failed.
     #[error(transparent)]
     Tmux(#[from] TmuxError),
+
+    /// `state_dir` could not be created to hold the memory-consolidation
+    /// session's log.
+    #[error("failed to create {path}: {source}")]
+    StateDir {
+        /// The directory that could not be created.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
 
     /// A run-state store operation failed.
     #[error(transparent)]
@@ -650,7 +669,40 @@ fn open_agent_window(
         source,
     })?;
     let command = deps.runner.tmux_command_line(&invocation, &prompt_path);
+    let opened = open_command_window(
+        deps,
+        session_key,
+        MERGE_WINDOW_BASE,
+        dir,
+        &invocation.env_set,
+        &command,
+    )?;
 
+    if let (Some(store), Some(id)) = (deps.run_store, run_id) {
+        if !opened.inside_tmux {
+            let _ = store.update_tmux_session(id, &opened.target);
+        }
+        if let Ok(Some(pid)) = deps.tmux.pane_pid(&opened.target, &opened.window) {
+            let _ = store.update_pid(id, pid);
+        }
+    }
+
+    Ok(opened)
+}
+
+/// Opens a tmux window named after `window_base` in `dir` running
+/// `command`: on the current tmux session when there is one, otherwise on
+/// `session_key`'s ticket session, created if needed. Shared by the
+/// conflict sessions ([`open_agent_window`]) and the memory-consolidation
+/// session ([`start_memory_session`]).
+fn open_command_window(
+    deps: &MergeDeps<'_>,
+    session_key: &str,
+    window_base: &str,
+    dir: &Path,
+    env: &[(String, String)],
+    command: &str,
+) -> Result<AgentWindow, MergeError> {
     let current_session = deps.tmux.current_session_name()?;
     let inside_tmux = current_session.is_some();
     let target = current_session
@@ -658,26 +710,15 @@ fn open_agent_window(
 
     let windows = deps.tmux.list_windows()?;
     let existing = session_window_names(&windows, &target);
-    let window = unique_window_name(MERGE_WINDOW_BASE, &existing);
+    let window = unique_window_name(window_base, &existing);
     let dir_str = dir.to_string_lossy().into_owned();
-
-    let env = &invocation.env_set;
 
     if existing.is_empty() {
         deps.tmux
-            .new_session_with_command(&target, &dir_str, &window, env, &command)?;
+            .new_session_with_command(&target, &dir_str, &window, env, command)?;
     } else {
         deps.tmux
-            .new_window_with_command(&target, &window, &dir_str, env, &command)?;
-    }
-
-    if let (Some(store), Some(id)) = (deps.run_store, run_id) {
-        if !inside_tmux {
-            let _ = store.update_tmux_session(id, &target);
-        }
-        if let Ok(Some(pid)) = deps.tmux.pane_pid(&target, &window) {
-            let _ = store.update_pid(id, pid);
-        }
+            .new_window_with_command(&target, &window, &dir_str, env, command)?;
     }
 
     Ok(AgentWindow {
@@ -685,6 +726,139 @@ fn open_agent_window(
         window,
         inside_tmux,
     })
+}
+
+/// Starts the post-merge memory-consolidation session for `branches`, all
+/// merged from `repo_root` (GitHub issue #208), when
+/// [`MergeConfig::consolidate_memories`] is on. Advisory: a failure is
+/// reported as a warning on `out` and never fails the merge or changes its
+/// exit code.
+fn consolidate_branch_memories(
+    deps: &MergeDeps<'_>,
+    repo_root: &Path,
+    session_key: &str,
+    branches: &[&str],
+    out: &mut dyn Write,
+) {
+    if !deps.merge_cfg.consolidate_memories || branches.is_empty() {
+        return;
+    }
+    if let Err(err) = start_memory_session(deps, repo_root, session_key, branches, out) {
+        let _ = writeln!(out, "warning: memory consolidation not started: {err}");
+    }
+}
+
+/// The launch half of [`consolidate_branch_memories`]: admits the agent,
+/// builds a [`RunMode::Headless`] invocation of the runner's
+/// [`AgentRunner::default_memory_consolidation_prompt_template`], and opens
+/// it in a [`MERGE_MEMORY_WINDOW_BASE`] window in `repo_root` (the merged
+/// worktrees are gone by now, and thatch finds the project store from the
+/// repo's remote) via [`open_command_window`].
+///
+/// Headless rather than interactive so the agent exits, and its window
+/// closes, once it is done; its output goes to
+/// `merge-memory-<session_key>-<timestamp>.log` under
+/// [`MergeDeps::state_dir`]. The session is untracked: no run row, no run-id
+/// variable, and no telemetry settings.
+fn start_memory_session(
+    deps: &MergeDeps<'_>,
+    repo_root: &Path,
+    session_key: &str,
+    branches: &[&str],
+    out: &mut dyn Write,
+) -> Result<(), MergeError> {
+    let branch_list = branches
+        .iter()
+        .map(|branch| format!("- {branch}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = deps
+        .runner
+        .default_memory_consolidation_prompt_template()
+        .replace("{branch_list}", &branch_list);
+
+    let repo = crate::work::run::dir_repo_key(repo_root);
+    let admitted = deps.admission.admit_tracked(
+        deps.run_store,
+        &crate::work::admission::LaunchRequest {
+            kind: MERGE_MEMORY_KIND,
+            agent: deps.runner.name(),
+            repo: &repo,
+            own_run: None,
+        },
+        crate::work::admission::LaunchOrigin::Human,
+        out,
+    )?;
+    let model = deps
+        .model_defaults
+        .resolve(
+            deps.runner,
+            &[crate::work::model::ModelCandidate {
+                source: "[work.merge] model",
+                model: deps.merge_cfg.model.as_deref(),
+            }],
+        )
+        .model;
+    let invocation = deps.runner.build_invocation(
+        &admitted,
+        InvocationInputs {
+            prompt,
+            model,
+            max_turns: None,
+            permission_mode: None,
+            settings_path: None,
+            run_id: None,
+            mode: RunMode::Headless,
+        },
+    );
+
+    std::fs::create_dir_all(deps.state_dir).map_err(|source| MergeError::StateDir {
+        path: deps.state_dir.to_path_buf(),
+        source,
+    })?;
+    let log_path = deps.state_dir.join(format!(
+        "merge-memory-{session_key}-{}.log",
+        deps.clock.now_unix_secs()
+    ));
+    let command = headless_command_line(&invocation, &log_path);
+    let opened = open_command_window(
+        deps,
+        session_key,
+        MERGE_MEMORY_WINDOW_BASE,
+        repo_root,
+        &invocation.env_set,
+        &command,
+    )?;
+
+    writeln!(
+        out,
+        "consolidating thatch memories for {} (window {}:{}, log {})",
+        branches.join(", "),
+        opened.target,
+        opened.window,
+        log_path.display()
+    )?;
+    Ok(())
+}
+
+/// Renders a headless `invocation` as the command a tmux window runs:
+/// `exec env -u VAR ... <program> <args...> > <log_path> 2>&1`, every
+/// argument [`shell_quote`]d. The `env -u` prefix keeps
+/// [`AgentInvocation::env_remove`]'s billing-safety stripping, which tmux
+/// cannot express itself (see [`AgentRunner::tmux_command_line`]), and
+/// `exec` lets the window close as soon as the agent exits.
+fn headless_command_line(invocation: &AgentInvocation, log_path: &Path) -> String {
+    let mut parts = vec!["exec".to_string(), "env".to_string()];
+    for var in &invocation.env_remove {
+        parts.push("-u".to_string());
+        parts.push(var.clone());
+    }
+    parts.push(invocation.program.clone());
+    parts.extend(invocation.args.iter().map(|arg| shell_quote(arg)));
+    parts.push(">".to_string());
+    parts.push(shell_quote(&log_path.to_string_lossy()));
+    parts.push("2>&1".to_string());
+    parts.join(" ")
 }
 
 /// One poll tick's view of a conflicted rebase, from [`check_rebase`].
@@ -825,7 +999,17 @@ pub fn run_merge(
             ConflictOutcome::HandedBack => return Ok(MergeFlowOutcome::ConflictsHandedBack),
         }
     }
-    finish_merge(deps, &prepared, None, out)
+    let outcome = finish_merge(deps, &prepared, None, out)?;
+    if outcome == MergeFlowOutcome::Merged {
+        consolidate_branch_memories(
+            deps,
+            &prepared.repo_root,
+            &prepared.key,
+            &[prepared.branch.as_str()],
+            out,
+        );
+    }
+    Ok(outcome)
 }
 
 /// What [`run_merge_batch`] accomplished, ticket by ticket.
@@ -894,6 +1078,7 @@ pub fn run_merge_batch(
 ) -> Result<BatchMergeReport, MergeError> {
     let mut report = BatchMergeReport::default();
     let mut set_aside: Vec<(PreparedMerge, PendingConflict)> = Vec::new();
+    let mut merged: Vec<PreparedMerge> = Vec::new();
     let total = keys.len();
 
     for (i, key) in keys.iter().enumerate() {
@@ -913,7 +1098,11 @@ pub fn run_merge_batch(
                 )?;
                 set_aside.push((prepared, conflict));
             }
-            None => finish_into_report(deps, &prepared, None, &mut report, out)?,
+            None => {
+                if finish_into_report(deps, &prepared, None, &mut report, out)? {
+                    merged.push(prepared);
+                }
+            }
         }
     }
 
@@ -973,8 +1162,12 @@ pub fn run_merge_batch(
     for mut prepared in resolved {
         writeln!(out, "=== finishing {} ===", prepared.key)?;
         prepared.needs_push = true;
-        finish_into_report(deps, &prepared, kept_session.as_deref(), &mut report, out)?;
+        if finish_into_report(deps, &prepared, kept_session.as_deref(), &mut report, out)? {
+            merged.push(prepared);
+        }
     }
+
+    consolidate_batch_memories(deps, &merged, out);
 
     writeln!(
         out,
@@ -1007,25 +1200,48 @@ fn record_failure(
     Ok(())
 }
 
-/// Runs [`finish_merge`] for `prepared`, recording the result in `report`.
-/// `kept_session` is passed through (see [`finish_merge`]).
+/// Runs [`finish_merge`] for `prepared`, recording the result in `report`,
+/// and returns whether the PR merged. `kept_session` is passed through (see
+/// [`finish_merge`]).
 fn finish_into_report(
     deps: &MergeDeps<'_>,
     prepared: &PreparedMerge,
     kept_session: Option<&str>,
     report: &mut BatchMergeReport,
     out: &mut dyn Write,
-) -> Result<(), MergeError> {
+) -> Result<bool, MergeError> {
     match finish_merge(deps, prepared, kept_session, out) {
         Ok(MergeFlowOutcome::Merged) => {
             report.merged.push(prepared.key.clone());
-            Ok(())
+            Ok(true)
         }
         Ok(MergeFlowOutcome::ConflictsHandedBack) => {
             report.handed_back.push(prepared.key.clone());
-            Ok(())
+            Ok(false)
         }
-        Err(err) => record_failure(report, &prepared.key, &err, out),
+        Err(err) => record_failure(report, &prepared.key, &err, out).map(|()| false),
+    }
+}
+
+/// Starts one memory-consolidation session (see
+/// [`consolidate_branch_memories`]) naming every branch a batch merged.
+/// Branches are grouped by repo root, in merge order, since thatch's project
+/// store is per repo: a batch within one repo, the usual case, gets exactly
+/// one session, keyed on its first merged ticket.
+fn consolidate_batch_memories(deps: &MergeDeps<'_>, merged: &[PreparedMerge], out: &mut dyn Write) {
+    let mut groups: Vec<(&Path, &str, Vec<&str>)> = Vec::new();
+    for prepared in merged {
+        let root = prepared.repo_root.as_path();
+        match groups
+            .iter_mut()
+            .find(|(group_root, ..)| *group_root == root)
+        {
+            Some((_, _, branches)) => branches.push(&prepared.branch),
+            None => groups.push((root, &prepared.key, vec![&prepared.branch])),
+        }
+    }
+    for (root, key, branches) in groups {
+        consolidate_branch_memories(deps, root, key, &branches, out);
     }
 }
 
@@ -1982,7 +2198,13 @@ mod tests {
                 home: PathBuf::from("/home/jowi"),
                 identity: identity(),
                 lanes: BTreeMap::new(),
-                merge_cfg: MergeConfig::default(),
+                // Off by default here so the post-merge memory session's
+                // window doesn't show up in every test's tmux calls; the
+                // GitHub issue #208 tests turn it back on.
+                merge_cfg: MergeConfig {
+                    consolidate_memories: false,
+                    ..MergeConfig::default()
+                },
                 work_default_model: None,
                 models: crate::config::ModelsConfig::default(),
                 status_on_merge: None,
@@ -4297,5 +4519,175 @@ mod tests {
             .failed
             .push(("PROJ-2".to_string(), "boom".to_string()));
         assert_eq!(report.exit_code(), 1);
+    }
+
+    // --- branch memory consolidation (GitHub issue #208) ---
+
+    /// Every window `tm merge` opened for the memory-consolidation session:
+    /// `(session, dir, command)`.
+    fn memory_windows(fx: &Fixture) -> Vec<(String, String, String)> {
+        fx.tmux
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                TmuxCall::NewSessionWithCommand {
+                    name,
+                    dir,
+                    window_name,
+                    command,
+                    ..
+                }
+                | TmuxCall::NewWindowWithCommand {
+                    name,
+                    dir,
+                    window_name,
+                    command,
+                    ..
+                } if window_name.starts_with(MERGE_MEMORY_WINDOW_BASE) => {
+                    Some((name, dir, command))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn successful_merge_starts_a_headless_memory_session_for_the_branch() {
+        let mut fx = up_to_date_fixture();
+        fx.merge_cfg.consolidate_memories = true;
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        let windows = memory_windows(&fx);
+        assert_eq!(windows.len(), 1, "{windows:?}");
+        let (session, dir, command) = &windows[0];
+        assert_eq!(
+            session,
+            &ticket_session_name(&fx.identity.session_slug(), "PROJ-1"),
+            "outside tmux the session gets its own ticket session"
+        );
+        assert_eq!(
+            dir, "/repo",
+            "runs in the repo root, not the removed worktree"
+        );
+        assert!(
+            command.starts_with("exec env -u ANTHROPIC_API_KEY"),
+            "{command}"
+        );
+        assert!(
+            command.contains("'-p'"),
+            "headless, not interactive: {command}"
+        );
+        assert!(
+            command.contains("proj-1-fix"),
+            "names the branch: {command}"
+        );
+        assert!(
+            command.contains("> "),
+            "output goes to a log file: {command}"
+        );
+        assert!(out.contains("consolidating thatch memories"), "{out}");
+    }
+
+    #[test]
+    fn memory_session_is_skipped_when_disabled() {
+        let fx = up_to_date_fixture();
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert!(memory_windows(&fx).is_empty());
+    }
+
+    #[test]
+    fn failed_merge_starts_no_memory_session() {
+        let mut fx = up_to_date_fixture();
+        fx.merge_cfg.consolidate_memories = true;
+        fx.gh = fx.gh.with_pr_merge_result(Err(GhError::Command {
+            command: "gh pr merge".to_string(),
+            exit_code: Some(1),
+            stderr: "X not mergeable".to_string(),
+        }));
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Err(MergeError::Gh(_))));
+        assert!(memory_windows(&fx).is_empty());
+    }
+
+    #[test]
+    fn handed_back_merge_starts_no_memory_session() {
+        let mut fx = Fixture::new();
+        fx.merge_cfg.consolidate_memories = true;
+        fx.gh = fx
+            .gh
+            .with_pr_list(Ok(vec![pr_info(7, "proj-1-fix", "main", "PROJ-1")]));
+        fx.git = fx
+            .git
+            .with_current_branch(Ok("proj-1-fix".to_string()))
+            .with_current_branch_for(PathBuf::from("/repo"), Ok("proj-1-fix".to_string()))
+            .with_rev_parse_result("proj-1-fix", Ok("aaa".to_string()))
+            .with_rev_parse_result("origin/proj-1-fix", Ok("aaa".to_string()))
+            .with_is_ancestor_result(Ok(false))
+            .with_rebase_onto_result(Ok(RebaseOutcome::Conflicted))
+            .with_rebase_in_progress_sequence(vec![Ok(true)])
+            .with_conflicted_files_sequence(vec![Ok(vec!["a.rs".to_string()])]);
+        fx.tmux = fx
+            .tmux
+            .with_current_session_name(Ok(Some("dev".to_string())))
+            .with_list_windows(Ok(vec![merge_window()]));
+        fx.clock = FakeClock::advancing(1_000, 901);
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::ConflictsHandedBack)));
+        assert!(memory_windows(&fx).is_empty());
+    }
+
+    #[test]
+    fn memory_session_failure_only_warns_and_keeps_the_merge() {
+        let mut fx = up_to_date_fixture();
+        fx.merge_cfg.consolidate_memories = true;
+        // A state_dir that is a file can't hold the session's log.
+        let blocker = fx._state_dir.path().join("not-a-dir");
+        std::fs::write(&blocker, "").unwrap();
+        fx.state_dir = blocker;
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert!(memory_windows(&fx).is_empty());
+        assert!(
+            out.contains("warning: memory consolidation not started"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn batch_merge_starts_one_memory_session_naming_every_merged_branch() {
+        let mut fx = batch_fixture(&[
+            BatchTicket::Clean,
+            BatchTicket::Conflict { resolves: false },
+            BatchTicket::Clean,
+        ]);
+        fx.merge_cfg.consolidate_memories = true;
+        fx.clock = FakeClock::advancing(1_000, 300);
+
+        let (result, out) = run_batch(&fx.deps(), &keys(3));
+
+        let report = result.expect("batch should succeed");
+        assert_eq!(report.merged, vec!["PROJ-1", "PROJ-3"]);
+        let windows = memory_windows(&fx);
+        assert_eq!(windows.len(), 1, "one session for the batch: {windows:?}");
+        let (session, _dir, command) = &windows[0];
+        assert_eq!(session, "dev", "inside tmux it joins the current session");
+        assert!(command.contains("proj-1-fix"), "{command}");
+        assert!(command.contains("proj-3-fix"), "{command}");
+        assert!(
+            !command.contains("proj-2-fix"),
+            "a handed-back branch is not merged: {command}"
+        );
+        assert!(out.contains("consolidating thatch memories"), "{out}");
     }
 }
