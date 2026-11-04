@@ -173,6 +173,10 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
         draw_lane_confirm(frame, app);
     }
 
+    if app.audit_mark_confirm.is_some() {
+        draw_audit_mark_confirm(frame, app);
+    }
+
     if app.show_retro_severity_picker {
         draw_retro_severity_picker(frame, app);
     }
@@ -306,7 +310,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  A assign  p priority  a audit  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  Space queue  R retro  P autopilot  i or / search  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  A assign  p priority  a audit  Y mark audited  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  Space queue  R retro  P autopilot  i or / search  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -1903,7 +1907,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("Enter/Space grab/drop (rank view)"),
         Line::from("?           toggle this help"),
         Line::from("card key markers:"),
-        Line::from("  ✓ ready    ◐ stackable"),
+        Line::from("  ✓ ready ◐ stackable ! audit"),
         Line::from("  ✗ blocked  ? unknown"),
         // The `review:` badge (GitHub issue #153) is the one badge whose
         // states aren't self-explanatory. On a 24-row terminal this column
@@ -1917,7 +1921,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("f       filter by assignee"),
         Line::from("A       assign ticket"),
         Line::from("p       priority (rank) view"),
-        Line::from("a       audit ticket"),
+        Line::from("a/Y     audit / mark audited"),
         Line::from("s       attach session"),
         Line::from("m       manual session"),
         Line::from("w       work (autonomous run)"),
@@ -2261,6 +2265,35 @@ fn draw_lane_confirm(frame: &mut Frame, app: &App) {
             .borders(Borders::ALL)
             .title(bold_title("Launch blocked ticket")),
     );
+    frame.render_widget(paragraph, area);
+}
+
+/// A centered floating window asking to confirm recording a passing audit
+/// verdict by hand ([`App::audit_mark_confirm`], the board's `Y` key --
+/// GitHub issue #193). Same paragraph shape as [`draw_lane_confirm`].
+fn draw_audit_mark_confirm(frame: &mut Frame, app: &App) {
+    let Some(key) = &app.audit_mark_confirm else {
+        return;
+    };
+    let area = centered_rect(60, 40, frame.area());
+    frame.render_widget(Clear, area);
+
+    let lines = vec![
+        Line::from(format!("Record a ready audit for {key}?")),
+        Line::from(""),
+        Line::from(format!(
+            "Same as `tm ticket audit {key} --record ready`; no audit session starts."
+        )),
+        Line::from(""),
+        Line::from("y/Enter record   n/Esc cancel"),
+    ];
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(bold_title("Mark audited")),
+        )
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
@@ -3581,6 +3614,30 @@ mod tests {
         assert!(text.contains("PROJ-9"), "{text}");
         assert!(text.contains("PROJ-10"), "{text}");
         assert!(text.contains("y/Enter merge all"), "{text}");
+    }
+
+    #[test]
+    fn draws_mark_audited_confirm_overlay() {
+        let app = App {
+            audit_mark_confirm: Some("PROJ-1".to_string()),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Record a ready audit for PROJ-1?"), "{text}");
+        assert!(text.contains("y/Enter record   n/Esc cancel"), "{text}");
+    }
+
+    #[test]
+    fn board_hint_and_help_list_the_mark_audited_key_and_marker() {
+        assert!(hint_for(Screen::Board, false).contains("Y mark audited"));
+        let app = App {
+            show_help: true,
+            ..App::new()
+        };
+        let text = buffer_text(&render_with_size(&app, 80, 24));
+        assert!(text.contains("mark audited"), "{text}");
+        assert!(text.contains("! audit"), "{text}");
+        assert!(text.contains("press any key to close"), "{text}");
     }
 
     #[test]

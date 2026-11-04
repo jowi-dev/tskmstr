@@ -1993,6 +1993,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         }
         Cmd::LaunchCleanup { key } => launch_cleanup_cmd(deps, &key),
         Cmd::LoadTicketRunDetail { key } => load_ticket_run_detail(deps, &key),
+        Cmd::RecordAudit { key } => record_audit(deps, &key),
         Cmd::RecordRetro {
             key,
             verdict,
@@ -2789,6 +2790,33 @@ pub fn fetch_retro_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
         });
     }
     vec![Msg::RetroTicketsLoaded(rows)]
+}
+
+/// Run `Cmd::RecordAudit`: record a passing audit verdict for `key` in the
+/// board's scope, the same row `tm ticket audit KEY --record ready` writes,
+/// so the next refresh and the next dispatcher tick both see it pass the
+/// audit gate. `deps.store` being unavailable degrades to
+/// [`Msg::AuditMarkFailed`], like [`record_retro`].
+pub fn record_audit(deps: &TuiDeps, key: &str) -> Vec<Msg> {
+    let failed = |err: &dyn std::fmt::Display| {
+        vec![Msg::AuditMarkFailed(format!(
+            "could not record audit for {key}: {err}"
+        ))]
+    };
+    let Some(store) = &deps.store else {
+        return failed(&"run database unavailable");
+    };
+    match store.record_audit(
+        &deps.backend_identity.scope(),
+        key,
+        crate::cli::ready::PASSING_AUDIT_VERDICT,
+        None,
+    ) {
+        Ok(()) => vec![Msg::AuditMarked {
+            key: key.to_string(),
+        }],
+        Err(err) => failed(&err),
+    }
 }
 
 /// Run `Cmd::RecordRetro`: record a retro verdict via
@@ -4471,6 +4499,40 @@ mod tests {
     }
 
     // --- Cmd::RecordRetro / record_retro ---
+
+    #[test]
+    fn record_audit_writes_the_verdict_tm_ready_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let mut deps = deps();
+        deps.store = Some(store);
+
+        let msgs = record_audit(&deps, "PROJ-1");
+
+        assert_eq!(
+            msgs,
+            vec![Msg::AuditMarked {
+                key: "PROJ-1".to_string()
+            }]
+        );
+        let scope = deps.backend_identity.scope();
+        let gate = AuditGate::Store {
+            store: deps.store.as_ref().unwrap(),
+            scope,
+        };
+        assert_eq!(gate.needs_audit("PROJ-1"), None);
+    }
+
+    #[test]
+    fn record_audit_with_no_store_reports_unavailable() {
+        let msgs = record_audit(&deps(), "PROJ-1");
+        assert_eq!(
+            msgs,
+            vec![Msg::AuditMarkFailed(
+                "could not record audit for PROJ-1: run database unavailable".to_string()
+            )]
+        );
+    }
 
     #[test]
     fn record_retro_clean_success_emits_retro_recorded() {

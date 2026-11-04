@@ -1459,6 +1459,7 @@ board still loads, without epic lines, and the status line says why.
 | `A` | Open the assign picker for the selected ticket (board only) |
 | `p` | Open the priority (stack-rank) view (board only) |
 | `a` | Launch a ticket-audit session for the selected ticket, or attach to it if one is live (board only) |
+| `Y` | Record a `ready` audit verdict for the selected ticket after a confirmation prompt, without starting an audit session: the same row `tm ticket audit <KEY> --record ready` writes (board only); see "Readiness glyphs" below |
 | `w` | Launch a lane run for the selected ticket: zero backend-compatible lanes sets a status-line message, exactly one launches it directly, more than one opens a lane picker; a ticket whose readiness glyph shows blocked asks for confirmation first, naming its blockers (board only); see "Board-launched lane runs" below |
 | `s` | Attach to the selected ticket's `tm-<scope>-<key>` tmux session — its whole action history, whatever is in it (board only). Unlike `a`, it never launches anything; if the ticket has no session yet, the status line says so |
 | `m` | Ensure the selected ticket's session holds your configured `[work.manual]` window layout, then attach (board only); see "Board-opened manual sessions" below |
@@ -1724,11 +1725,20 @@ below.
 #### Readiness glyphs
 
 Each card's title shows a one-column glyph beside the key: `✓` ready, `◐`
-stackable, `✗` blocked, `?` unknown (GitHub issue #62). It is the same
+stackable, `!` needs audit, `✗` blocked, `?` unknown (GitHub issue #62). It is the same
 classification `tm ready <KEY>` reports, computed by the same rule
 (`blocker_stacking::decide`) from the ticket's direct `Blocks` links and the
 board repo's PR list, plus the blockers a card inherits from a locked
 parent epic (see [Inherited blockers](#inherited-blockers-children-of-a-locked-epic)).
+
+With `[ready] require_audit` on, a ticket that would be ready or stackable
+but has no passing audit verdict shows a yellow `!` instead (GitHub issue
+#193): `tm ready` lists it as needs audit and autopilot skips it. The
+detail overlay (`Enter`) gives the reason in `tm ready`'s words, such as
+`Readiness: needs audit (not audited)` or `(last audit was needs-work)`,
+and for a blocked ticket names its blockers. Two keys clear the gate: `a`
+starts an audit session, and `Y` records a `ready` verdict directly after a
+confirmation, with no session, then refreshes the board.
 Pressing `w` on a blocked ticket opens a confirmation listing the blocking
 keys, an inherited one as `PROJ-12 (via epic PROJ-30)`; `y`/`Enter`
 launches anyway, `n`/`Esc` launches nothing. Ready, stackable, and unknown tickets launch without a prompt.
