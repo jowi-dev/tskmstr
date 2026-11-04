@@ -1348,11 +1348,14 @@ The board's status bar starts with its repo's state. On the overview, a
 project with autopilot on shows it at the end of its strip line:
 
 ```
-autopilot on · lanes 2/2 · launched 12m ago · not launching: 2 lanes running (GH-7, GH-8), [dispatch] max_lanes is 2 (5m)
+autopilot on · lanes 2/2 (GH-7, GH-8) · launched 12m ago · not launching: 2 lanes running (GH-7, GH-8), [dispatch] max_lanes is 2 (5m)
 ```
 
 - **lanes**: this repo's lane runs running now, against `max_lanes` from
-  the config you started the TUI from
+  the config you started the TUI from, followed by their tickets. The
+  count is the one `max_lanes` caps and `tm dispatch status` prints, so a
+  legacy lane without a scope, or one the board's filter hides, is still
+  named.
 - **launched**: how long ago this repo last launched a lane. It is left out
   when the repo has never launched one.
 - the last part is the newest tick's refusal, from `dispatch_events`, and
@@ -1381,10 +1384,14 @@ tm dispatch off --all       # kill switch: the next tick launches nothing
 `status` prints, for example:
 
 ```
-github:o/r: on, 1 lanes running, last tick 2026-10-19T14:03:22Z, last launch 2h10m ago
+github:o/r: on, 1 lanes running (GH-5), last tick 2026-10-19T14:03:22Z, last launch 2h10m ago
   repo: /home/me/r
   blocked for 45m: not launching: 1 lanes running (GH-5), [dispatch] max_lanes is 1
 ```
+
+The lane count is the one `max_lanes` caps: this scope's running lanes,
+plus legacy lanes recorded before runs carried a scope. The board's
+`lanes` count reads the same rows, so the two always agree.
 
 The `blocked` line appears only while the newest tick refused.
 `tick` prints one line per launch, naming the runner the lane landed on,
