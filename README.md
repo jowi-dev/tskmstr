@@ -2039,9 +2039,13 @@ worktree's vdiff comment store, `<git-dir>/vdiff/comments.json`. Each round:
 5. Otherwise starts an interactive `tm review fix <KEY>` pass in a `fix`
    window (`fix-2` for round 2). The pass is done once the agent writes
    `<git-dir>/vdiff/auto-review/fix-<loop>-<round>.done`, holding
-   `{"succeeded": true}` or `{"succeeded": false}`. Then tm moves the
+   `{"succeeded": true}` or `{"succeeded": false}`, plus a `declined`
+   array of `{"comment": "<path:start-end>", "reason": "..."}` for each
+   comment the pass triaged as not needing a change. Then tm moves the
    consumed store to `<git-dir>/vdiff/archive/<round>.json` so the next
-   round never re-reads comments with stale line anchors.
+   round never re-reads comments with stale line anchors. The next round's
+   prompt lists the declines with their reasons, so `thatch-review-followup`
+   checks each reason instead of re-reporting the finding as unaddressed.
 
 **The windows are yours to watch and steer.** Attach to the ticket's
 session to read a round or type into it. The loop does not wait for claude
@@ -2112,7 +2116,7 @@ so the badge stays at `needs you` until another round runs.
 
 The prompt is rendered per round with `{key}`, `{round}`, `{skill}`,
 `{findings_file}`, `{archive}` and `{prior}` (a sentence pointing a
-follow-up round at the archive). With `auto = true`, a `tm pr watch` that
+follow-up round at the archive, then the previous fix pass's declines). With `auto = true`, a `tm pr watch` that
 finds every bot done with nothing unresolved launches `tm review auto` for
 the ticket. A watch that hands off to a bugbot cleanup session does not
 chain, because tm can't see that interactive session finish.
