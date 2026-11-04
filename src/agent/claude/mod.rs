@@ -251,6 +251,15 @@ impl AgentRunner for ClaudeRunner {
         "Claude Code"
     }
 
+    /// The `/thatch:peer-review` command: it runs the `thatch-review-*`
+    /// specialists and the synthesizer in-session, where `thatch-code-review`
+    /// needs sub-agents only opencode has. It reports findings without
+    /// working them with the user, unlike `/thatch:self-review`, so it fits
+    /// an unattended round.
+    fn auto_review_skill(&self) -> &'static str {
+        "thatch:peer-review"
+    }
+
     /// `claude -p 'ok' --model <model> --max-turns 1 --output-format
     /// stream-json --verbose`: one turn (about $0.003 list price on haiku,
     /// the built-in probe model, when measured), whose `rate_limit_event`
@@ -870,6 +879,13 @@ mod tests {
     #[test]
     fn display_name_is_claude_code() {
         assert_eq!(ClaudeRunner.display_name(), "Claude Code");
+    }
+
+    #[test]
+    fn auto_review_skill_is_the_peer_review_pipeline() {
+        // `thatch-code-review` fans out sub-agents, which only opencode
+        // supports (GitHub issue #203).
+        assert_eq!(ClaudeRunner.auto_review_skill(), "thatch:peer-review");
     }
 
     #[test]
