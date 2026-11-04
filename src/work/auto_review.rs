@@ -216,8 +216,26 @@ pub struct FixMarker {
     pub succeeded: bool,
     /// The comments the pass triaged as not needing a change (GitHub issue
     /// #204). Absent from an older agent's marker, so it defaults to empty.
-    #[serde(default)]
+    /// Only advisory context for the next round, so it parses leniently
+    /// ([`lenient_declines`]): a malformed list never fails the loop.
+    #[serde(default, deserialize_with = "lenient_declines")]
     pub declined: Vec<Decline>,
+}
+
+/// Deserializes [`FixMarker::declined`] from any JSON, keeping the entries
+/// that are a [`Decline`] and dropping the rest; anything but an array
+/// reads as no declines.
+fn lenient_declines<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Decline>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let serde_json::Value::Array(entries) = value else {
+        return Ok(Vec::new());
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value(entry).ok())
+        .collect())
 }
 
 /// One review comment a fix pass declined, which [`run_loop`] hands the
@@ -931,6 +949,41 @@ mod tests {
 
         assert!(section.contains("merged"), "{section}");
         assert!(section.contains("same root cause as"), "{section}");
+    }
+
+    #[test]
+    fn a_malformed_declined_list_reads_as_no_declines_and_keeps_good_entries() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("fix-1.done");
+        for malformed in [
+            r#"{"succeeded": true, "declined": ["src/a.rs:4-6"]}"#,
+            r#"{"succeeded": true, "declined": "src/a.rs:4-6"}"#,
+            r#"{"succeeded": true, "declined": [{"comment": "src/a.rs:4-6"}]}"#,
+            r#"{"succeeded": true, "declined": null}"#,
+        ] {
+            std::fs::write(&path, malformed).unwrap();
+            assert_eq!(
+                read_fix_marker(&path).unwrap(),
+                Some(FixMarker {
+                    succeeded: true,
+                    declined: Vec::new()
+                }),
+                "{malformed}"
+            );
+        }
+
+        std::fs::write(
+            &path,
+            r#"{"succeeded": true, "declined": ["x", {"comment": "a:1-2", "reason": "dup"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_fix_marker(&path).unwrap().unwrap().declined,
+            vec![Decline {
+                comment: "a:1-2".to_string(),
+                reason: "dup".to_string(),
+            }]
+        );
     }
 
     #[test]
