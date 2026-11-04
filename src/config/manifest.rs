@@ -295,6 +295,14 @@ pub const EXPECTED_CONFIG_KEYS: &[ExpectedConfigKey] = &[
         severity: KeySeverity::Recommended,
         suggested_default: |_| None,
     },
+    // GitHub issue #226. Fixing failing CI unattended is opt-in, so there
+    // is no default to suggest.
+    ExpectedConfigKey {
+        path: &["dispatch", "fix_failing_ci"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
 ];
 
 #[cfg(test)]
@@ -376,6 +384,14 @@ mod tests {
     #[test]
     fn dispatch_allow_paid_fallback_is_registered_without_a_default() {
         let key = expected(&["dispatch", "allow_paid_fallback"]);
+        assert_eq!(key.severity, KeySeverity::Recommended);
+        assert_eq!((key.suggested_default)(BackendKind::Github), None);
+        assert_eq!((key.suggested_default)(BackendKind::Jira), None);
+    }
+
+    #[test]
+    fn dispatch_fix_failing_ci_is_registered_without_a_default() {
+        let key = expected(&["dispatch", "fix_failing_ci"]);
         assert_eq!(key.severity, KeySeverity::Recommended);
         assert_eq!((key.suggested_default)(BackendKind::Github), None);
         assert_eq!((key.suggested_default)(BackendKind::Jira), None);
