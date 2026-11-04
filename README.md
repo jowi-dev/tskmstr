@@ -140,7 +140,8 @@ checked (a lane prompt is read only to learn which skills it names; see
 `docs/decisions/0007-asset-schema-version.md`).
 
 When any configured prompt names a thatch skill (a `thatch-<name>` token
-or a `/thatch:<name>` command in a lane prompt file, or in the
+or a `thatch:<name>` command, with or without a leading slash, in a lane
+prompt file, or in the
 `[work.audit]`, `[work.create]`, `[work.review_watch]` or
 `[work.auto_review]` prompt, built-in defaults included even when the
 section is absent; the default auto-review prompt names the runner's
@@ -159,8 +160,11 @@ review skill, or `first_round_skill`, then `thatch-review-followup`),
   the skill, and both agents.
 - **skill not installed**: `thatch` is installed, but a named
   `thatch-*` skill has no `SKILL.md` in the runner's repo-local or
-  user-level skills dir. Either `thatch setup` was never run for this
-  agent, or thatch leaves that skill out for it (on Claude Code there is
+  user-level skills dir, or a named `thatch:<name>` command (Claude
+  Code's default `thatch:peer-review` review skill, say) has no
+  `thatch/<name>.md` in its commands dir (`.claude/commands`). A
+  `/thatch:<name>` command is not looked up. Either `thatch setup` was
+  never run for this agent, or thatch leaves that skill out for it (on Claude Code there is
   no `thatch-code-review`, which is opencode only). Run `thatch setup`
   for the agent, or point the prompt at a skill it has.
 

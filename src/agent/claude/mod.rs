@@ -297,6 +297,10 @@ impl AgentRunner for ClaudeRunner {
         base.join(".claude/skills")
     }
 
+    fn commands_dir(&self, base: &Path) -> PathBuf {
+        base.join(".claude/commands")
+    }
+
     /// `<base>/.claude/agents/<name>.md` — claude discovers subagent
     /// definitions under `.claude/agents/`.
     fn agent_definition_path(&self, base: &Path, name: &str) -> PathBuf {
@@ -901,6 +905,14 @@ mod tests {
         // `thatch-code-review` fans out sub-agents, which only opencode
         // supports (GitHub issue #203).
         assert_eq!(ClaudeRunner.auto_review_skill(), "thatch:peer-review");
+    }
+
+    #[test]
+    fn commands_dir_is_dot_claude_commands() {
+        assert_eq!(
+            ClaudeRunner.commands_dir(Path::new("/repo")),
+            PathBuf::from("/repo/.claude/commands")
+        );
     }
 
     #[test]

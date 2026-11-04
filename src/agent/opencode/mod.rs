@@ -263,6 +263,13 @@ impl AgentRunner for OpencodeRunner {
         base.join(".opencode/skills")
     }
 
+    /// opencode's native commands dir (singular `command`). Like
+    /// [`OpencodeRunner::skills_dir`], the probe under-detects a user-level
+    /// command installed under `~/.config/opencode/command` instead.
+    fn commands_dir(&self, base: &Path) -> PathBuf {
+        base.join(".opencode/command")
+    }
+
     /// `<base>/.opencode/agent/<name>.md` — opencode discovers subagent
     /// definitions under `.opencode/agent/` (singular `agent`, per the
     /// `opencode agent create` CLI path).
@@ -893,6 +900,14 @@ mod tests {
     #[test]
     fn auto_review_skill_is_thatch_code_review() {
         assert_eq!(OpencodeRunner.auto_review_skill(), "thatch-code-review");
+    }
+
+    #[test]
+    fn commands_dir_is_dot_opencode_command() {
+        assert_eq!(
+            OpencodeRunner.commands_dir(Path::new("/repo")),
+            PathBuf::from("/repo/.opencode/command")
+        );
     }
 
     #[test]
