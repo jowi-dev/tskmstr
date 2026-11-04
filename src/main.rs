@@ -724,6 +724,7 @@ fn run_review(cmd: ReviewCmd) -> Result<(), Box<dyn std::error::Error>> {
         ReviewCmd::Fix { .. } => unreachable!("tm review fix is handled by run_review_fix"),
         ReviewCmd::Auto { key, foreground } => run_review_auto(key, foreground),
         ReviewCmd::Import { key, fix } => run_review_import(key, fix),
+        ReviewCmd::CiFix { key, unattended } => run_review_ci_fix(key, unattended),
     }
 }
 
@@ -2621,8 +2622,18 @@ fn run_review_import(key: String, fix: bool) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-/// Builds the real [`tskmstr::cli::review::ReviewFixDeps`] `tm review fix`
-/// and `tm review auto` share, and hands them to `f` with the run paths and
+/// `tm review ci-fix <KEY> [--unattended]` (GitHub issue #226): build real
+/// dependencies and run [`tskmstr::cli::review::ci_fix`].
+fn run_review_ci_fix(key: String, unattended: bool) -> Result<(), Box<dyn std::error::Error>> {
+    with_review_deps(|deps, run_paths, _config| {
+        let mut stdout = std::io::stdout();
+        tskmstr::cli::review::ci_fix(deps, run_paths, &key, unattended, &mut stdout).map(|_| ())
+    })??;
+    Ok(())
+}
+
+/// Builds the real [`tskmstr::cli::review::ReviewFixDeps`] every `tm
+/// review` subcommand shares, and hands them to `f` with the run paths and
 /// the leniently loaded config.
 ///
 /// # Errors

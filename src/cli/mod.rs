@@ -460,6 +460,26 @@ pub enum ReviewCmd {
         #[arg(long)]
         fix: bool,
     },
+    /// Dispatch a fix pass over the failing CI checks on KEY's pull
+    /// request.
+    ///
+    /// Reads the checks on the PR's head commit. When every check has
+    /// finished and at least one failed, starts an interactive `review-fix`
+    /// run in a `fix` / `fix-N` window of the ticket's `tm-<scope>-<key>`
+    /// session, with a prompt carrying the failing checks' names and their
+    /// `gh run view --log-failed` logs, trimmed. Otherwise prints why and
+    /// starts nothing. The autopilot dispatcher runs this on its own under
+    /// `[dispatch] fix_failing_ci`; by hand it ignores `max_fix_rounds`.
+    CiFix {
+        /// Ticket key whose PR's checks to fix, e.g. `GH-226`
+        /// (case-insensitive).
+        key: String,
+        /// Hidden: launched by the autopilot dispatcher (GitHub issue
+        /// #226). Waits for admission instead of warning, and records the
+        /// wait on the ticket's lane run.
+        #[arg(long, hide = true)]
+        unattended: bool,
+    },
 }
 
 /// `tm work` subcommands.
@@ -3617,6 +3637,31 @@ mod tests {
             }
             other => panic!("expected Review Fix, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_review_ci_fix_with_hidden_unattended() {
+        let cli = Cli::try_parse_from(["tm", "review", "ci-fix", "GH-1", "--unattended"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Review {
+                cmd: ReviewCmd::CiFix { key, unattended },
+            }) => {
+                assert_eq!(key, "GH-1");
+                assert!(unattended);
+            }
+            other => panic!("expected Review CiFix, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["tm", "review", "ci-fix", "GH-1"]).expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Review {
+                cmd: ReviewCmd::CiFix {
+                    unattended: false,
+                    ..
+                },
+            })
+        ));
     }
 
     #[test]

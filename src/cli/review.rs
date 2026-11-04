@@ -34,6 +34,10 @@
 //!      __supervise` supervisor `tm work run`'s headless path uses — the
 //!      supervisor only reads back a [`crate::work::run::PreparedRun`], so it
 //!      has no notion of "lane" vs. "review-fix" runs at all.
+//!
+//! `tm review ci-fix <KEY>` ([`ci_fix`], GitHub issue #226) dispatches the
+//! same interactive fix pass with a prompt built from the PR's failing CI
+//! checks instead of the exported comments.
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -43,7 +47,7 @@ use thiserror::Error;
 
 use crate::agent::{AgentRunner, RunMode};
 use crate::config::AutoReviewConfig;
-use crate::github::gh_cli::GhCli;
+use crate::github::gh_cli::{GhCli, PrLifecycle};
 use crate::github::pr::pr_number_from_url;
 use crate::runs::{Run, RunStatus, RunStore, RunStoreError};
 use crate::work::admission::{AdmissionDeps, LaunchOrigin, LaunchRequest};
@@ -51,6 +55,7 @@ use crate::work::auto_review::{
     AUTO_REVIEW_KIND, AutoReviewError, AutoReviewOps, DEFAULT_PROMPT, LOOP_PID_EVENT, LoopOutcome,
     SIGNAL_EVENT, StepState, run_loop,
 };
+use crate::work::ci_fix;
 use crate::work::detach::{DetachError, DetachSpawner, SupervisorState, supervisor_argv};
 use crate::work::git::{GitError, GitOps};
 use crate::work::interactive::{
@@ -344,6 +349,101 @@ pub fn fix(
 ) -> Result<FixOutcome, ReviewCliError> {
     let prompt = FixPrompt::Comments { completion: None };
     dispatch_fix(deps, paths, key, dispatch, origin, prompt, out).map(|(outcome, _)| outcome)
+}
+
+/// How one `tm review ci-fix` went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CiFixOutcome {
+    /// The PR isn't open, or its checks don't call for a fix
+    /// ([`ci_fix::ready_to_fix`]); no run was dispatched and no run row was
+    /// created.
+    NothingToFix,
+    /// A fix pass was dispatched in a `fix` window of the ticket's session.
+    Dispatched,
+}
+
+/// `tm review ci-fix <KEY> [--unattended]` (GitHub issue #226): one fix
+/// pass over the failing CI checks on the PR for KEY's lane branch.
+///
+/// Reads the PR's checks ([`GhCli::pr_checks`]). When the PR is open, every
+/// check has finished, and at least one failed, it fetches the failing
+/// checks' logs ([`ci_fix::collect_failures`]), builds the prompt from them
+/// ([`ci_fix::build_prompt`]), and dispatches it as [`fix`] does with
+/// [`Dispatch::Interactive`]: a `review-fix` run in a `fix` / `fix-N`
+/// window of the ticket's session, behind the same admission gate.
+/// Otherwise it prints why and dispatches nothing.
+///
+/// `unattended` (`--unattended`, the autopilot dispatcher) makes the pass
+/// wait for admission instead of warning, recording the wait on the lane
+/// run, as `tm review auto`'s fix rounds do.
+///
+/// The fix-round cap is not checked here. It stops only the dispatcher's
+/// automatic trigger ([`ci_fix::sweep`] checks it before launching), so a
+/// human can always start a pass by hand.
+///
+/// # Errors
+///
+/// [`ReviewCliError::Runs`]/[`ReviewCliError::MissingBranch`] as for
+/// [`fix`]; [`ReviewCliError::NoPullRequest`] when no PR is open for the
+/// branch; [`ReviewCliError::Gh`] if reading the checks fails; any
+/// dispatch error [`fix`] returns. A log `gh` couldn't fetch is noted in
+/// the prompt, not returned.
+pub fn ci_fix(
+    deps: &ReviewFixDeps<'_>,
+    paths: &RunLanePaths,
+    key: &str,
+    unattended: bool,
+    out: &mut dyn Write,
+) -> Result<CiFixOutcome, ReviewCliError> {
+    let scope = deps.backend_identity.scope();
+    let run = resolve_run(deps.run_store, Some(&scope), key, Some("lane"))?;
+    let branch = run
+        .branch
+        .clone()
+        .ok_or_else(|| ReviewCliError::MissingBranch {
+            ticket: run.ticket.clone(),
+        })?;
+    let worktree = PathBuf::from(&run.worktree);
+    let no_pr = || ReviewCliError::NoPullRequest {
+        branch: branch.clone(),
+    };
+    let url = deps.gh.pr_url_for_branch(&branch)?.ok_or_else(no_pr)?;
+    let pr = pr_number_from_url(&url).ok_or_else(no_pr)?;
+
+    let checks = deps.gh.pr_checks(&worktree, pr)?;
+    if checks.lifecycle != PrLifecycle::Open {
+        writeln!(out, "nothing to fix: PR #{pr} is not open")?;
+        return Ok(CiFixOutcome::NothingToFix);
+    }
+    if !ci_fix::ready_to_fix(&checks) {
+        writeln!(
+            out,
+            "nothing to fix: no completed failing checks on PR #{pr}"
+        )?;
+        return Ok(CiFixOutcome::NothingToFix);
+    }
+
+    let failures = ci_fix::collect_failures(deps.gh, &worktree, &checks);
+    let prompt = ci_fix::build_prompt(&url, &checks.head_sha, &failures);
+    let origin = if unattended {
+        LaunchOrigin::Unattended {
+            event_run: Some(run.id),
+        }
+    } else {
+        LaunchOrigin::Human
+    };
+    match dispatch_fix(
+        deps,
+        paths,
+        &run.ticket,
+        Dispatch::Interactive,
+        origin,
+        FixPrompt::Text(prompt),
+        out,
+    )? {
+        (FixOutcome::NoComments, _) => Ok(CiFixOutcome::NothingToFix),
+        (FixOutcome::Dispatched { .. }, _) => Ok(CiFixOutcome::Dispatched),
+    }
 }
 
 /// Where a fix pass's prompt comes from.
@@ -3227,5 +3327,185 @@ mod tests {
 
         assert_eq!(outcome.fix, ImportFix::Fixed { resolved: 0 });
         assert!(fakes.gh.reply_and_resolve_thread_calls().is_empty());
+    }
+
+    // --- tm review ci-fix (GitHub issue #226) ---
+
+    const CI_PR: &str = "https://github.com/o/r/pull/140";
+
+    fn ci_checks(
+        states: &[(&str, crate::github::gh_cli::ChecksState)],
+    ) -> crate::github::gh_cli::PrChecks {
+        crate::github::gh_cli::PrChecks {
+            lifecycle: crate::github::gh_cli::PrLifecycle::Open,
+            head_sha: "abc1234def".to_string(),
+            checks: states
+                .iter()
+                .map(|(name, state)| crate::github::gh_cli::CheckResult {
+                    name: (*name).to_string(),
+                    state: *state,
+                    run_id: Some(9),
+                    details_url: Some("https://github.com/o/r/actions/runs/9".to_string()),
+                })
+                .collect(),
+        }
+    }
+
+    fn ci_fakes(
+        tmp: &TempDir,
+        pr_url: Option<&str>,
+        checks: crate::github::gh_cli::PrChecks,
+    ) -> AutoFakes {
+        AutoFakes {
+            gh: FakeGhCli::new()
+                .with_pr_url_for_branch(Ok(pr_url.map(str::to_string)))
+                .with_pr_checks(140, Ok(checks))
+                .with_run_failed_log(9, Ok("error[E0308]: mismatched types".to_string())),
+            ..auto_fakes(tmp)
+        }
+    }
+
+    fn run_ci_fix(
+        fakes: &AutoFakes,
+        run_store: &RunStore,
+        tmp: &TempDir,
+    ) -> (Result<CiFixOutcome, ReviewCliError>, String) {
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(fakes, run_store, &spawner);
+        let mut out = Vec::new();
+        let result = ci_fix(&deps, &paths(tmp), "PROJ-1", false, &mut out);
+        (result, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn ci_fix_unattended_records_its_admission_wait_on_the_lane_run() {
+        use crate::github::gh_cli::ChecksState;
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let fakes = ci_fakes(
+            &tmp,
+            Some(CI_PR),
+            ci_checks(&[("test", ChecksState::Failing)]),
+        );
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = ReviewFixDeps {
+            admission: AdmissionDeps::with_budget(1),
+            ..auto_deps(&fakes, &run_store, &spawner)
+        };
+
+        let err = ci_fix(&deps, &paths(&tmp), "PROJ-1", true, &mut Vec::new()).unwrap_err();
+
+        assert!(err.to_string().contains("memory budget exceeded"), "{err}");
+        let kinds: Vec<String> = run_store
+            .events_for_run(lane_run_id(&run_store))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, vec!["admission_wait", "admission_timeout"]);
+        assert!(opened_windows(&fakes.tmux).is_empty());
+    }
+
+    #[test]
+    fn ci_fix_dispatches_an_interactive_fix_carrying_the_failing_logs() {
+        use crate::github::gh_cli::ChecksState;
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let checks = ci_checks(&[
+            ("lint", ChecksState::Passing),
+            ("test", ChecksState::Failing),
+        ]);
+        let fakes = ci_fakes(&tmp, Some(CI_PR), checks);
+
+        let (result, _) = run_ci_fix(&fakes, &run_store, &tmp);
+
+        assert_eq!(result.unwrap(), CiFixOutcome::Dispatched);
+        assert_eq!(fakes.gh.pr_checks_calls(), vec![140]);
+        assert!(
+            fakes.vdiff.calls().is_empty(),
+            "the prompt comes from the checks, not vdiff"
+        );
+        let fix_run = run_store
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
+            .unwrap()
+            .expect("a review-fix run row");
+        assert_eq!(fix_run.tmux_session.as_deref(), Some("tm-proj-proj-1"));
+        let windows = opened_windows(&fakes.tmux);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].0, "fix");
+        let prompt = std::fs::read_dir(&paths(&tmp).state_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.to_string_lossy().ends_with(".prompt.md"))
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .unwrap();
+        assert!(prompt.contains(CI_PR), "{prompt}");
+        assert!(prompt.contains("abc1234def"), "{prompt}");
+        assert!(prompt.contains("## test"), "{prompt}");
+        assert!(!prompt.contains("## lint"), "{prompt}");
+        assert!(
+            prompt.contains("error[E0308]: mismatched types"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn ci_fix_with_a_check_still_pending_starts_nothing() {
+        use crate::github::gh_cli::ChecksState;
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let checks = ci_checks(&[
+            ("test", ChecksState::Failing),
+            ("build", ChecksState::Pending),
+        ]);
+        let fakes = ci_fakes(&tmp, Some(CI_PR), checks);
+
+        let (result, printed) = run_ci_fix(&fakes, &run_store, &tmp);
+
+        assert_eq!(result.unwrap(), CiFixOutcome::NothingToFix);
+        assert!(
+            printed.contains("nothing to fix: no completed failing checks on PR #140"),
+            "{printed}"
+        );
+        assert!(
+            run_store
+                .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(fakes.gh.run_failed_log_calls().is_empty());
+        assert!(opened_windows(&fakes.tmux).is_empty());
+    }
+
+    #[test]
+    fn ci_fix_on_a_merged_pr_starts_nothing() {
+        use crate::github::gh_cli::ChecksState;
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let checks = crate::github::gh_cli::PrChecks {
+            lifecycle: crate::github::gh_cli::PrLifecycle::Merged,
+            ..ci_checks(&[("test", ChecksState::Failing)])
+        };
+        let fakes = ci_fakes(&tmp, Some(CI_PR), checks);
+
+        let (result, printed) = run_ci_fix(&fakes, &run_store, &tmp);
+
+        assert_eq!(result.unwrap(), CiFixOutcome::NothingToFix);
+        assert!(printed.contains("PR #140 is not open"), "{printed}");
+    }
+
+    #[test]
+    fn ci_fix_errors_when_no_pr_is_open_for_the_branch() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let fakes = ci_fakes(&tmp, None, ci_checks(&[]));
+
+        let (result, _) = run_ci_fix(&fakes, &run_store, &tmp);
+
+        assert!(
+            matches!(result, Err(ReviewCliError::NoPullRequest { .. })),
+            "{result:?}"
+        );
+        assert!(fakes.gh.pr_checks_calls().is_empty());
     }
 }
