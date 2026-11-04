@@ -84,6 +84,7 @@ pub fn run_update(
         paths: ctx.paths,
         home: ctx.home,
         runner: ctx.runner,
+        thatch: check::ThatchProbe::Unchecked,
     };
 
     let findings = check::collect_findings(&check_ctx, &doc, &repo_dir);
@@ -158,6 +159,11 @@ pub fn run_update(
             DriftFinding::RejectedModel { .. } => {}
             // A content rewrite, so confirmed separately below.
             DriftFinding::LegacyAgentKeys { .. } => {}
+            // Thatch health comes from `tm check` alone, never from here.
+            DriftFinding::ThatchMissing { .. }
+            | DriftFinding::ThatchOutdated { .. }
+            | DriftFinding::HostLimitedSkill { .. }
+            | DriftFinding::ThatchSkillNotInstalled { .. } => {}
         }
     }
 
