@@ -2838,7 +2838,16 @@ fn run_runs(
             )?;
         }
         Some(RunsCmd::Register { kind, key }) => {
-            let runner = agent_runner_or_default(full_config.as_ref());
+            // The env vars to read belong to the runner hosting this
+            // session, which a routed lane records on its row; see
+            // `hosting_runner`.
+            let default_runner = agent_runner_or_default(full_config.as_ref());
+            let session_run_id = tskmstr::runs::session::SessionEnv::from_process_env(
+                &default_runner.session_env_vars(),
+            )
+            .session_run_id;
+            let runner =
+                tskmstr::runs::session::hosting_runner(&store, session_run_id, default_runner);
             let session_env =
                 tskmstr::runs::session::SessionEnv::from_process_env(&runner.session_env_vars());
             let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();

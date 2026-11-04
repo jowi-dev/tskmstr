@@ -64,8 +64,10 @@
 //! kind/ticket match.
 //!
 //! [`SessionEnv::session_id`]/[`SessionEnv::agent_pid`] are read from
-//! whichever env vars the configured runner's
-//! [`crate::agent::AgentRunner::session_env_vars`] names (`claude` sets
+//! whichever env vars the hosting runner's
+//! [`crate::agent::AgentRunner::session_env_vars`] names (see
+//! [`hosting_runner`]: the agent recorded on the pre-registered row, else
+//! the configured default) (`claude` sets
 //! `CLAUDE_CODE_SESSION_ID`/`CLAUDE_PID` for Bash-tool subprocesses — see
 //! that impl for the "observed but undocumented" caveat those two carry).
 //! [`SessionEnv::from_process_env`] degrades to a silent no-op when either
@@ -212,14 +214,53 @@ impl SessionEnv {
     /// if [`std::env::current_dir`] fails, rather than erroring — this is
     /// telemetry, not a load-bearing path.
     pub fn from_process_env(vars: &crate::agent::SessionEnvVars) -> Self {
+        SessionEnv::from_lookup(
+            vars,
+            &|key| std::env::var(key).ok(),
+            std::env::current_dir().unwrap_or_default(),
+        )
+    }
+
+    /// [`SessionEnv::from_process_env`] over `lookup` instead of the process
+    /// environment, so tests can supply the variables a given runner's
+    /// session exports. An empty value counts as absent, as there.
+    pub fn from_lookup(
+        vars: &crate::agent::SessionEnvVars,
+        lookup: &dyn Fn(&str) -> Option<String>,
+        cwd: PathBuf,
+    ) -> Self {
+        let get = |key: &str| lookup(key).filter(|v| !v.is_empty());
         SessionEnv {
-            session_id: non_empty_env(vars.session_id),
-            agent_pid: non_empty_env(vars.pid).and_then(|v| v.parse().ok()),
-            lane_run_id: non_empty_env("TSKMSTR_RUN_ID"),
-            session_run_id: non_empty_env("TSKMSTR_SESSION_RUN_ID").and_then(|v| v.parse().ok()),
-            cwd: std::env::current_dir().unwrap_or_default(),
+            session_id: get(vars.session_id),
+            agent_pid: get(vars.pid).and_then(|v| v.parse().ok()),
+            lane_run_id: get("TSKMSTR_RUN_ID"),
+            session_run_id: get("TSKMSTR_SESSION_RUN_ID").and_then(|v| v.parse().ok()),
+            cwd,
         }
     }
+}
+
+/// The runner hosting the session that is registering: the agent recorded
+/// on the pre-registered row `session_run_id` names, else `default`.
+///
+/// Read [`SessionEnv`] through this runner's
+/// [`crate::agent::AgentRunner::session_env_vars`], not the configured
+/// default's. A lane routed to another runner than the default (GitHub
+/// issue #192) only exports its own runner's vars, so reading the default's
+/// finds no session id, adopts nothing, and leaves the pid-less row to be
+/// reaped `failed` as stale while the agent works (GitHub issue #196).
+/// A missing row or an unrecorded or unknown agent falls back to `default`.
+pub fn hosting_runner(
+    store: &RunStore,
+    session_run_id: Option<i64>,
+    default: &'static dyn crate::agent::AgentRunner,
+) -> &'static dyn crate::agent::AgentRunner {
+    session_run_id
+        .and_then(|id| store.run_by_id(id).ok().flatten())
+        .and_then(|run| run.agent)
+        .and_then(|agent| crate::config::AgentKind::parse(&agent))
+        .map(crate::agent::routing::runner_for)
+        .unwrap_or(default)
 }
 
 /// Returns the directory session marker files live in:
@@ -1735,5 +1776,111 @@ mod tests {
             path,
             PathBuf::from("/home/user/.local/share/tskmstr/sessions")
         );
+    }
+
+    /// A pre-registered row whose `agent` names `agent`, as an interactive
+    /// lane launch leaves it: no pid, a recorded tmux session.
+    fn interactive_lane_row(store: &RunStore, agent: &str) -> i64 {
+        let id = store
+            .start_run(&StartRun {
+                ticket: "GH-1".to_string(),
+                scope: String::new(),
+                lane: "tskmstr".to_string(),
+                worktree: "/tmp/wt".to_string(),
+                branch: Some("gh-1".to_string()),
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store.update_agent_repo(id, agent, "tskmstr").unwrap();
+        store.update_tmux_session(id, "tm-o-gh-1").unwrap();
+        id
+    }
+
+    #[test]
+    fn hosting_runner_is_the_agent_recorded_on_the_pre_registered_row() {
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let id = interactive_lane_row(&store, "opencode");
+
+        let runner = hosting_runner(&store, Some(id), &ClaudeRunner);
+
+        assert_eq!(runner.name(), "opencode");
+    }
+
+    #[test]
+    fn hosting_runner_falls_back_to_the_default_without_a_usable_row() {
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let unknown = interactive_lane_row(&store, "some-future-agent");
+
+        assert_eq!(hosting_runner(&store, None, &ClaudeRunner).name(), "claude");
+        assert_eq!(
+            hosting_runner(&store, Some(9999), &ClaudeRunner).name(),
+            "claude"
+        );
+        assert_eq!(
+            hosting_runner(&store, Some(unknown), &ClaudeRunner).name(),
+            "claude"
+        );
+    }
+
+    #[test]
+    fn from_lookup_reads_the_named_vars_and_treats_empty_as_absent() {
+        let vars = crate::agent::SessionEnvVars {
+            session_id: "SID",
+            pid: "PID",
+        };
+        let lookup = |key: &str| match key {
+            "SID" => Some("ses_1".to_string()),
+            "PID" => Some("4242".to_string()),
+            "TSKMSTR_RUN_ID" => Some(String::new()),
+            "TSKMSTR_SESSION_RUN_ID" => Some("7".to_string()),
+            _ => None,
+        };
+
+        let env = SessionEnv::from_lookup(&vars, &lookup, PathBuf::from("/tmp/wt"));
+
+        assert_eq!(env.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(env.agent_pid, Some(4242));
+        assert_eq!(env.lane_run_id, None);
+        assert_eq!(env.session_run_id, Some(7));
+        assert_eq!(env.cwd, PathBuf::from("/tmp/wt"));
+    }
+
+    /// GitHub issue #196: an interactive lane routed to opencode while the
+    /// configured default is claude. Its session only exports opencode's
+    /// vars, so registering through the default runner's var names found no
+    /// session id, adopted nothing, and left the row pid-less until the
+    /// reaper failed it as stale with the agent still working.
+    #[test]
+    fn an_opencode_hosted_lane_stays_running_through_a_reap() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let id = interactive_lane_row(&store, "opencode");
+        let run_id = id.to_string();
+        let lookup = |key: &str| match key {
+            "OPENCODE_SESSION_ID" => Some("ses_1".to_string()),
+            "OPENCODE_PID" => Some("4242".to_string()),
+            "TSKMSTR_SESSION_RUN_ID" => Some(run_id.clone()),
+            _ => None,
+        };
+
+        let runner = hosting_runner(&store, Some(id), &ClaudeRunner);
+        let env = SessionEnv::from_lookup(
+            &runner.session_env_vars(),
+            &lookup,
+            PathBuf::from("/tmp/wt"),
+        );
+        register_session(&store, None, markers_dir.path(), &env, "lane", "GH-1").unwrap();
+        store.backdate_heartbeat_for_tests(id, 60);
+        let reaped = store.reap(10, &|pid| pid == 4242, &|_| true).unwrap();
+
+        assert!(reaped.is_empty(), "reaped a live run: {reaped:?}");
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(run.pid, Some(4242));
     }
 }
