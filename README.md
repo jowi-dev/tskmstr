@@ -254,7 +254,7 @@ tm auth status
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
-| `tm merge <KEY>...` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, finishing the ticket's live runs, archive-then-kill of the `tm-<scope>-<key>` tmux session, `status_on_merge`, stale `tm:status/*` label sweep on a closed GitHub issue, then the same for stacked PRs already merged into its branch). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
+| `tm merge <KEY>...` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, finishing the ticket's live runs, archive-then-kill of the `tm-<scope>-<key>` tmux session, `status_on_merge`, stale `tm:status/*` label sweep on a closed GitHub issue, then the same for stacked PRs already merged into its branch, then a short headless agent session that archives the merged branch's thatch memories). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
 | `tm drift [KEY...] [--fix] [--stall-hours <N>]` | List tickets whose tracker status has drifted from what their lane runs and PRs did, across every project the run store has lane runs for: finished work still in To Do, merged PRs whose ticket isn't done, running lanes on a To Do ticket, and in-progress tickets with no live run or open PR for more than `N` hours (default 24). Read-only by default; `--fix` applies each finding's `status_on_*` transition (stalled tickets are never moved), and `KEY...` restricts listing and fixing to those tickets. See "Ticket/run status drift" below |
 | `tm usage` | Print the stored usage snapshots (5-hour / 7-day utilization per agent) with their source, age and reset time — what the usage gate sees. See "Usage snapshots" below |
 | `tm usage statusline [-- <command...>]` | Claude Code statusline shim: save the stdin payload's `rate_limits` as usage snapshots (at most every 30s), then run `<command...>` with the same stdin and print its output unchanged. Recording errors never change the output or exit code (`TM_DEBUG=1` prints them on stderr). See "Usage snapshots" below |
@@ -2420,8 +2420,25 @@ these stages:
    branch, so nothing else closes those issues. Already-done tickets are
    reported, not moved. A failure here only warns; `tm drift` still finds
    any left behind.
+10. **Branch memory consolidation.** tm starts a short headless agent
+    session in a `memory` window, at the repo root, on the same tmux
+    session a conflict session would use. The agent lists the thatch
+    memories scoped to the merged branch in the project store and exits
+    straight away if there are none. Otherwise it folds them into one
+    unscoped archived record and forgets the originals, so branch-scoped
+    memories don't go stale once their branch is deleted. tm doesn't
+    wait for it: the window closes when the agent exits, and its output
+    goes to `merge-memory-<key>-<timestamp>.log` under tm's run-state
+    directory. The session has no run row, so it is confined instead:
+    it can call thatch's MCP tools and nothing else (no shell, no file
+    edits), and it gets a 30-turn budget. Under opencode, which has no
+    flag for that, it runs without the permission bypass and your own
+    opencode `permission` config decides. A merge that fails or is
+    handed back starts no session. A failure to start one only warns and
+    never changes the exit code. Turn it off with `[work.merge]
+    consolidate_memories = false`.
 
-Exit codes: `0` merged (steps 4-9 all attempted; cleanup/base-sync
+Exit codes: `0` merged (steps 4-10 all attempted; cleanup/base-sync
 warnings don't change this), `2` a conflict session never resolved (step
 3, or the step 4 retry), `1` any other error (no open PR, a diverged branch, a dirty worktree,
 a `gh`/`git` failure).
@@ -2470,6 +2487,10 @@ or more keys, tm works in two phases:
    shared window lives in a merged ticket's session (the case outside tmux),
    that session is also kept while any ticket is still handed back to it.
 
+The batch ends with one memory-consolidation session (stage 10) naming
+every branch it merged, not one session per branch. A batch spanning
+several repos gets one session per repo.
+
 The batch ends with a summary of what merged, what was handed back, and
 what failed. The exit code is `1` if any ticket failed, else `2` if any was
 handed back, else `0`.
@@ -2490,9 +2511,9 @@ Two boundaries worth knowing:
 
 ### `[work.merge]`: conflict-resolution session settings
 
-Both the board's `M` key and `tm merge <KEY>` share this section — it only
-configures the agent session a rebase conflict opens (stage 3 above); it
-never gates whether merging is available at all, unlike `[work.audit]`'s
+Both the board's `M` key and `tm merge <KEY>` share this section. It
+configures the agent session a rebase conflict opens (stage 3 above) and
+the post-merge memory session (stage 10); it never gates whether merging is available at all, unlike `[work.audit]`'s
 `dir`. Every field is optional:
 
 ```toml
@@ -2501,6 +2522,7 @@ never gates whether merging is available at all, unlike `[work.audit]`'s
 # prompt_file = ".tskmstr/prompts/merge.md"    # optional; see [work.audit]'s prompt_file above
 # model = "opus"                               # optional; see "Which model a launch uses"
 # batch_conflict_prompt = "..."               # optional; combined session for `tm merge KEY1 KEY2 ...`
+# consolidate_memories = false                # optional; default true, see stage 10
 ```
 
 `prompt_file` and `prompt` are mutually exclusive — setting both is a
@@ -2520,6 +2542,10 @@ multi-key `tm merge` opens when its tickets stop on conflicts (see
 its key, branch, base, and checkout directory. Leave it unset and tm ships
 a built-in batch prompt. It is independent of `prompt`/`prompt_file`,
 which stay single-ticket only, so setting it alongside either is fine.
+
+`consolidate_memories` turns off the post-merge memory-consolidation
+session (stage 10). It is on by default. That session uses `model` the
+same way the conflict sessions do.
 
 ### Retro board
 

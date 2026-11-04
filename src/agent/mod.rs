@@ -232,6 +232,24 @@ pub enum RunMode {
     Interactive,
 }
 
+/// Which tools a run may call. Runner-neutral: each adapter maps a scope onto
+/// its own CLI's tool and permission flags in
+/// [`AgentRunner::build_invocation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolScope {
+    /// Every tool the agent CLI offers, governed by the run's permission
+    /// mode. The shape every lane, audit, and conflict session uses.
+    #[default]
+    Full,
+    /// Only thatch's MCP tools: no shell, no file edits, no other MCP
+    /// servers. For untracked sessions that run in the operator's own
+    /// checkout with no worktree to contain them, such as the memory
+    /// consolidation session a successful `tm merge` starts (GitHub issue
+    /// #208). Overrides the run's permission mode, since a bypass would
+    /// re-open every tool the scope exists to close.
+    ThatchOnly,
+}
+
 /// Already-resolved inputs for one run's agent invocation. Everything here
 /// is data the caller has already produced (prompt text read from the
 /// prompt file and ticket-suffixed, the deployed hooks settings path, etc.)
@@ -275,6 +293,8 @@ pub struct InvocationInputs {
     /// environment variable carries `run_id` — see [`RunMode`], which is
     /// where the consequences of getting that wrong are spelled out.
     pub mode: RunMode,
+    /// Which tools the run may call. See [`ToolScope`].
+    pub tool_scope: ToolScope,
 }
 
 /// A fully resolved agent invocation: the program, its argv, and the
@@ -864,6 +884,35 @@ pub trait AgentRunner: Sync {
          on to the next ticket. Do not push. Do not make unrelated changes. If a ticket's \
          conflicts cannot be resolved safely, run `git rebase --abort` in its directory, \
          explain why, and continue with the next ticket."
+    }
+
+    /// Prompt for the short headless session a successful `tm merge` starts
+    /// to consolidate the merged branches' thatch memories (GitHub issue
+    /// #208). The one placeholder, `{branch_list}`, is substituted by the
+    /// caller (`crate::work::merge`) with one `- <branch>` line per merged
+    /// branch.
+    ///
+    /// The session checks for branch-scoped memories itself, so tm never
+    /// filters them: thatch's MCP `memory_list` takes only a `store`, but
+    /// tags each branch-scoped label with a `(branch:<name>)` suffix, and the
+    /// prompt has the agent pick entries by that suffix. (The `thatch list`
+    /// CLI does not show branch scope, which is why tm cannot skip an empty
+    /// branch before launching.) Runner-neutral for the same reason as
+    /// [`AgentRunner::default_merge_conflict_prompt_template`]: it names
+    /// thatch's MCP tools, which every runner reaches the same way.
+    fn default_memory_consolidation_prompt_template(&self) -> &'static str {
+        "These git branches were just merged and deleted:\n\n\
+         {branch_list}\n\n\
+         Your job is bounded: consolidate their thatch memories in this repository's project \
+         store, using thatch's MCP tools. Call memory_list once, with no arguments. Each \
+         branch-scoped entry's label ends with a (branch:<name>) suffix; pick the entries \
+         whose suffix names one of the branches above. If none match, stop now and do \
+         nothing else. Otherwise, for each branch with matching entries, read them with \
+         memory_show, then save one unscoped record with memory_remember, passing \
+         archived: true and no branch, summarizing what the branch delivered and any \
+         decisions, gotchas, or follow-ups still worth knowing. Then remove each original \
+         with memory_forget, which needs the exact full label as memory_list printed it. Do \
+         not change code, git state, or tickets."
     }
 
     /// Deploy this runner's telemetry artifacts (hook scripts + a settings
