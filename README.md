@@ -1794,11 +1794,11 @@ PROPOSED APPROACH, so the approach's premises are checked against the code
 before a lane runs it (GitHub issue #206). The default prompt is
 `/ticket-audit {key} (investigate with /thatch:refine on its PROPOSED
 APPROACH)`, and the `.tskmstr/prompts/audit.md` scaffold `tm init` writes
-carries the same step. Refine runs unmodified; the audit still checks links,
-blockers and lane size itself, writes refine's revisions back to the ticket
-body, and only then records a verdict with `tm ticket audit <KEY> --record`.
-A user-level `ticket-audit` skill lives outside this repo, so update it to
-match.
+carries the same step. The audit still checks links, blockers and lane size
+itself, writes refine's revisions back to the ticket body, and only then
+records a verdict with `tm ticket audit <KEY> --record`. If you use your own
+`ticket-audit` skill, add a `/thatch:refine` step on the ticket's PROPOSED
+APPROACH so a custom `prompt` gets the same investigation.
 
 Each card with a live `audit` window (or a live audit run) shows a badge:
 `audit: starting` (window up, run not registered yet), `audit: running`, `audit:
