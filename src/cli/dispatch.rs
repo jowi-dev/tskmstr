@@ -680,11 +680,12 @@ mod tests {
     struct OneReady;
 
     impl CandidateSource for OneReady {
-        fn candidates(&self) -> Result<Vec<Candidate>, String> {
+        fn candidates(&self, _with_epics: bool) -> Result<Vec<Candidate>, String> {
             Ok(vec![Candidate {
                 key: "GH-1".to_string(),
                 decision: ListDecision::Ready,
                 unblocks: 0,
+                epic: None,
             }])
         }
     }
