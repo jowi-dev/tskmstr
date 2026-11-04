@@ -1692,6 +1692,7 @@ fn run_check_cmd(quiet: bool) -> ExitCode {
             paths: &paths,
             home: &home,
             runner,
+            thatch: tskmstr::cli::check::probe_thatch(),
         };
         tskmstr::cli::check::run_check(&ctx, &mut stdout)
     };
