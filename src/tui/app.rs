@@ -1207,8 +1207,7 @@ impl App {
     /// The tickets of board column `col` that pass [`App::epic_filter`]
     /// (GitHub issue #199; ignored in [`BoardView::Epics`]) and match [`App::board_search_query`] (GitHub
     /// issue #152): with an empty query, every ticket the epic filter keeps,
-    /// otherwise those whose key or summary also contains the query,
-    /// case-insensitive, in column order. Empty (rather than panicking) if
+    /// otherwise those that also pass [`search_matches`], in column order. Empty (rather than panicking) if
     /// `col` is out of bounds. `columns` stays the unfiltered source of
     /// truth; selection, movement and rendering all go through this view.
     pub fn tickets_in_col(&self, col: usize) -> Vec<&TicketSummary> {
@@ -1220,11 +1219,7 @@ impl App {
             .tickets
             .iter()
             .filter(|t| self.board_view == BoardView::Epics || self.epic_filter.matches(t))
-            .filter(|t| {
-                query.is_empty()
-                    || t.key.to_lowercase().contains(&query)
-                    || t.summary.to_lowercase().contains(&query)
-            })
+            .filter(|t| query.is_empty() || search_matches(t, &query))
             .collect()
     }
 
@@ -4728,6 +4723,21 @@ fn clamp_selection(app: &mut App) {
     clamp_row(app);
 }
 
+/// Whether `ticket` matches the board search `query` (GitHub issues #152,
+/// #198): its key, its summary, its parent epic's key, or its parent epic's
+/// title contains `query`. `query` must already be lowercased; the ticket
+/// side is lowercased here, so the match ignores case. A ticket with no epic
+/// matches on its own key and summary only.
+fn search_matches(ticket: &TicketSummary, query: &str) -> bool {
+    let contains = |text: &str| text.to_lowercase().contains(query);
+    contains(&ticket.key)
+        || contains(&ticket.summary)
+        || ticket
+            .epic
+            .as_ref()
+            .is_some_and(|epic| contains(&epic.key) || contains(&epic.summary))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4816,6 +4826,48 @@ mod tests {
         assert!(keys_in_col(&app, 0).is_empty());
         assert_eq!(keys_in_col(&app, 1), ["PROJ-4"]);
         assert!(keys_in_col(&app, 9).is_empty());
+    }
+
+    /// The search board with epics (GitHub issue #198): PROJ-1 and PROJ-4
+    /// sit under PROJ-90 "Checkout revamp", PROJ-3 under PROJ-80 "Onboarding",
+    /// and PROJ-2 has no epic.
+    fn epic_search_board() -> App {
+        let checkout = epic("PROJ-90", "Checkout revamp");
+        let onboarding = epic("PROJ-80", "Onboarding");
+        board_with(
+            vec![
+                under(&checkout, titled("PROJ-1", "To Do", "Fix login")),
+                titled("PROJ-2", "To Do", "Add search"),
+                under(&onboarding, titled("PROJ-3", "To Do", "Login copy")),
+                under(&checkout, titled("PROJ-4", "Done", "Search docs")),
+            ],
+            0,
+        )
+    }
+
+    #[test]
+    fn tickets_in_col_matches_the_epic_key_case_insensitively() {
+        let mut app = epic_search_board();
+        app.board_search_query = "proj-90".to_string();
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-1"]);
+        assert_eq!(keys_in_col(&app, 1), ["PROJ-4"]);
+    }
+
+    #[test]
+    fn tickets_in_col_matches_the_epic_title_case_insensitively() {
+        let mut app = epic_search_board();
+        app.board_search_query = "ONBOARD".to_string();
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-3"]);
+        assert!(keys_in_col(&app, 1).is_empty());
+    }
+
+    #[test]
+    fn tickets_in_col_keeps_own_matches_for_cards_without_an_epic() {
+        let mut app = epic_search_board();
+        app.board_search_query = "add".to_string();
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-2"]);
+        app.board_search_query = "revamp".to_string();
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-1"]);
     }
 
     #[test]
