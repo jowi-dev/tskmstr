@@ -15,8 +15,11 @@
 //! apply the configured
 //! `status_on_merge` transition, clear any `tm:status/*` label GitHub left
 //! on an issue the PR's closing keyword closed (GitHub issue #75), and
-//! finally move the tickets of stacked PRs already merged into the branch,
-//! whose closing keywords GitHub never honoured (GitHub issue #94).
+//! move the tickets of stacked PRs already merged into the branch, whose
+//! closing keywords GitHub never honoured (GitHub issue #94), and finally
+//! start a short headless agent session that archives the merged branch's
+//! thatch memories (GitHub issue #208, see [`consolidate_branch_memories`];
+//! a batch starts one session for every branch it merged).
 //!
 //! The conflict-resolution session is launched the same way an interactive
 //! lane run is: [`crate::agent::AgentRunner::build_invocation`] under
