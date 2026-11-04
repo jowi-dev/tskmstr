@@ -709,15 +709,21 @@ without `--audited` and it waits for `tm ticket audit`.
      project-specific detail the create session should know. -->
 ";
 
-/// Thatch scaffold for `[work.audit]`: recall memory for `{key}`, audit with
-/// the `thatch-ticket-description` skill, write findings back, leave repo
-/// context. `{key}` is substituted at launch.
+/// Thatch scaffold for `[work.audit]`: recall memory for `{key}`, run
+/// `/thatch:refine` on the ticket's PROPOSED APPROACH, check what refine does
+/// not (links, blockers, lane size), write refine's revisions back to the
+/// ticket body, then record the verdict (GitHub issue #206). `{key}` is
+/// substituted at launch.
 const AUDIT_THATCH_TEMPLATE: &str = "\
 # Audit ticket {key}
 
-Audit ticket {key}: check that its description still matches reality and is
-actionable. Keep the ticket body human-readable; keep detailed findings in
-thatch memory.
+Audit ticket {key}: check that its description still matches reality, that
+its proposed approach holds up against the code, and that a headless lane run
+can carry it out without a human. Keep the ticket body human-readable; keep
+detailed findings in thatch memory.
+
+Start with `tm ticket audit {key}` to read the ticket, its links, and its last
+audit.
 
 ## Recall thatch memory first
 
@@ -726,10 +732,29 @@ plans, decisions, and related tickets — so the audit is grounded in what the
 project already knows. The `thatch-code-archaeology` skill helps when the ticket
 touches unfamiliar code.
 
-## Audit with the thatch skill
+## Refine the proposed approach
 
-Use the `thatch-ticket-description` skill to judge the description against
-reality and rewrite it where it has drifted, without inventing requirements.
+Run `/thatch:refine` on the ticket's PROPOSED APPROACH section as the plan to
+refine. Use refine as it is; do not change how it works. It checks the plan's
+premises against the code and revises the plan until its reviewer agrees.
+
+## Check what refine does not
+
+Refine does not check links, blockers, or lane size, and the verdict depends on
+them. Confirm the ticket's links and blockers are right, and that one lane run
+can finish it. Ask the user about any gap you cannot close from the code.
+
+## Write the ticket back
+
+Use the `thatch-ticket-description` skill to write refine's revisions back to
+the ticket body, along with anything else that has drifted, without inventing
+requirements. Do this before recording a verdict: a `ready` verdict needs the
+revised body on the ticket.
+
+## Record the verdict
+
+Record the verdict with `tm ticket audit {key} --record ready` or
+`tm ticket audit {key} --record needs-work --notes \"<why>\"`.
 
 ## Write findings back to thatch memory
 
@@ -3557,6 +3582,25 @@ mod tests {
         assert!(
             audit.contains("## Repo-specific context"),
             "audit.md must have the context marker: {audit}"
+        );
+        // GitHub issue #206: refine runs on the ticket's approach, and its
+        // revisions reach the ticket body before the verdict is recorded.
+        let refine = audit
+            .find("/thatch:refine")
+            .unwrap_or_else(|| panic!("audit.md must run /thatch:refine: {audit}"));
+        assert!(
+            audit.contains("PROPOSED APPROACH"),
+            "audit.md must aim refine at the ticket's approach: {audit}"
+        );
+        let write_back = audit
+            .find("write refine's revisions back")
+            .unwrap_or_else(|| panic!("audit.md must write refine's revisions back: {audit}"));
+        let verdict = audit
+            .find("tm ticket audit {key} --record")
+            .unwrap_or_else(|| panic!("audit.md must record the verdict: {audit}"));
+        assert!(
+            refine < write_back && write_back < verdict,
+            "refine, then write-back, then verdict: {audit}"
         );
 
         // review.md: thatch memory recall + write-back + thatch-review-* skills
