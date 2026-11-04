@@ -490,6 +490,18 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             program: self.current_exe.clone(),
             cwd: repo_dir.to_path_buf(),
         };
+        let ci_launcher = tskmstr::work::dispatch::CommandCiFixLauncher {
+            program: self.current_exe.clone(),
+            cwd: repo_dir.to_path_buf(),
+            log_dir: tskmstr::work::dispatch::ci_fix_log_dir(&self.home),
+            spawner: &tskmstr::work::detach::RealDetachSpawner,
+        };
+        let ci = tskmstr::work::ci_fix::SweepDeps {
+            store: self.store,
+            gh: &gh,
+            repo_dir,
+            launcher: &ci_launcher,
+        };
         let notifier = tskmstr::work::notify::DesktopNotifier::detect();
         let deps = tskmstr::work::dispatch::TickDeps {
             store: self.store,
@@ -500,6 +512,7 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             usage_prober: &usage_prober,
             now: unix_now(),
             notifier: &notifier,
+            ci: Some(&ci),
         };
         let cfg = tskmstr::work::dispatch::TickConfig {
             scope,
@@ -507,6 +520,7 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             max_launches_per_day: config.dispatch.max_launches_per_day,
             max_fix_rounds: config.dispatch.max_fix_rounds,
             stall_notify_mins: config.dispatch.stall_notify_mins,
+            fix_failing_ci: config.dispatch.fix_failing_ci,
             lanes: &lanes,
             runners: &runners,
             memory: &config.work.memory,
@@ -3147,6 +3161,18 @@ impl AutopilotTicker {
             ),
         };
 
+        let ci_launcher = dispatch::CommandCiFixLauncher {
+            program: launcher.program.clone(),
+            cwd: target.repo_root.clone(),
+            log_dir: dispatch::ci_fix_log_dir(&self.home),
+            spawner: &tskmstr::work::detach::RealDetachSpawner,
+        };
+        let ci = tskmstr::work::ci_fix::SweepDeps {
+            store: &store,
+            gh: &gh,
+            repo_dir: &target.repo_root,
+            launcher: &ci_launcher,
+        };
         let notifier = tskmstr::work::notify::DesktopNotifier::detect();
         let deps = dispatch::TickDeps {
             store: &store,
@@ -3157,6 +3183,7 @@ impl AutopilotTicker {
             usage_prober: &usage_prober,
             now: unix_now(),
             notifier: &notifier,
+            ci: Some(&ci),
         };
         let cfg = dispatch::TickConfig {
             scope: &scope,
@@ -3164,6 +3191,7 @@ impl AutopilotTicker {
             max_launches_per_day: config.dispatch.max_launches_per_day,
             max_fix_rounds: config.dispatch.max_fix_rounds,
             stall_notify_mins: config.dispatch.stall_notify_mins,
+            fix_failing_ci: config.dispatch.fix_failing_ci,
             lanes: &lanes,
             runners: &runners,
             memory: &config.work.memory,

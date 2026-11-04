@@ -31,7 +31,13 @@
 //! 6. Records a `launch` row in `dispatch_events` per launch, and a
 //!    `refused` row, with its [`Refusal::code`], for the tick's first
 //!    refusal.
-//! 7. Sends the desktop notifications the scope owes
+//! 7. With `[dispatch] fix_failing_ci` on, runs the CI-fix sweep
+//!    ([`ci_fix::sweep`], GitHub issue #226): a fix pass for each lane PR
+//!    whose checks finished red on a head commit not yet handled, started
+//!    detached through a [`ci_fix::CiFixLauncher`]. A fix pass is not a
+//!    lane, so it counts against neither `max_lanes` nor the daily cap;
+//!    `tm review ci-fix` applies admission itself.
+//! 8. Sends the desktop notifications the scope owes
 //!    ([`crate::work::notify`]): tickets that entered awaiting review or hit
 //!    the fix-round cap, and a refusal streak older than
 //!    `stall_notify_mins`. Each transition notifies once.
@@ -56,6 +62,8 @@ use crate::work::admission::{
     AdmissionRefusal, RouteRefusal, RunnerRefusal, UsageProber, UsageRefusal, route_unattended,
 };
 use crate::work::auto_review::RoundVerdict;
+use crate::work::ci_fix::{self, CiFixAction};
+use crate::work::detach::DetachSpawner;
 use crate::work::notify::{self, Notifier};
 
 /// `dispatch_events.kind` of a launched lane.
@@ -140,6 +148,45 @@ impl Launcher for CommandLauncher {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!("{}: {}", output.status, stderr.trim()))
     }
+}
+
+/// Production [`ci_fix::CiFixLauncher`]: spawns `<program> review ci-fix
+/// --unattended <ticket>` detached in `cwd`, logging to `<log_dir>/<ticket
+/// lowercased>.log`. Detached because the tick holds the scope lock and
+/// `tm review ci-fix --unattended` may wait on admission.
+pub struct CommandCiFixLauncher<'a> {
+    /// The `tm` binary, normally `std::env::current_exe()`.
+    pub program: PathBuf,
+    /// Where to run it: the scope's repo, so `tm` loads its config.
+    pub cwd: PathBuf,
+    /// Where the logs go, normally [`ci_fix_log_dir`]; created on first
+    /// launch.
+    pub log_dir: PathBuf,
+    /// Spawns the detached process.
+    pub spawner: &'a dyn DetachSpawner,
+}
+
+impl ci_fix::CiFixLauncher for CommandCiFixLauncher<'_> {
+    fn launch(&self, ticket: &str) -> Result<(), String> {
+        std::fs::create_dir_all(&self.log_dir)
+            .map_err(|err| format!("could not create {}: {err}", self.log_dir.display()))?;
+        let log_path = self.log_dir.join(format!("{}.log", ticket.to_lowercase()));
+        let argv = ["review", "ci-fix", "--unattended", ticket].map(str::to_string);
+        self.spawner
+            .spawn_detached(&self.program, &argv, &self.cwd, &log_path)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+}
+
+/// Where [`CommandCiFixLauncher`] logs: `~/.local/state/tskmstr/ci-fix`,
+/// beside the auto-review logs
+/// ([`crate::cli::review::auto_review_log_path`]).
+pub fn ci_fix_log_dir(home: &Path) -> PathBuf {
+    home.join(".local")
+        .join("state")
+        .join("tskmstr")
+        .join("ci-fix")
 }
 
 /// Held for as long as a tick runs; dropping it releases the scope lock.
@@ -234,8 +281,12 @@ pub struct TickConfig<'a> {
     /// `[dispatch] max_launches_per_day`: the most launches in any rolling
     /// 24 hours for this scope.
     pub max_launches_per_day: usize,
-    /// `[dispatch] max_fix_rounds`, for fix-cap notifications.
+    /// `[dispatch] max_fix_rounds`, for fix-cap notifications and the
+    /// CI-fix sweep's cap.
     pub max_fix_rounds: u32,
+    /// `[dispatch] fix_failing_ci`: run the CI-fix sweep (GitHub issue
+    /// #226).
+    pub fix_failing_ci: bool,
     /// `[dispatch] stall_notify_mins`: how long refusals for one reason
     /// last before a stall notification.
     pub stall_notify_mins: u64,
@@ -273,6 +324,9 @@ pub struct TickDeps<'a> {
     pub now: i64,
     /// Shows the tick's notifications ([`crate::work::notify`]).
     pub notifier: &'a dyn Notifier,
+    /// What the CI-fix sweep reads PR checks with and launches through.
+    /// `None` runs no sweep, whatever [`TickConfig::fix_failing_ci`] says.
+    pub ci: Option<&'a ci_fix::SweepDeps<'a>>,
 }
 
 /// Why a tick did nothing at all.
@@ -415,6 +469,8 @@ pub struct TickReport {
     pub skipped: Option<Skip>,
     /// The titles of the notifications the tick sent, in order.
     pub notified: Vec<String>,
+    /// What the CI-fix sweep did, one entry per ticket it acted on.
+    pub ci_fixes: Vec<CiFixAction>,
 }
 
 /// Errors that stop a tick outright.
@@ -527,6 +583,10 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
             refusal.code(),
             &refusal.to_string(),
         )?;
+    }
+
+    if let Some(ci) = deps.ci.filter(|_| cfg.fix_failing_ci) {
+        report.ci_fixes = ci_fix::sweep(ci, &runs, cfg.scope, cfg.max_fix_rounds)?;
     }
 
     let mut notices = notify::ticket_notices(&runs, cfg.scope, cfg.max_fix_rounds);
@@ -808,6 +868,7 @@ mod tests {
         now: i64,
         max_fix_rounds: u32,
         stall_notify_mins: u64,
+        fix_failing_ci: bool,
         notifier: Recorder,
     }
 
@@ -832,6 +893,7 @@ mod tests {
                 now: NOW,
                 max_fix_rounds: 3,
                 stall_notify_mins: 30,
+                fix_failing_ci: false,
                 notifier: Recorder::default(),
             }
         }
@@ -853,6 +915,27 @@ mod tests {
             candidates: &[Candidate],
             launcher: &dyn Launcher,
         ) -> (TickReport, Option<bool>) {
+            self.tick_with_ci_asking(candidates, launcher, None)
+        }
+
+        /// [`Fixture::tick`] with `ci` as the tick's CI-fix sweep deps.
+        fn tick_with_ci(
+            &self,
+            candidates: &[Candidate],
+            launcher: &dyn Launcher,
+            ci: Option<&ci_fix::SweepDeps<'_>>,
+        ) -> TickReport {
+            self.tick_with_ci_asking(candidates, launcher, ci).0
+        }
+
+        /// [`Fixture::tick_with_ci`], also returning whether the tick asked
+        /// its candidate source for parent epics.
+        fn tick_with_ci_asking(
+            &self,
+            candidates: &[Candidate],
+            launcher: &dyn Launcher,
+            ci: Option<&ci_fix::SweepDeps<'_>>,
+        ) -> (TickReport, Option<bool>) {
             let lock = self.lock();
             let source = FakeCandidates(candidates.to_vec(), Cell::new(None));
             let pressure = self.pressure;
@@ -866,6 +949,7 @@ mod tests {
                 usage_prober: &NoProbe,
                 now: self.now,
                 notifier: &self.notifier,
+                ci,
             };
             let cfg = TickConfig {
                 scope: SCOPE,
@@ -873,6 +957,7 @@ mod tests {
                 max_launches_per_day: self.max_launches_per_day,
                 max_fix_rounds: self.max_fix_rounds,
                 stall_notify_mins: self.stall_notify_mins,
+                fix_failing_ci: self.fix_failing_ci,
                 lanes: &self.lanes,
                 runners: &self.runners,
                 memory: &self.memory,
@@ -943,6 +1028,158 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    // --- CI-fix sweep (GitHub issue #226) ---
+
+    /// Records each ticket a CI fix was started for.
+    #[derive(Default)]
+    struct FakeCiFixLauncher(RefCell<Vec<String>>);
+
+    impl ci_fix::CiFixLauncher for FakeCiFixLauncher {
+        fn launch(&self, ticket: &str) -> Result<(), String> {
+            self.0.borrow_mut().push(ticket.to_string());
+            Ok(())
+        }
+    }
+
+    /// `gh` reporting PR 7 open and red on head `abc1234`.
+    fn red_pr_gh() -> crate::github::gh_cli::FakeGhCli {
+        use crate::github::gh_cli::{CheckResult, ChecksState, PrChecks, PrLifecycle};
+        crate::github::gh_cli::FakeGhCli::new().with_pr_checks(
+            7,
+            Ok(PrChecks {
+                lifecycle: PrLifecycle::Open,
+                head_sha: "abc1234".to_string(),
+                checks: vec![CheckResult {
+                    name: "test".to_string(),
+                    state: ChecksState::Failing,
+                    run_id: Some(2),
+                    details_url: None,
+                }],
+            }),
+        )
+    }
+
+    /// A finished lane run for `ticket` whose PR is number 7.
+    fn finished_lane_with_pr(store: &RunStore, ticket: &str) {
+        let lane = start(store, ticket, "lane");
+        finish(
+            store,
+            lane,
+            RunStatus::Done,
+            Some("https://github.com/o/r/pull/7"),
+        );
+    }
+
+    #[test]
+    fn with_fix_failing_ci_on_a_red_lane_pr_gets_a_ci_fix() {
+        let mut fx = Fixture::new();
+        fx.fix_failing_ci = true;
+        finished_lane_with_pr(&fx.store, "GH-1");
+        let gh = red_pr_gh();
+        let ci_launcher = FakeCiFixLauncher::default();
+        let ci = ci_fix::SweepDeps {
+            store: &fx.store,
+            gh: &gh,
+            repo_dir: Path::new("/repo"),
+            launcher: &ci_launcher,
+        };
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let report = fx.tick_with_ci(&[ready("GH-2", 0)], &launcher, Some(&ci));
+
+        assert_eq!(*ci_launcher.0.borrow(), vec!["GH-1"]);
+        assert_eq!(
+            report.ci_fixes,
+            vec![ci_fix::CiFixAction::Started {
+                ticket: "GH-1".to_string(),
+                sha: "abc1234".to_string(),
+            }]
+        );
+        assert_eq!(launcher.tickets(), vec!["GH-2"], "lanes still launch");
+    }
+
+    #[test]
+    fn with_fix_failing_ci_off_checks_are_never_read() {
+        let fx = Fixture::new();
+        finished_lane_with_pr(&fx.store, "GH-1");
+        let gh = red_pr_gh();
+        let ci_launcher = FakeCiFixLauncher::default();
+        let ci = ci_fix::SweepDeps {
+            store: &fx.store,
+            gh: &gh,
+            repo_dir: Path::new("/repo"),
+            launcher: &ci_launcher,
+        };
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let report = fx.tick_with_ci(&[], &launcher, Some(&ci));
+
+        assert!(gh.pr_checks_calls().is_empty());
+        assert!(ci_launcher.0.borrow().is_empty());
+        assert!(report.ci_fixes.is_empty());
+    }
+
+    #[test]
+    fn a_ci_fix_does_not_count_against_max_lanes() {
+        let mut fx = Fixture::new();
+        fx.fix_failing_ci = true;
+        fx.max_lanes = 0;
+        finished_lane_with_pr(&fx.store, "GH-1");
+        let gh = red_pr_gh();
+        let ci_launcher = FakeCiFixLauncher::default();
+        let ci = ci_fix::SweepDeps {
+            store: &fx.store,
+            gh: &gh,
+            repo_dir: Path::new("/repo"),
+            launcher: &ci_launcher,
+        };
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let report = fx.tick_with_ci(&[ready("GH-2", 0)], &launcher, Some(&ci));
+
+        assert!(matches!(report.refused, Some(Refusal::MaxLanes { .. })));
+        assert_eq!(*ci_launcher.0.borrow(), vec!["GH-1"]);
+    }
+
+    #[test]
+    fn command_ci_fix_launcher_spawns_tm_review_ci_fix_detached() {
+        let dir = tempdir().unwrap();
+        let spawner = crate::work::detach::FakeDetachSpawner::new(4242);
+        let log_dir = dir.path().join("state/ci-fix");
+        let launcher = CommandCiFixLauncher {
+            program: PathBuf::from("/usr/local/bin/tm"),
+            cwd: PathBuf::from("/repo"),
+            log_dir: log_dir.clone(),
+            spawner: &spawner,
+        };
+
+        ci_fix::CiFixLauncher::launch(&launcher, "GH-12").unwrap();
+
+        let recorded = spawner.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].program, PathBuf::from("/usr/local/bin/tm"));
+        assert_eq!(
+            recorded[0].argv,
+            vec!["review", "ci-fix", "--unattended", "GH-12"]
+        );
+        assert_eq!(recorded[0].working_dir, PathBuf::from("/repo"));
+        assert_eq!(recorded[0].log_path, log_dir.join("gh-12.log"));
+        assert!(log_dir.is_dir(), "the log dir is created");
+    }
+
+    #[test]
+    fn ci_fix_log_dir_sits_beside_the_auto_review_logs() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            ci_fix_log_dir(home),
+            PathBuf::from("/home/me/.local/state/tskmstr/ci-fix")
+        );
+        assert_eq!(
+            crate::cli::review::auto_review_log_path(home, "GH-1").parent(),
+            Some(Path::new("/home/me/.local/state/tskmstr/auto-review"))
+        );
     }
 
     #[test]
