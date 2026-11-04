@@ -132,6 +132,12 @@ section is absent; the default auto-review prompt names
   only works on another agent (a sentence opening "opencode only" while
   this repo runs Claude Code, say). The line names the `[work.*]` section,
   the skill, and both agents.
+- **skill not installed**: `thatch` is installed, but a named
+  `thatch-*` skill has no `SKILL.md` in the runner's repo-local or
+  user-level skills dir. Either `thatch setup` was never run for this
+  agent, or thatch leaves that skill out for it (on Claude Code there is
+  no `thatch-code-review`, which is opencode only). Run `thatch setup`
+  for the agent, or point the prompt at a skill it has.
 
 tm reads only thatch's `--version` output and the skill files, never its
 database or config.

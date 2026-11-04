@@ -160,7 +160,8 @@ pub fn run_update(
             // Thatch health comes from `tm check` alone, never from here.
             DriftFinding::ThatchMissing { .. }
             | DriftFinding::ThatchOutdated { .. }
-            | DriftFinding::HostLimitedSkill { .. } => {}
+            | DriftFinding::HostLimitedSkill { .. }
+            | DriftFinding::ThatchSkillNotInstalled { .. } => {}
         }
     }
 

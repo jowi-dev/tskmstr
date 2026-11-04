@@ -246,6 +246,16 @@ pub enum DriftFinding {
         runner: String,
         path: PathBuf,
     },
+    /// A `thatch-*` skill a configured prompt names has no `SKILL.md` in
+    /// `runner`'s repo-local or user-level skills dir, though `thatch` is
+    /// installed: `thatch setup` was never run for `runner`, or it installs
+    /// that skill only for another agent (Claude Code gets no
+    /// `thatch-code-review`, which is opencode only).
+    ThatchSkillNotInstalled {
+        session: String,
+        skill: String,
+        runner: String,
+    },
 }
 
 impl DriftFinding {
@@ -396,6 +406,16 @@ impl std::fmt::Display for DriftFinding {
                 "[{session}] uses `{skill}`, which {} marks {host} only, \
                  but this repo runs {runner}",
                 path.display()
+            ),
+            DriftFinding::ThatchSkillNotInstalled {
+                session,
+                skill,
+                runner,
+            } => write!(
+                f,
+                "[{session}] uses `{skill}`, which is not installed for {runner}; \
+                 run `thatch setup` for {runner}, or point the prompt at a skill \
+                 {runner} has"
             ),
         }
     }
@@ -1165,8 +1185,9 @@ fn skill_description(contents: &str) -> Option<String> {
 /// configured prompt names a thatch skill: `thatch` missing from PATH or
 /// older than [`MIN_THATCH_VERSION`], and every named skill whose
 /// `SKILL.md` (repo-local first, then user-level, in the runner's skills
-/// dir) limits it to another agent. A skill found in neither place is left
-/// alone: this check is about mismatches, not presence.
+/// dir) limits it to another agent. A skill found in neither place is
+/// reported as not installed when `thatch` itself is, since thatch setup
+/// leaves a host-limited skill out for the hosts it doesn't support.
 fn thatch_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<DriftFinding> {
     if ctx.thatch == ThatchProbe::Unchecked {
         return Vec::new();
@@ -1218,6 +1239,13 @@ fn thatch_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Ve
             .into_iter()
             .find_map(|path| std::fs::read_to_string(&path).ok().map(|c| (path, c)))
         else {
+            if matches!(ctx.thatch, ThatchProbe::Installed { .. }) {
+                findings.push(DriftFinding::ThatchSkillNotInstalled {
+                    session: session.clone(),
+                    skill: skill.clone(),
+                    runner: ctx.runner.display_name().to_string(),
+                });
+            }
             continue;
         };
         if let Some(host) = skill_description(&contents)
@@ -2349,8 +2377,17 @@ mod tests {
         );
     }
 
-    /// A repo whose one lane prompt names the `thatch-coding-workflow` skill.
+    /// A repo whose one lane prompt names the `thatch-coding-workflow` skill,
+    /// with that skill and the default auto-review skills installed at the
+    /// user level.
     fn thatch_lane_repo(env: &TestEnv) {
+        for skill in [
+            "thatch-coding-workflow",
+            crate::work::auto_review::FIRST_ROUND_SKILL,
+            crate::work::auto_review::FOLLOWUP_SKILL,
+        ] {
+            write_home_skill(env, skill, "A thatch skill.");
+        }
         let lane_prompt = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
         std::fs::create_dir_all(lane_prompt.parent().unwrap()).expect("mkdir");
         std::fs::write(
@@ -2545,14 +2582,43 @@ mod tests {
     }
 
     #[test]
+    fn named_skill_absent_from_the_runners_skills_dirs_is_reported() {
+        let env = test_env();
+        write_home_skill(&env, "thatch-review-followup", "Follow-up review rounds.");
+        write_repo_config(&env, "schema_version = 2\n");
+
+        let (findings, rendered) = check_with(
+            &env,
+            ThatchProbe::Installed {
+                version: Some(MIN_THATCH_VERSION.to_string()),
+            },
+        );
+
+        let expected = DriftFinding::ThatchSkillNotInstalled {
+            session: "work.auto_review".to_string(),
+            skill: "thatch-code-review".to_string(),
+            runner: "Claude Code".to_string(),
+        };
+        assert_eq!(findings, vec![expected.clone()]);
+        assert!(!expected.is_advisory());
+        assert!(
+            rendered.contains("[work.auto_review]")
+                && rendered.contains("thatch-code-review")
+                && rendered.contains("Claude Code")
+                && rendered.contains("thatch setup"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn skill_limited_to_the_running_host_is_clean() {
         let env = test_env();
+        thatch_lane_repo(&env);
         write_home_skill(
             &env,
             "thatch-coding-workflow",
             "Workflow. Claude Code only.",
         );
-        thatch_lane_repo(&env);
 
         let (findings, _) = check_with(
             &env,
