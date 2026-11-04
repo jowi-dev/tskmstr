@@ -490,6 +490,18 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             program: self.current_exe.clone(),
             cwd: repo_dir.to_path_buf(),
         };
+        let ci_launcher = tskmstr::work::dispatch::CommandCiFixLauncher {
+            program: self.current_exe.clone(),
+            cwd: repo_dir.to_path_buf(),
+            log_dir: tskmstr::work::dispatch::ci_fix_log_dir(&self.home),
+            spawner: &tskmstr::work::detach::RealDetachSpawner,
+        };
+        let ci = tskmstr::work::ci_fix::SweepDeps {
+            store: self.store,
+            gh: &gh,
+            repo_dir,
+            launcher: &ci_launcher,
+        };
         let notifier = tskmstr::work::notify::DesktopNotifier::detect();
         let deps = tskmstr::work::dispatch::TickDeps {
             store: self.store,
@@ -500,6 +512,7 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             usage_prober: &usage_prober,
             now: unix_now(),
             notifier: &notifier,
+            ci: Some(&ci),
         };
         let cfg = tskmstr::work::dispatch::TickConfig {
             scope,
@@ -507,6 +520,7 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             max_launches_per_day: config.dispatch.max_launches_per_day,
             max_fix_rounds: config.dispatch.max_fix_rounds,
             stall_notify_mins: config.dispatch.stall_notify_mins,
+            fix_failing_ci: config.dispatch.fix_failing_ci,
             lanes: &lanes,
             runners: &runners,
             memory: &config.work.memory,
@@ -724,6 +738,7 @@ fn run_review(cmd: ReviewCmd) -> Result<(), Box<dyn std::error::Error>> {
         ReviewCmd::Fix { .. } => unreachable!("tm review fix is handled by run_review_fix"),
         ReviewCmd::Auto { key, foreground } => run_review_auto(key, foreground),
         ReviewCmd::Import { key, fix } => run_review_import(key, fix),
+        ReviewCmd::CiFix { key, unattended } => run_review_ci_fix(key, unattended),
     }
 }
 
@@ -2621,8 +2636,18 @@ fn run_review_import(key: String, fix: bool) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-/// Builds the real [`tskmstr::cli::review::ReviewFixDeps`] `tm review fix`
-/// and `tm review auto` share, and hands them to `f` with the run paths and
+/// `tm review ci-fix <KEY> [--unattended]` (GitHub issue #226): build real
+/// dependencies and run [`tskmstr::cli::review::ci_fix`].
+fn run_review_ci_fix(key: String, unattended: bool) -> Result<(), Box<dyn std::error::Error>> {
+    with_review_deps(|deps, run_paths, _config| {
+        let mut stdout = std::io::stdout();
+        tskmstr::cli::review::ci_fix(deps, run_paths, &key, unattended, &mut stdout).map(|_| ())
+    })??;
+    Ok(())
+}
+
+/// Builds the real [`tskmstr::cli::review::ReviewFixDeps`] every `tm
+/// review` subcommand shares, and hands them to `f` with the run paths and
 /// the leniently loaded config.
 ///
 /// # Errors
@@ -3136,6 +3161,18 @@ impl AutopilotTicker {
             ),
         };
 
+        let ci_launcher = dispatch::CommandCiFixLauncher {
+            program: launcher.program.clone(),
+            cwd: target.repo_root.clone(),
+            log_dir: dispatch::ci_fix_log_dir(&self.home),
+            spawner: &tskmstr::work::detach::RealDetachSpawner,
+        };
+        let ci = tskmstr::work::ci_fix::SweepDeps {
+            store: &store,
+            gh: &gh,
+            repo_dir: &target.repo_root,
+            launcher: &ci_launcher,
+        };
         let notifier = tskmstr::work::notify::DesktopNotifier::detect();
         let deps = dispatch::TickDeps {
             store: &store,
@@ -3146,6 +3183,7 @@ impl AutopilotTicker {
             usage_prober: &usage_prober,
             now: unix_now(),
             notifier: &notifier,
+            ci: Some(&ci),
         };
         let cfg = dispatch::TickConfig {
             scope: &scope,
@@ -3153,6 +3191,7 @@ impl AutopilotTicker {
             max_launches_per_day: config.dispatch.max_launches_per_day,
             max_fix_rounds: config.dispatch.max_fix_rounds,
             stall_notify_mins: config.dispatch.stall_notify_mins,
+            fix_failing_ci: config.dispatch.fix_failing_ci,
             lanes: &lanes,
             runners: &runners,
             memory: &config.work.memory,

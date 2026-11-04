@@ -352,6 +352,8 @@ pub struct RawRunnerConfig {
 pub struct RawDispatchConfig {
     /// See [`DispatchConfig::allow_paid_fallback`].
     pub allow_paid_fallback: Option<bool>,
+    /// See [`DispatchConfig::fix_failing_ci`].
+    pub fix_failing_ci: Option<bool>,
     /// See [`DispatchConfig::max_fix_rounds`].
     pub max_fix_rounds: Option<u32>,
     /// See [`DispatchConfig::max_launches_per_day`].
@@ -1178,6 +1180,10 @@ pub struct DispatchConfig {
     /// Whether unattended dispatch may route to a [`Billing::Metered`]
     /// runner. Off by default.
     pub allow_paid_fallback: bool,
+    /// Whether the autopilot dispatcher starts a fix pass in a lane's
+    /// worktree when the lane's PR checks fail (GitHub issue #226). Each
+    /// pass counts against `max_fix_rounds`. Off by default.
+    pub fix_failing_ci: bool,
     /// How many `review-fix` runs a ticket may have before tm stops
     /// starting fix passes for it on its own. It counts every fix pass,
     /// whatever triggered it (`tm review auto`, an imported GitHub review,
@@ -1210,6 +1216,7 @@ impl Default for DispatchConfig {
     fn default() -> Self {
         Self {
             allow_paid_fallback: false,
+            fix_failing_ci: false,
             max_fix_rounds: DEFAULT_MAX_FIX_ROUNDS,
             max_lanes: DEFAULT_DISPATCH_MAX_LANES,
             max_launches_per_day: DEFAULT_DISPATCH_MAX_LAUNCHES_PER_DAY,
@@ -2232,6 +2239,12 @@ fn merge_with_repo_dir(
             .as_ref()
             .and_then(|d| d.allow_paid_fallback)
             .or(global.dispatch.as_ref().and_then(|d| d.allow_paid_fallback))
+            .unwrap_or(false),
+        fix_failing_ci: repo
+            .dispatch
+            .as_ref()
+            .and_then(|d| d.fix_failing_ci)
+            .or(global.dispatch.as_ref().and_then(|d| d.fix_failing_ci))
             .unwrap_or(false),
         max_fix_rounds: repo
             .dispatch
@@ -7012,6 +7025,29 @@ mod tests {
 
         assert_eq!(cfg.dispatch.max_fix_rounds, 1, "repo wins");
         assert!(cfg.review.resolve_imported, "global kept");
+    }
+
+    // --- failing-CI fix passes: `[dispatch] fix_failing_ci` (GitHub issue
+    // #226) ---
+
+    #[test]
+    fn fix_failing_ci_defaults_to_off() {
+        let cfg = load_with("", None).expect("should load");
+
+        assert!(!cfg.dispatch.fix_failing_ci);
+    }
+
+    #[test]
+    fn fix_failing_ci_is_merged_repo_over_global() {
+        let cfg = load_with(
+            "[dispatch]\nfix_failing_ci = true\n",
+            Some("[dispatch]\nfix_failing_ci = false\n"),
+        )
+        .expect("should load");
+        assert!(!cfg.dispatch.fix_failing_ci, "repo wins");
+
+        let cfg = load_with("[dispatch]\nfix_failing_ci = true\n", None).expect("should load");
+        assert!(cfg.dispatch.fix_failing_ci, "global kept");
     }
 
     #[test]

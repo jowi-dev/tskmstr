@@ -303,6 +303,7 @@ tm auth status
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
 | `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch. The agent triages the comments with `thatch-review-response`, fixes the ones that hold up, declines the rest with a one-line reason, and posts nothing to GitHub; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
 | `tm review auto <KEY> [--foreground]` | Run thatch auto-review rounds over `<KEY>`'s lane-run branch: each round is an interactive `auto-review` run in a `review` window of the ticket's `tm-<scope>-<key>` session (`review-2` for round 2). Its confirmed findings are appended to the worktree's vdiff comment store, and findings at or above `[work.auto_review].fix_threshold` start an interactive `tm review fix` pass in a `fix` / `fix-N` window. The loop waits for each step's signal file for up to `round_timeout_mins` and leaves the windows open. Stops on a clean round, or flags the round for review at `max_review_rounds` or when a step never signals. Detaches by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`; see "Auto-review" below |
+| `tm review ci-fix <KEY>` | Start one fix pass over the failing CI checks on `<KEY>`'s PR, as an interactive `review-fix` run in a `fix` / `fix-N` window of the ticket's `tm-<scope>-<key>` session, with the failing checks' logs in its prompt. Starts nothing while a check is still running or when none failed. Ignores `max_fix_rounds`; see "Fixing failing CI" below |
 | `tm review import <KEY> [--fix]` | Import the unresolved human review threads on `<KEY>`'s PR into the worktree's vdiff comment store, once each, skipping review bots and comments tm or vdiff posted. `--fix` then runs `tm review fix <KEY> --fg` unless the ticket is at `[dispatch] max_fix_rounds`; see "Importing a GitHub review" below |
 
 **Epics and parents are backend-dependent.** The `--epic`/`--parent` create flags, `tm ticket parent <KEY> <EPIC>`/`--clear`, and `tm ticket children` go through the ticket backend, and both backends support them. In Jira, an epic is an issue of type `Epic` (or whatever `epic_issue_type` names, see "Configuration"), a child points at its epic through Jira's `parent` field, and `tm ticket children` lists every ticket under the epic, done ones included, in backlog rank order. In GitHub, an epic is an issue labeled `tm:epic` (`tm backend init-labels` creates the label), and a ticket's epic is its GitHub sub-issue parent. `tm ticket create --parent` creates the issue and then adds it as a sub-issue; if that second step fails, the error names the created issue so you can retry with `tm ticket parent`. Sub-issues can live in other repos: `tm ticket children` lists such a child as `owner/repo#N`, which is display-only, so `tm` won't accept it as a ticket key. A parent always means "this epic is made of these tickets"; ordering between epics is a `Blocks` link (`tm ticket link`).
@@ -1291,7 +1292,11 @@ it. A tick:
    `every_runner`, ...). When every runner refused for the same kind of
    reason, the code is that kind (`memory` or `usage`); mixed reasons give
    `every_runner`.
-7. **Sends desktop notifications** (GitHub issue #121,
+7. **Starts CI fixes**, when `fix_failing_ci` is on: a fix pass for each
+   lane PR whose checks finished red (see "Fixing failing CI" below). A
+   fix pass is not a lane, so it counts against neither `max_lanes` nor
+   `max_launches_per_day`.
+8. **Sends desktop notifications** (GitHub issue #121,
    `src/work/notify.rs`) when:
    - a ticket enters "awaiting review": its PR is open, the bots have
      reviewed, and nothing is running;
@@ -1345,6 +1350,8 @@ allow_paid_fallback = false # default; see "Usage admission" above
 tick_secs = 60              # default; how often an open TUI ticks (10 minimum)
 max_launches_per_day = 20   # default; launches per repo in any rolling 24 hours
 stall_notify_mins = 30      # default; refusing this long for one reason notifies
+max_fix_rounds = 3          # default; automatic fix passes per ticket, every source
+fix_failing_ci = false      # default; start a fix pass when a lane PR's CI fails
 ```
 
 #### Running autopilot from the TUI
@@ -2313,8 +2320,8 @@ whose own findings are all below `fix_threshold` does not fix, even when
 bugbot left comments. Those stay out of the store, on the PR, for you.
 With autopilot off, none of this applies.
 
-Every automatic fix pass, from `tm review auto` or `tm review import --fix`,
-stops at `[dispatch] max_fix_rounds` (default 3). The cap counts every
+Every automatic fix pass, from `tm review auto`, `tm review import --fix`,
+or a CI fix, stops at `[dispatch] max_fix_rounds` (default 3). The cap counts every
 `review-fix` run the ticket has had, including ones you started with `F`.
 
 ### Importing a GitHub review
@@ -2348,6 +2355,36 @@ store to `<git-dir>/vdiff/archive/import-<n>.json`.
 ```
 
 See `docs/plans/gh-120-import-github-review.md` for the details.
+
+### Fixing failing CI
+
+**With `[dispatch] fix_failing_ci = true`, autopilot starts a fix pass when
+a lane PR's CI fails** (GitHub issue #226). It is off by default and only
+runs while autopilot is on for the repo: each dispatch tick checks the PR
+of every finished lane with nothing running.
+
+A pass starts when every check on the PR's head commit has finished and at
+least one failed. A check still running holds it back, so a re-run in
+progress never triggers, and neither does a re-run that passes. The pass
+runs `tm review ci-fix <KEY>`: an interactive `review-fix` run in a `fix`
+window of the ticket's session, whose prompt lists the failing checks and
+carries their failure logs (`gh run view --log-failed`), trimmed to about
+24 KB in total. The agent fixes the cause on the PR's branch and pushes.
+
+One pass runs per red head commit. tm records a `ci_fix started <sha>`
+event on the lane run before it starts the pass, so later ticks leave that
+commit alone. A new push that fails again gets its own pass.
+
+CI fixes count against `[dispatch] max_fix_rounds` with every other fix
+pass. At the cap, tm starts nothing, records `ci_fix capped <sha>`, flags
+the lane for review, and sends the fix-cap notification.
+
+`tm review ci-fix <KEY>` runs a pass by hand. It ignores the cap.
+
+```toml
+[dispatch]
+# fix_failing_ci = false    # needs autopilot on for the repo
+```
 
 ### Merging from the board
 

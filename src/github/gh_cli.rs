@@ -383,6 +383,32 @@ pub trait GhCli {
     /// [`GhCli::pr_review_threads`]'s doc comment.
     fn pr_state(&self, dir: &Path, number: u64) -> Result<PrLifecycle, GhError>;
 
+    /// The lifecycle, head commit, and per-check results of pull request
+    /// `number` (`gh pr view <number> --json
+    /// state,headRefOid,statusCheckRollup`).
+    ///
+    /// `dir` is an explicit repo root, same rationale as
+    /// [`GhCli::pr_review_threads`]'s doc comment.
+    fn pr_checks(&self, dir: &Path, number: u64) -> Result<PrChecks, GhError>;
+
+    /// The logs of the failed steps of GitHub Actions run `run_id` (`gh run
+    /// view <run_id> --log-failed`), returned as `gh` prints them.
+    ///
+    /// `run_id` comes from [`CheckResult::run_id`]. `dir` is an explicit
+    /// repo root, same rationale as [`GhCli::pr_review_threads`]'s doc
+    /// comment.
+    fn run_failed_log(&self, dir: &Path, run_id: u64) -> Result<String, GhError>;
+
+    /// The logs of the failed steps of one GitHub Actions job `job_id`
+    /// (`gh run view --job <job_id> --log-failed`), returned as `gh` prints
+    /// them. Unlike [`GhCli::run_failed_log`], this leaves out the other
+    /// failed jobs of the same run.
+    ///
+    /// `job_id` comes from [`CheckResult::job_id`]. `dir` is an explicit
+    /// repo root, same rationale as [`GhCli::pr_review_threads`]'s doc
+    /// comment.
+    fn job_failed_log(&self, dir: &Path, job_id: u64) -> Result<String, GhError>;
+
     /// List the review threads on pull request `number`, same as
     /// [`GhCli::pr_review_threads`] but with each thread's first comment's
     /// full body/path/line/URL, for handing bot findings to a cleanup
@@ -820,6 +846,77 @@ pub enum ChecksState {
     Failing,
 }
 
+/// A pull request's lifecycle, head commit, and individual checks, as
+/// returned by [`GhCli::pr_checks`].
+///
+/// Unlike [`PrReviewState::checks`], which folds the rollup into one
+/// verdict, this keeps every check separately so a caller can tell which
+/// ones failed and fetch their logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrChecks {
+    /// The pull request's lifecycle state.
+    pub lifecycle: PrLifecycle,
+    /// The SHA of the pull request's head commit (`gh`'s `headRefOid`), so
+    /// a caller can tell which push the checks ran against.
+    pub head_sha: String,
+    /// One entry per `statusCheckRollup` entry, in `gh`'s order. Empty when
+    /// the PR has no checks.
+    pub checks: Vec<CheckResult>,
+}
+
+impl PrChecks {
+    /// The checks whose verdict is [`ChecksState::Failing`].
+    pub fn failing(&self) -> impl Iterator<Item = &CheckResult> {
+        self.checks
+            .iter()
+            .filter(|check| check.state == ChecksState::Failing)
+    }
+}
+
+/// One `statusCheckRollup` entry on a pull request: a GitHub `CheckRun` or a
+/// commit `StatusContext`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckResult {
+    /// The check's display name: a `CheckRun`'s `name` or a
+    /// `StatusContext`'s `context`.
+    pub name: String,
+    /// The check's verdict, by the same rules [`PrReviewState::checks`]
+    /// folds. Never [`ChecksState::None`].
+    pub state: ChecksState,
+    /// The GitHub Actions run id from [`CheckResult::details_url`], when the
+    /// check is an Actions job (`.../actions/runs/<run_id>[/job/<job_id>]`).
+    /// `None` for checks posted by other CI systems. This is what
+    /// [`GhCli::run_failed_log`] takes.
+    pub run_id: Option<u64>,
+    /// The GitHub Actions job id from [`CheckResult::details_url`], when the
+    /// link names one (`.../actions/runs/<run_id>/job/<job_id>`). This is
+    /// what [`GhCli::job_failed_log`] takes.
+    pub job_id: Option<u64>,
+    /// The check's link: a `CheckRun`'s `detailsUrl` or a `StatusContext`'s
+    /// `targetUrl`.
+    pub details_url: Option<String>,
+    /// The raw verdict `gh` reported: a `CheckRun`'s `conclusion` or a
+    /// `StatusContext`'s `state`, such as `FAILURE` or `CANCELLED`. `None`
+    /// while a check run has no conclusion yet.
+    pub conclusion: Option<String>,
+}
+
+impl CheckResult {
+    /// Whether this check failed in a way a code fix can address: its
+    /// conclusion is `FAILURE`, `ERROR`, `TIMED_OUT`, or `STARTUP_FAILURE`.
+    ///
+    /// Narrower than [`ChecksState::Failing`], which also counts `CANCELLED`
+    /// and `ACTION_REQUIRED`. A cancelled run or one waiting for approval
+    /// is red on the overview, but its log holds no error to fix.
+    pub fn failed_for_fix(&self) -> bool {
+        self.state == ChecksState::Failing
+            && matches!(
+                self.conclusion.as_deref(),
+                Some("FAILURE" | "ERROR" | "TIMED_OUT" | "STARTUP_FAILURE")
+            )
+    }
+}
+
 /// The open/closed state of a GitHub issue, as reported by `state` in `gh
 /// issue view`/`gh issue list --json` output (`"OPEN"` or `"CLOSED"`).
 ///
@@ -1020,6 +1117,11 @@ const PR_VIEW_JSON_FIELDS: &str = "number,url,title,body,headRefName,baseRefName
 /// `merged` JSON field (see [`PrLifecycle`]'s doc comment), and requesting it
 /// makes every call fail with `Unknown JSON field: "merged"`.
 const PR_STATE_JSON_FIELDS: &str = "state";
+
+/// Fields requested from `gh pr view <number> --json` in
+/// [`GhCli::pr_checks`]; shared so the flag and [`RawPrChecks`]
+/// deserialization stay in lockstep.
+const PR_CHECKS_JSON_FIELDS: &str = "state,headRefOid,statusCheckRollup";
 
 /// Fields requested from `gh pr list --state all --json` in
 /// [`GhCli::pr_list_all`]; shared so the flag and [`RawPrListAllEntry`]
@@ -1650,6 +1752,63 @@ impl GhCli for ShellGhCli {
             })?;
 
         interpret_pr_state_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn pr_checks(&self, dir: &Path, number: u64) -> Result<PrChecks, GhError> {
+        let output = Command::new("gh")
+            .args([
+                "pr",
+                "view",
+                &number.to_string(),
+                "--json",
+                PR_CHECKS_JSON_FIELDS,
+            ])
+            .current_dir(dir)
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh pr view".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_pr_checks_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn run_failed_log(&self, dir: &Path, run_id: u64) -> Result<String, GhError> {
+        let output = Command::new("gh")
+            .args(["run", "view", &run_id.to_string(), "--log-failed"])
+            .current_dir(dir)
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh run view".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_run_failed_log_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn job_failed_log(&self, dir: &Path, job_id: u64) -> Result<String, GhError> {
+        let output = Command::new("gh")
+            .args(["run", "view", "--job", &job_id.to_string(), "--log-failed"])
+            .current_dir(dir)
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh run view --job".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_run_failed_log_output(
             output.status.code(),
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
@@ -2693,13 +2852,7 @@ fn interpret_pr_state_output(
                 command: "gh pr view".to_string(),
                 message: err.to_string(),
             })?;
-            Ok(if raw.state.eq_ignore_ascii_case("merged") {
-                PrLifecycle::Merged
-            } else if raw.state.eq_ignore_ascii_case("closed") {
-                PrLifecycle::Closed
-            } else {
-                PrLifecycle::Open
-            })
+            Ok(lifecycle_from_state(&raw.state))
         }
         Some(code) => Err(GhError::Command {
             command: "gh pr view".to_string(),
@@ -2709,6 +2862,107 @@ fn interpret_pr_state_output(
         None => Err(GhError::Command {
             command: "gh pr view".to_string(),
             exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
+/// Classify `gh`'s PR `state` field (`OPEN`, `CLOSED`, or `MERGED`, see
+/// [`PrLifecycle`]'s doc comment), case-insensitively. Anything else reads
+/// as open.
+fn lifecycle_from_state(state: &str) -> PrLifecycle {
+    if state.eq_ignore_ascii_case("merged") {
+        PrLifecycle::Merged
+    } else if state.eq_ignore_ascii_case("closed") {
+        PrLifecycle::Closed
+    } else {
+        PrLifecycle::Open
+    }
+}
+
+/// Raw shape of `gh pr view --json` [`PR_CHECKS_JSON_FIELDS`] output, for
+/// deserialization only; [`PrChecks`] is the shape callers use.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPrChecks {
+    state: String,
+    #[serde(default)]
+    head_ref_oid: String,
+    #[serde(default)]
+    status_check_rollup: Option<Vec<RawCheck>>,
+}
+
+/// Interpret the result of a `gh pr view <number> --json
+/// state,headRefOid,statusCheckRollup` invocation.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`]. A `null` rollup
+/// (a PR with no checks) reads as an empty [`PrChecks::checks`].
+fn interpret_pr_checks_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<PrChecks, GhError> {
+    match exit_code {
+        Some(0) => {
+            let raw =
+                serde_json::from_str::<RawPrChecks>(stdout).map_err(|err| GhError::Parse {
+                    command: "gh pr view".to_string(),
+                    message: err.to_string(),
+                })?;
+            Ok(PrChecks {
+                lifecycle: lifecycle_from_state(&raw.state),
+                head_sha: raw.head_ref_oid,
+                checks: raw
+                    .status_check_rollup
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(RawCheck::into_result)
+                    .collect(),
+            })
+        }
+        code => Err(GhError::Command {
+            command: "gh pr view".to_string(),
+            exit_code: code,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
+/// The GitHub Actions run id in a check's details URL, from either
+/// `https://github.com/<owner>/<repo>/actions/runs/<run_id>` or the same
+/// with a trailing `/job/<job_id>`. `None` for any other URL, such as one
+/// from an external CI system.
+fn actions_run_id(url: &str) -> Option<u64> {
+    let (_, rest) = url.split_once("/actions/runs/")?;
+    rest.split(['/', '?', '#']).next()?.parse().ok()
+}
+
+/// The GitHub Actions job id in a check's details URL of the form
+/// `https://github.com/<owner>/<repo>/actions/runs/<run_id>/job/<job_id>`.
+/// `None` for a run-level link or any other URL.
+fn actions_job_id(url: &str) -> Option<u64> {
+    let (_, rest) = url.split_once("/actions/runs/")?;
+    let (_, job) = rest.split_once("/job/")?;
+    job.split(['/', '?', '#']).next()?.parse().ok()
+}
+
+/// Interpret the result of a `gh run view <run_id> --log-failed`
+/// invocation: stdout unchanged on success, a [`GhError::Command`]
+/// otherwise.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`].
+fn interpret_run_failed_log_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<String, GhError> {
+    match exit_code {
+        Some(0) => Ok(stdout.to_string()),
+        code => Err(GhError::Command {
+            command: "gh run view".to_string(),
+            exit_code: code,
             stderr: stderr.trim().to_string(),
         }),
     }
@@ -2760,20 +3014,54 @@ struct RawPrReviewState {
     status_check_rollup: Option<Vec<RawCheck>>,
 }
 
-/// One `statusCheckRollup` entry: a `CheckRun` (`status` + `conclusion`)
-/// or a commit `StatusContext` (`state`). Both shapes deserialize here,
-/// with the other shape's fields absent.
+/// One `statusCheckRollup` entry: a `CheckRun` (`name`, `status`,
+/// `conclusion`, `detailsUrl`) or a commit `StatusContext` (`context`,
+/// `state`, `targetUrl`). Both shapes deserialize here, with the other
+/// shape's fields absent.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawCheck {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
     conclusion: Option<String>,
     #[serde(default)]
     state: Option<String>,
+    #[serde(default)]
+    details_url: Option<String>,
+    #[serde(default)]
+    target_url: Option<String>,
 }
 
 impl RawCheck {
+    /// This entry as a [`CheckResult`], with its verdict from
+    /// [`RawCheck::verdict`] and its run id from [`actions_run_id`].
+    fn into_result(self) -> CheckResult {
+        let state = self.verdict();
+        let conclusion = self
+            .state
+            .clone()
+            .or(self.conclusion.clone())
+            .filter(|value| !value.is_empty());
+        let details_url = self
+            .details_url
+            .or(self.target_url)
+            .filter(|url| !url.is_empty());
+        CheckResult {
+            name: self.name.or(self.context).unwrap_or_default(),
+            state,
+            run_id: details_url.as_deref().and_then(actions_run_id),
+            job_id: details_url.as_deref().and_then(actions_job_id),
+            details_url,
+            conclusion,
+        }
+    }
+
+    /// This entry's verdict. Never [`ChecksState::None`].
     fn verdict(&self) -> ChecksState {
         let failed = |value: &str| {
             matches!(
@@ -2893,13 +3181,7 @@ fn interpret_pr_list_all_output(
                         number: entry.number,
                         head_ref_name: entry.head_ref_name,
                         head_ref_oid: entry.head_ref_oid,
-                        lifecycle: if entry.state.eq_ignore_ascii_case("merged") {
-                            PrLifecycle::Merged
-                        } else if entry.state.eq_ignore_ascii_case("closed") {
-                            PrLifecycle::Closed
-                        } else {
-                            PrLifecycle::Open
-                        },
+                        lifecycle: lifecycle_from_state(&entry.state),
                         updated_at: entry.updated_at,
                     })
                     .collect()
@@ -3944,6 +4226,12 @@ pub struct FakeGhCli {
     pr_reviews_calls: RefCell<Vec<u64>>,
     pr_state_results: RefCell<HashMap<u64, Result<PrLifecycle, GhError>>>,
     pr_state_calls: RefCell<Vec<u64>>,
+    pr_checks_results: RefCell<HashMap<u64, Result<PrChecks, GhError>>>,
+    pr_checks_calls: RefCell<Vec<u64>>,
+    run_failed_log_results: RefCell<HashMap<u64, Result<String, GhError>>>,
+    job_failed_log_results: RefCell<HashMap<u64, Result<String, GhError>>>,
+    job_failed_log_calls: RefCell<Vec<u64>>,
+    run_failed_log_calls: RefCell<Vec<u64>>,
     finding_details_results: RefCell<HashMap<u64, Result<Vec<FindingDetail>, GhError>>>,
     finding_details_calls: RefCell<Vec<u64>>,
     full_threads_results: RefCell<HashMap<u64, Result<PrReviewThreads, GhError>>>,
@@ -4041,6 +4329,12 @@ impl Default for FakeGhCli {
             pr_reviews_calls: RefCell::new(Vec::new()),
             pr_state_results: RefCell::new(HashMap::new()),
             pr_state_calls: RefCell::new(Vec::new()),
+            pr_checks_results: RefCell::new(HashMap::new()),
+            pr_checks_calls: RefCell::new(Vec::new()),
+            run_failed_log_results: RefCell::new(HashMap::new()),
+            run_failed_log_calls: RefCell::new(Vec::new()),
+            job_failed_log_results: RefCell::new(HashMap::new()),
+            job_failed_log_calls: RefCell::new(Vec::new()),
             finding_details_results: RefCell::new(HashMap::new()),
             finding_details_calls: RefCell::new(Vec::new()),
             full_threads_results: RefCell::new(HashMap::new()),
@@ -4211,6 +4505,53 @@ impl FakeGhCli {
     /// The pull request numbers passed to `pr_state`, in call order.
     pub fn pr_state_calls(&self) -> Vec<u64> {
         self.pr_state_calls.borrow().clone()
+    }
+
+    /// Set the result `pr_checks` will return for pull request `number`.
+    ///
+    /// A PR number with no configured result returns an open PR with an
+    /// empty head SHA and no checks, the same "nothing interesting
+    /// configured" default as [`FakeGhCli::with_pr_state`].
+    pub fn with_pr_checks(self, number: u64, result: Result<PrChecks, GhError>) -> Self {
+        self.pr_checks_results.borrow_mut().insert(number, result);
+        self
+    }
+
+    /// The pull request numbers passed to `pr_checks`, in call order.
+    pub fn pr_checks_calls(&self) -> Vec<u64> {
+        self.pr_checks_calls.borrow().clone()
+    }
+
+    /// Set the result `run_failed_log` will return for Actions run `run_id`.
+    ///
+    /// A run id with no configured result returns `Ok(String::new())`, an
+    /// empty log.
+    pub fn with_run_failed_log(self, run_id: u64, result: Result<String, GhError>) -> Self {
+        self.run_failed_log_results
+            .borrow_mut()
+            .insert(run_id, result);
+        self
+    }
+
+    /// The run ids passed to `run_failed_log`, in call order.
+    pub fn run_failed_log_calls(&self) -> Vec<u64> {
+        self.run_failed_log_calls.borrow().clone()
+    }
+
+    /// Set the result `job_failed_log` will return for Actions job `job_id`.
+    ///
+    /// A job id with no configured result returns `Ok(String::new())`, an
+    /// empty log.
+    pub fn with_job_failed_log(self, job_id: u64, result: Result<String, GhError>) -> Self {
+        self.job_failed_log_results
+            .borrow_mut()
+            .insert(job_id, result);
+        self
+    }
+
+    /// The job ids passed to `job_failed_log`, in call order.
+    pub fn job_failed_log_calls(&self) -> Vec<u64> {
+        self.job_failed_log_calls.borrow().clone()
     }
 
     /// Set the result `pr_bot_finding_details` will return for pull request
@@ -4676,6 +5017,34 @@ impl GhCli for FakeGhCli {
         }
     }
 
+    fn pr_checks(&self, _dir: &Path, number: u64) -> Result<PrChecks, GhError> {
+        self.pr_checks_calls.borrow_mut().push(number);
+        match self.pr_checks_results.borrow().get(&number) {
+            Some(result) => result.clone(),
+            None => Ok(PrChecks {
+                lifecycle: PrLifecycle::Open,
+                head_sha: String::new(),
+                checks: Vec::new(),
+            }),
+        }
+    }
+
+    fn run_failed_log(&self, _dir: &Path, run_id: u64) -> Result<String, GhError> {
+        self.run_failed_log_calls.borrow_mut().push(run_id);
+        match self.run_failed_log_results.borrow().get(&run_id) {
+            Some(result) => result.clone(),
+            None => Ok(String::new()),
+        }
+    }
+
+    fn job_failed_log(&self, _dir: &Path, job_id: u64) -> Result<String, GhError> {
+        self.job_failed_log_calls.borrow_mut().push(job_id);
+        match self.job_failed_log_results.borrow().get(&job_id) {
+            Some(result) => result.clone(),
+            None => Ok(String::new()),
+        }
+    }
+
     fn pr_bot_finding_details(
         &self,
         _dir: &Path,
@@ -5043,6 +5412,191 @@ mod tests {
         let err = interpret_pr_review_state_output(Some(1), "", "auth required").unwrap_err();
 
         assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    // --- pr_checks parsing ---
+
+    fn pr_checks_json(state: &str, rollup: &str) -> String {
+        format!(r#"{{"state":"{state}","headRefOid":"abc123","statusCheckRollup":{rollup}}}"#)
+    }
+
+    #[test]
+    fn pr_checks_output_parses_a_failing_check_run_with_its_actions_run_id() {
+        let rollup = r#"[{"__typename":"CheckRun","name":"test","status":"COMPLETED",
+            "conclusion":"FAILURE",
+            "detailsUrl":"https://github.com/o/r/actions/runs/123456/job/789"}]"#;
+
+        let checks =
+            interpret_pr_checks_output(Some(0), &pr_checks_json("OPEN", rollup), "").unwrap();
+
+        assert_eq!(checks.lifecycle, PrLifecycle::Open);
+        assert_eq!(checks.head_sha, "abc123");
+        assert_eq!(checks.failing().count(), 1);
+        assert_eq!(
+            checks.checks,
+            vec![CheckResult {
+                name: "test".to_string(),
+                state: ChecksState::Failing,
+                run_id: Some(123456),
+                job_id: Some(789),
+                details_url: Some("https://github.com/o/r/actions/runs/123456/job/789".to_string()),
+                conclusion: Some("FAILURE".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn pr_checks_output_reads_an_in_progress_check_run_as_pending() {
+        let rollup = r#"[{"__typename":"CheckRun","name":"build","status":"IN_PROGRESS",
+            "conclusion":"","detailsUrl":"https://github.com/o/r/actions/runs/5"}]"#;
+
+        let checks =
+            interpret_pr_checks_output(Some(0), &pr_checks_json("OPEN", rollup), "").unwrap();
+
+        assert_eq!(checks.checks[0].state, ChecksState::Pending);
+        assert_eq!(checks.checks[0].run_id, Some(5));
+        assert_eq!(checks.checks[0].conclusion, None);
+        assert_eq!(checks.failing().count(), 0);
+    }
+
+    #[test]
+    fn failed_for_fix_excludes_cancelled_and_approval_waits() {
+        let rollup = r#"[
+            {"__typename":"CheckRun","name":"a","status":"COMPLETED","conclusion":"FAILURE"},
+            {"__typename":"CheckRun","name":"b","status":"COMPLETED","conclusion":"TIMED_OUT"},
+            {"__typename":"CheckRun","name":"c","status":"COMPLETED","conclusion":"STARTUP_FAILURE"},
+            {"__typename":"StatusContext","context":"d","state":"ERROR"},
+            {"__typename":"CheckRun","name":"e","status":"COMPLETED","conclusion":"CANCELLED"},
+            {"__typename":"CheckRun","name":"f","status":"COMPLETED","conclusion":"ACTION_REQUIRED"},
+            {"__typename":"CheckRun","name":"g","status":"COMPLETED","conclusion":"SUCCESS"}]"#;
+
+        let checks =
+            interpret_pr_checks_output(Some(0), &pr_checks_json("OPEN", rollup), "").unwrap();
+
+        let fixable: Vec<&str> = checks
+            .checks
+            .iter()
+            .filter(|check| check.failed_for_fix())
+            .map(|check| check.name.as_str())
+            .collect();
+        assert_eq!(fixable, vec!["a", "b", "c", "d"]);
+        assert_eq!(checks.failing().count(), 6);
+    }
+
+    #[test]
+    fn pr_checks_output_names_a_status_context_by_its_context() {
+        let rollup = r#"[{"__typename":"StatusContext","context":"ci/external",
+            "state":"SUCCESS","targetUrl":"https://ci.example.com/build/9"}]"#;
+
+        let checks =
+            interpret_pr_checks_output(Some(0), &pr_checks_json("OPEN", rollup), "").unwrap();
+
+        assert_eq!(
+            checks.checks,
+            vec![CheckResult {
+                name: "ci/external".to_string(),
+                state: ChecksState::Passing,
+                run_id: None,
+                job_id: None,
+                details_url: Some("https://ci.example.com/build/9".to_string()),
+                conclusion: Some("SUCCESS".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn pr_checks_output_reads_a_null_rollup_as_no_checks() {
+        let checks =
+            interpret_pr_checks_output(Some(0), &pr_checks_json("OPEN", "null"), "").unwrap();
+
+        assert!(checks.checks.is_empty());
+    }
+
+    #[test]
+    fn pr_checks_output_reads_a_merged_state() {
+        let checks =
+            interpret_pr_checks_output(Some(0), &pr_checks_json("MERGED", "[]"), "").unwrap();
+
+        assert_eq!(checks.lifecycle, PrLifecycle::Merged);
+    }
+
+    #[test]
+    fn pr_checks_output_surfaces_a_nonzero_exit_as_a_command_error() {
+        let err = interpret_pr_checks_output(Some(1), "", "no pull requests found").unwrap_err();
+
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn actions_run_id_parses_job_and_run_urls_and_ignores_other_urls() {
+        assert_eq!(
+            actions_run_id("https://github.com/o/r/actions/runs/42/job/7"),
+            Some(42)
+        );
+        assert_eq!(
+            actions_run_id("https://github.com/o/r/actions/runs/42"),
+            Some(42)
+        );
+        assert_eq!(actions_run_id("https://ci.example.com/build/42"), None);
+    }
+
+    #[test]
+    fn actions_job_id_parses_only_job_urls() {
+        assert_eq!(
+            actions_job_id("https://github.com/o/r/actions/runs/42/job/7?pr=3"),
+            Some(7)
+        );
+        assert_eq!(
+            actions_job_id("https://github.com/o/r/actions/runs/42"),
+            None
+        );
+        assert_eq!(actions_job_id("https://ci.example.com/job/42"), None);
+    }
+
+    // --- run_failed_log ---
+
+    #[test]
+    fn run_failed_log_output_returns_stdout_unchanged() {
+        let log = "test\tRun tests\tFAILED: 1 test\n";
+
+        assert_eq!(
+            interpret_run_failed_log_output(Some(0), log, "").unwrap(),
+            log
+        );
+    }
+
+    #[test]
+    fn run_failed_log_output_surfaces_a_nonzero_exit_as_a_command_error() {
+        let err = interpret_run_failed_log_output(Some(1), "", "run not found").unwrap_err();
+
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn fake_pr_checks_and_run_failed_log_return_configured_results_or_empty() {
+        let expected = PrChecks {
+            lifecycle: PrLifecycle::Closed,
+            head_sha: "def".to_string(),
+            checks: Vec::new(),
+        };
+        let fake = FakeGhCli::new()
+            .with_pr_checks(3, Ok(expected.clone()))
+            .with_run_failed_log(9, Ok("boom".to_string()));
+        let dir = Path::new(".");
+
+        assert_eq!(fake.pr_checks(dir, 3).unwrap(), expected);
+        assert_eq!(
+            fake.pr_checks(dir, 4).unwrap(),
+            PrChecks {
+                lifecycle: PrLifecycle::Open,
+                head_sha: String::new(),
+                checks: Vec::new(),
+            }
+        );
+        assert_eq!(fake.run_failed_log(dir, 9).unwrap(), "boom");
+        assert_eq!(fake.run_failed_log(dir, 10).unwrap(), "");
+        assert_eq!(fake.pr_checks_calls(), vec![3, 4]);
+        assert_eq!(fake.run_failed_log_calls(), vec![9, 10]);
     }
 
     // --- GhError::is_permanent ---

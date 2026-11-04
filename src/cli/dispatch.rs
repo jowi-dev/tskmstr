@@ -28,6 +28,7 @@ use thiserror::Error;
 use crate::cli::runs::format_age;
 use crate::config::{BackendIdentity, BackendIdentityResolver, Config, compatible_lane_names};
 use crate::runs::{AutopilotScope, RunStore, RunStoreError};
+use crate::work::ci_fix::CiFixAction;
 use crate::work::dispatch::{LaneChoice, Skip, TickReport, dispatch_state};
 
 /// Which scopes a `tm dispatch` command acts on.
@@ -211,6 +212,7 @@ fn tick_json(scope: &str, outcome: &TickOutcome) -> serde_json::Value {
             "refused": report.refused.as_ref().map(ToString::to_string),
             "skipped": report.skipped.map(skip_name),
             "notified": report.notified,
+            "ci_fixes": report.ci_fixes.iter().map(ci_fix_json).collect::<Vec<_>>(),
             "error": null,
         }),
         TickOutcome::Failed(err) => json!({
@@ -219,8 +221,41 @@ fn tick_json(scope: &str, outcome: &TickOutcome) -> serde_json::Value {
             "refused": null,
             "skipped": null,
             "notified": [],
+            "ci_fixes": [],
             "error": err,
         }),
+    }
+}
+
+/// One CI-fix sweep action as `tm dispatch tick --json` reports it.
+fn ci_fix_json(action: &CiFixAction) -> serde_json::Value {
+    let (ticket, name, sha, error) = match action {
+        CiFixAction::Started { ticket, sha } => (ticket, "started", Some(sha), None),
+        CiFixAction::Capped { ticket, sha } => (ticket, "capped", Some(sha), None),
+        CiFixAction::LaunchFailed { ticket, sha, error } => {
+            (ticket, "launch_failed", Some(sha), Some(error))
+        }
+        CiFixAction::CheckFailed { ticket, error } => {
+            (ticket, "checks_unavailable", None, Some(error))
+        }
+    };
+    json!({"ticket": ticket, "action": name, "sha": sha, "error": error})
+}
+
+/// One CI-fix sweep action as a `tm dispatch tick` line, after the scope.
+fn ci_fix_text(action: &CiFixAction) -> String {
+    let short = |sha: &str| sha.chars().take(7).collect::<String>();
+    match action {
+        CiFixAction::Started { ticket, sha } => {
+            format!("ci-fix {ticket} started ({})", short(sha))
+        }
+        CiFixAction::Capped { ticket, sha } => format!("ci-fix {ticket} capped ({})", short(sha)),
+        CiFixAction::LaunchFailed { ticket, error, .. } => {
+            format!("ci-fix {ticket} launch failed: {error}")
+        }
+        CiFixAction::CheckFailed { ticket, error } => {
+            format!("ci-fix {ticket} checks unavailable: {error}")
+        }
     }
 }
 
@@ -254,6 +289,9 @@ fn write_tick_text(scope: &str, outcome: &TickOutcome, out: &mut dyn Write) -> i
         writeln!(out, "{scope}: {refusal}")?;
     } else if report.launched.is_empty() {
         writeln!(out, "{scope}: nothing to launch")?;
+    }
+    for action in &report.ci_fixes {
+        writeln!(out, "{scope}: {}", ci_fix_text(action))?;
     }
     for title in &report.notified {
         writeln!(out, "{scope}: notified: {title}")?;
@@ -560,6 +598,25 @@ mod tests {
             }),
             skipped: None,
             notified: vec!["tm: GH-0 is awaiting your review".to_string()],
+            ci_fixes: vec![
+                CiFixAction::Started {
+                    ticket: "GH-3".to_string(),
+                    sha: "abc1234def5678".to_string(),
+                },
+                CiFixAction::Capped {
+                    ticket: "GH-4".to_string(),
+                    sha: "bcd2345".to_string(),
+                },
+                CiFixAction::LaunchFailed {
+                    ticket: "GH-5".to_string(),
+                    sha: "cde3456".to_string(),
+                    error: "no such file".to_string(),
+                },
+                CiFixAction::CheckFailed {
+                    ticket: "GH-6".to_string(),
+                    error: "rate limited".to_string(),
+                },
+            ],
         }
     }
 
@@ -597,6 +654,10 @@ mod tests {
             "github:o/one: launched GH-1 in lane backend on claude\n\
              github:o/one: launched GH-2 in lane backend on opencode (stacked on gh-1-branch)\n\
              github:o/one: not launching: 2 lanes running (GH-7, GH-8), [dispatch] max_lanes is 2\n\
+             github:o/one: ci-fix GH-3 started (abc1234)\n\
+             github:o/one: ci-fix GH-4 capped (bcd2345)\n\
+             github:o/one: ci-fix GH-5 launch failed: no such file\n\
+             github:o/one: ci-fix GH-6 checks unavailable: rate limited\n\
              github:o/one: notified: tm: GH-0 is awaiting your review\n\
              github:o/two: skipped: another host is ticking this scope\n\
              github:o/idle: nothing to launch\n\
@@ -661,6 +722,12 @@ mod tests {
                     "refused": "not launching: 2 lanes running (GH-7, GH-8), [dispatch] max_lanes is 2",
                     "skipped": null,
                     "notified": ["tm: GH-0 is awaiting your review"],
+                    "ci_fixes": [
+                        {"ticket": "GH-3", "action": "started", "sha": "abc1234def5678", "error": null},
+                        {"ticket": "GH-4", "action": "capped", "sha": "bcd2345", "error": null},
+                        {"ticket": "GH-5", "action": "launch_failed", "sha": "cde3456", "error": "no such file"},
+                        {"ticket": "GH-6", "action": "checks_unavailable", "sha": null, "error": "rate limited"},
+                    ],
                     "error": null,
                 },
                 {
@@ -669,6 +736,7 @@ mod tests {
                     "refused": null,
                     "skipped": null,
                     "notified": [],
+                    "ci_fixes": [],
                     "error": "no repo recorded for github:o/two; run `tm dispatch on` inside it once",
                 },
             ])
@@ -754,6 +822,7 @@ mod tests {
                 usage_prober: &NoProbe,
                 now: 1_000_000,
                 notifier: &crate::work::notify::NoNotifier,
+                ci: None,
             };
             let lanes = [LaneChoice {
                 name: "backend".to_string(),
@@ -767,6 +836,7 @@ mod tests {
                 max_launches_per_day: 100,
                 max_fix_rounds: 3,
                 stall_notify_mins: 30,
+                fix_failing_ci: false,
                 lanes: &lanes,
                 runners: &["claude"],
                 memory: &memory,
