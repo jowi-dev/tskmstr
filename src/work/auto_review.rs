@@ -269,8 +269,8 @@ pub fn review_completion_section(findings_file: &Path) -> String {
 
 /// The section tm appends to an auto-review fix pass's prompt: the loop
 /// waits for `marker` ([`fix_marker_path`]), written last under a
-/// temporary name and renamed into place, carrying the comments the pass
-/// declined ([`FixMarker`]).
+/// temporary name and renamed into place, carrying every comment the pass
+/// made no code change for, merged ones included ([`FixMarker`]).
 pub fn fix_completion_section(marker: &Path) -> String {
     let tmp = temporary_name(marker);
     format!(
@@ -278,9 +278,11 @@ pub fn fix_completion_section(marker: &Path) -> String {
          tm is waiting for `{file}` to know this fix pass is done. Once every \
          comment is triaged and every fix committed, write \
          `{{\"succeeded\": true}}` to `{tmp}`, or `{{\"succeeded\": false}}` \
-         if you could not fix the legitimate ones. List each comment you \
-         declined in the same object, so the next review round checks your \
-         reason instead of re-raising it:\n\n\
+         if you could not fix the legitimate ones. List every comment that \
+         got no code change under `declined` in the same object, so the next \
+         review round checks your reason instead of re-raising it. That \
+         includes a comment you merged with another: give it a reason like \
+         `same root cause as <anchor>: ...`.\n\n\
          \x20   {{\"succeeded\": true, \"declined\": [{{\"comment\": \"src/lib.rs:10-12\",\n\
          \x20     \"reason\": \"One line on why no change is needed.\"}}]}}\n\n\
          Then rename it into place with `mv '{tmp}' '{file}'`, so tm never \
@@ -921,6 +923,14 @@ mod tests {
         assert!(section.contains(r#"{"succeeded": false}"#));
         assert!(section.contains(r#""declined""#), "{section}");
         assert!(section.contains(r#""reason""#), "{section}");
+    }
+
+    #[test]
+    fn the_fix_completion_section_asks_for_merged_comments_as_declines() {
+        let section = fix_completion_section(Path::new("/g/fix.done"));
+
+        assert!(section.contains("merged"), "{section}");
+        assert!(section.contains("same root cause as"), "{section}");
     }
 
     #[test]
