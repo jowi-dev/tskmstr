@@ -258,7 +258,7 @@ tm auth status
 | `tm work start [<dir>]` | Attach to (or create) the tmux session for `<dir>`, defaulting to `cwd` |
 | `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<scope>-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
-| `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
+| `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch. The agent triages the comments with `thatch-review-response`, fixes the ones that hold up, declines the rest with a one-line reason, and posts nothing to GitHub; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
 | `tm review auto <KEY> [--foreground]` | Run thatch auto-review rounds over `<KEY>`'s lane-run branch: each round is an interactive `auto-review` run in a `review` window of the ticket's `tm-<scope>-<key>` session (`review-2` for round 2). Its confirmed findings are appended to the worktree's vdiff comment store, and findings at or above `[work.auto_review].fix_threshold` start an interactive `tm review fix` pass in a `fix` / `fix-N` window. The loop waits for each step's signal file for up to `round_timeout_mins` and leaves the windows open. Stops on a clean round, or flags the round for review at `max_review_rounds` or when a step never signals. Detaches by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`; see "Auto-review" below |
 | `tm review import <KEY> [--fix]` | Import the unresolved human review threads on `<KEY>`'s PR into the worktree's vdiff comment store, once each, skipping review bots and comments tm or vdiff posted. `--fix` then runs `tm review fix <KEY> --fg` unless the ticket is at `[dispatch] max_fix_rounds`; see "Importing a GitHub review" below |
 
@@ -2054,7 +2054,14 @@ Pressing `F` dispatches `tm review fix <KEY>` as a watched-child launch, the
 same shape as `w`/`b`: `tm review fix` resolves the ticket's lane run,
 renders its captured `vdiff` comments via `vdiff --export-comments`, and
 dispatches a tracked run in the ticket's existing worktree and branch — no
-new worktree, no new branch. The pass itself runs interactively in a `fix`
+new worktree, no new branch. The agent does not fix every comment blindly:
+it triages them with thatch's `thatch-review-response` skill (legitimate,
+intentional, false positive, unlikely edge case), merges comments that share
+a root cause, fixes and commits the legitimate ones, and ends with each
+comment's outcome: fixed, declined with a one-line reason, or merged with
+another. It uses only the skill's triage and fix steps: it never replies to
+a review thread or posts a summary comment, since vdiff owns the comment
+state. The pass itself runs interactively in a `fix`
 window of the ticket's `tm-<scope>-<key>` session (`fix-2` for a second pass), so
 `tmux attach -t tm-<scope>-<key>` shows it alongside the ticket's other actions. Its run rows
 use `kind = "review-fix"`, so they never shadow the lane run and show up
@@ -2090,9 +2097,13 @@ worktree's vdiff comment store, `<git-dir>/vdiff/comments.json`. Each round:
 5. Otherwise starts an interactive `tm review fix <KEY>` pass in a `fix`
    window (`fix-2` for round 2). The pass is done once the agent writes
    `<git-dir>/vdiff/auto-review/fix-<loop>-<round>.done`, holding
-   `{"succeeded": true}` or `{"succeeded": false}`. Then tm moves the
+   `{"succeeded": true}` or `{"succeeded": false}`, plus a `declined`
+   array of `{"comment": "<path:start-end>", "reason": "..."}` for each
+   comment the pass triaged as not needing a change. Then tm moves the
    consumed store to `<git-dir>/vdiff/archive/<round>.json` so the next
-   round never re-reads comments with stale line anchors.
+   round never re-reads comments with stale line anchors. The next round's
+   prompt lists the declines with their reasons, so `thatch-review-followup`
+   checks each reason instead of re-reporting the finding as unaddressed.
 
 **The windows are yours to watch and steer.** Attach to the ticket's
 session to read a round or type into it. The loop does not wait for claude
@@ -2163,7 +2174,7 @@ so the badge stays at `needs you` until another round runs.
 
 The prompt is rendered per round with `{key}`, `{round}`, `{skill}`,
 `{findings_file}`, `{archive}` and `{prior}` (a sentence pointing a
-follow-up round at the archive). With `auto = true`, a `tm pr watch` that
+follow-up round at the archive, then the previous fix pass's declines). With `auto = true`, a `tm pr watch` that
 finds every bot done with nothing unresolved launches `tm review auto` for
 the ticket. A watch that hands off to a bugbot cleanup session does not
 chain, because tm can't see that interactive session finish.
