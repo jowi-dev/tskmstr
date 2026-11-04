@@ -13,6 +13,15 @@ tickets with vim-style keys.
 - [`gh`](https://cli.github.com/), authenticated (`gh auth login`)
 - A Jira Cloud API token for your Atlassian account
 
+## tm and thatch
+
+tm's agent sessions use [thatch](https://github.com/sysread/thatch) for
+memory, planning, review and session coordination. tm itself owns tickets,
+dispatch, admission, processes, worktrees and merges. The split, and the
+rule that agent-side features check thatch before tm builds them, is
+recorded in
+[ADR-0011](docs/decisions/0011-tm-control-plane-thatch-agent-plane.md).
+
 ## Setup
 
 ```
