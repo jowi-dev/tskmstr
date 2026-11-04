@@ -232,6 +232,24 @@ pub enum RunMode {
     Interactive,
 }
 
+/// Which tools a run may call. Runner-neutral: each adapter maps a scope onto
+/// its own CLI's tool and permission flags in
+/// [`AgentRunner::build_invocation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolScope {
+    /// Every tool the agent CLI offers, governed by the run's permission
+    /// mode. The shape every lane, audit, and conflict session uses.
+    #[default]
+    Full,
+    /// Only thatch's MCP tools: no shell, no file edits, no other MCP
+    /// servers. For untracked sessions that run in the operator's own
+    /// checkout with no worktree to contain them, such as the memory
+    /// consolidation session a successful `tm merge` starts (GitHub issue
+    /// #208). Overrides the run's permission mode, since a bypass would
+    /// re-open every tool the scope exists to close.
+    ThatchOnly,
+}
+
 /// Already-resolved inputs for one run's agent invocation. Everything here
 /// is data the caller has already produced (prompt text read from the
 /// prompt file and ticket-suffixed, the deployed hooks settings path, etc.)
@@ -275,6 +293,8 @@ pub struct InvocationInputs {
     /// environment variable carries `run_id` — see [`RunMode`], which is
     /// where the consequences of getting that wrong are spelled out.
     pub mode: RunMode,
+    /// Which tools the run may call. See [`ToolScope`].
+    pub tool_scope: ToolScope,
 }
 
 /// A fully resolved agent invocation: the program, its argv, and the

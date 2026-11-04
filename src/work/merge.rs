@@ -105,6 +105,11 @@ pub const MERGE_MEMORY_WINDOW_BASE: &str = "memory";
 /// finish a row, so the kind only keys admission's memory estimate.
 pub const MERGE_MEMORY_KIND: &str = "merge-memory";
 
+/// Turn budget for the memory-consolidation session: enough for one
+/// `memory_list`, a `memory_show` per entry, and a remember plus forgets
+/// per branch, and small because nothing tracks or reaps the session.
+pub const MERGE_MEMORY_MAX_TURNS: &str = "30";
+
 /// Errors returned by [`run_merge`].
 #[derive(Debug, Error)]
 pub enum MergeError {
@@ -653,6 +658,7 @@ fn open_agent_window(
             settings_path: None,
             run_id: run_id.map(|id| id.to_string()),
             mode: RunMode::Interactive,
+            tool_scope: crate::agent::ToolScope::Full,
         },
     );
     let prompt_text = deps
@@ -763,6 +769,13 @@ fn consolidate_branch_memories(
 /// `merge-memory-<session_key>-<timestamp>.log` under
 /// [`MergeDeps::state_dir`]. The session is untracked: no run row, no run-id
 /// variable, and no telemetry settings.
+///
+/// Because it runs untracked in `repo_root`, the operator's own checkout,
+/// with no worktree to contain it, it does not take the lane default of a
+/// bypassed permission mode and a 200-turn budget. It runs with
+/// [`ToolScope::ThatchOnly`](crate::agent::ToolScope::ThatchOnly), so it can
+/// call thatch's MCP tools and nothing else, and with
+/// [`MERGE_MEMORY_MAX_TURNS`] turns.
 fn start_memory_session(
     deps: &MergeDeps<'_>,
     repo_root: &Path,
@@ -807,11 +820,12 @@ fn start_memory_session(
         InvocationInputs {
             prompt,
             model,
-            max_turns: None,
+            max_turns: Some(MERGE_MEMORY_MAX_TURNS.to_string()),
             permission_mode: None,
             settings_path: None,
             run_id: None,
             mode: RunMode::Headless,
+            tool_scope: crate::agent::ToolScope::ThatchOnly,
         },
     );
 
@@ -4591,6 +4605,30 @@ mod tests {
             "output goes to a log file: {command}"
         );
         assert!(out.contains("consolidating thatch memories"), "{out}");
+    }
+
+    #[test]
+    fn memory_session_is_confined_to_thatch_tools_with_a_small_turn_budget() {
+        let mut fx = up_to_date_fixture();
+        fx.merge_cfg.consolidate_memories = true;
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        let windows = memory_windows(&fx);
+        let (_, _, command) = &windows[0];
+        assert!(
+            command.contains("'--allowedTools' 'mcp__thatch'"),
+            "only thatch's MCP tools are allowed: {command}"
+        );
+        assert!(
+            !command.contains("bypassPermissions"),
+            "no bypass in the operator's own checkout: {command}"
+        );
+        assert!(
+            command.contains(&format!("'--max-turns' '{MERGE_MEMORY_MAX_TURNS}'")),
+            "{command}"
+        );
     }
 
     #[test]

@@ -494,6 +494,7 @@ pub(crate) fn offer_agent_setup(
                 // must.
                 run_id: None,
                 mode: RunMode::Interactive,
+                tool_scope: crate::agent::ToolScope::Full,
             },
         )
     };

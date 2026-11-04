@@ -2325,7 +2325,11 @@ these stages:
     memories don't go stale once their branch is deleted. tm doesn't
     wait for it: the window closes when the agent exits, and its output
     goes to `merge-memory-<key>-<timestamp>.log` under tm's run-state
-    directory. The session has no run row. A merge that fails or is
+    directory. The session has no run row, so it is confined instead:
+    it can call thatch's MCP tools and nothing else (no shell, no file
+    edits), and it gets a 30-turn budget. Under opencode, which has no
+    flag for that, it runs without the permission bypass and your own
+    opencode `permission` config decides. A merge that fails or is
     handed back starts no session. A failure to start one only warns and
     never changes the exit code. Turn it off with `[work.merge]
     consolidate_memories = false`.
