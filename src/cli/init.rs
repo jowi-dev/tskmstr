@@ -278,7 +278,7 @@ pub fn run_init(
         SessionSection {
             table: "create",
             question: "Configure ticket create sessions ([work.create], the board's `c` key)?",
-            default_prompt: "/ticket-create",
+            default_prompt: ctx.runner.default_create_prompt(),
             prompt_file_name: "create",
             thatch_template: CREATE_THATCH_TEMPLATE,
             dir_fallback_to_audit: false,
@@ -286,7 +286,7 @@ pub fn run_init(
         SessionSection {
             table: "review_watch",
             question: "Configure review-watch sessions ([work.review_watch])?",
-            default_prompt: "/bugbot-triage {key} {findings_file}",
+            default_prompt: ctx.runner.default_cleanup_prompt_template(),
             prompt_file_name: "review",
             thatch_template: REVIEW_THATCH_TEMPLATE,
             dir_fallback_to_audit: true,
@@ -294,7 +294,7 @@ pub fn run_init(
         SessionSection {
             table: "audit",
             question: "Configure ticket audit sessions ([work.audit], the board's `a` key)?",
-            default_prompt: "/ticket-audit {key}",
+            default_prompt: ctx.runner.default_audit_prompt_template(),
             prompt_file_name: "audit",
             thatch_template: AUDIT_THATCH_TEMPLATE,
             dir_fallback_to_audit: false,
@@ -872,7 +872,8 @@ struct SessionSection {
     /// The confirm question enabling the section.
     question: &'static str,
     /// The prompt the section runs when none is configured, whose leading
-    /// `/skill` is checked for existence.
+    /// `/skill` is checked for existence. It is the agent runner's default,
+    /// so it matches what a launch actually uses.
     default_prompt: &'static str,
     /// Stem of the thatch prompt file scaffolded under `.tskmstr/prompts/`
     /// (e.g. `"create"`, `"review"`, `"audit"`).
