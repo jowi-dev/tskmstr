@@ -1166,7 +1166,7 @@ mod tests {
         std::fs::create_dir_all(lane_prompt.parent().unwrap()).expect("mkdir");
         std::fs::write(&lane_prompt, body).expect("write lane prompt");
         write_repo_config(
-            &env,
+            env,
             "schema_version = 2\n\
              [work.lanes.widget]\n\
              repo = \".\"\n\
