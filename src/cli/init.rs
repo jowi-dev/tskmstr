@@ -294,7 +294,7 @@ pub fn run_init(
         SessionSection {
             table: "audit",
             question: "Configure ticket audit sessions ([work.audit], the board's `a` key)?",
-            default_prompt: "/ticket-audit {key} (investigate with /thatch:refine on its PROPOSED APPROACH)",
+            default_prompt: "/ticket-audit {key}",
             prompt_file_name: "audit",
             thatch_template: AUDIT_THATCH_TEMPLATE,
             dir_fallback_to_audit: false,

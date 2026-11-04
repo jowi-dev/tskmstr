@@ -102,12 +102,13 @@ Refine's revisions are written back to the ticket body before a verdict is
 recorded; `ready` still requires that write-back, and `tm ready` is
 unchanged.
 
-Both tm-owned audit prompts carry the step: the runners' default
-`[work.audit]` prompt (`/ticket-audit {key} (investigate with
-/thatch:refine on its PROPOSED APPROACH)`) and the `tm init` scaffold
-(`AUDIT_THATCH_TEMPLATE` in `src/cli/init.rs`). The user-level
-`~/.claude/skills/ticket-audit` skill is outside this repo and needs the
-matching edit.
+The `tm init` thatch scaffold (`AUDIT_THATCH_TEMPLATE` in
+`src/cli/init.rs`) carries the step. The runners' default `[work.audit]`
+prompt stays `/ticket-audit {key}`: `tm init` and `tm check` only verify
+the prompt's leading `/skill`, so a default naming `/thatch:refine` would
+send users without the thatch plugin to a missing command with no drift
+warning. The user-level `~/.claude/skills/ticket-audit` skill is outside
+this repo and needs the matching edit.
 
 Declined: replacing the audit with refine, which would make refine absorb
 tm's verdict rules.

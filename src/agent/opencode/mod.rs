@@ -591,7 +591,7 @@ impl AgentRunner for OpencodeRunner {
     /// Claude-format skills natively, so the same skill set backs these
     /// claude-shaped defaults unchanged.
     fn default_audit_prompt_template(&self) -> &'static str {
-        "/ticket-audit {key} (investigate with /thatch:refine on its PROPOSED APPROACH)"
+        "/ticket-audit {key}"
     }
 
     fn default_cleanup_prompt_template(&self) -> &'static str {
@@ -955,10 +955,10 @@ mod tests {
     }
 
     #[test]
-    fn default_audit_prompt_template_is_ticket_audit_with_refine() {
+    fn default_audit_prompt_template_is_ticket_audit() {
         assert_eq!(
             OpencodeRunner.default_audit_prompt_template(),
-            "/ticket-audit {key} (investigate with /thatch:refine on its PROPOSED APPROACH)"
+            "/ticket-audit {key}"
         );
     }
 

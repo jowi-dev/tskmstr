@@ -801,9 +801,9 @@ pub trait AgentRunner: Sync {
     }
 
     /// Default prompt template used when `[work.audit].prompt` is unset,
-    /// e.g. `"/ticket-audit {key} (investigate with /thatch:refine ...)"`:
-    /// the audit skill, told to run `/thatch:refine` on the ticket's
-    /// PROPOSED APPROACH as its investigation step (GitHub issue #206).
+    /// e.g. `"/ticket-audit {key}"`. It names only the audit skill, which
+    /// `tm init` and `tm check` verify; the `/thatch:refine` investigation
+    /// step lives in the thatch audit scaffold instead (GitHub issue #206).
     fn default_audit_prompt_template(&self) -> &'static str;
 
     /// Default prompt template used when `[work.review_watch].prompt` is
