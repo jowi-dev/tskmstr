@@ -3283,6 +3283,7 @@ mod tests {
             false,
             RetroOverlay::None,
             false,
+            false,
             key,
         )
     }
@@ -3593,6 +3594,7 @@ mod tests {
     fn broadcast_key(screen: Screen, board_broadcasting: bool, key: KeyCode) -> Option<Msg> {
         map_key(
             &screen,
+            false,
             false,
             false,
             false,

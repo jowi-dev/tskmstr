@@ -130,7 +130,9 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
         frame,
         status_area,
         &status_line_text(app),
-        if app.screen == Screen::Board && app.board_searching {
+        if app.screen == Screen::Board && app.board_broadcasting {
+            BROADCAST_HINT
+        } else if app.screen == Screen::Board && app.board_searching {
             SEARCH_HINT
         } else if app.screen == Screen::Board
             && app.board_view == BoardView::Epics
@@ -235,8 +237,12 @@ fn with_autopilot(app: &App, base: String) -> String {
 
 /// [`status_line_text`] without the pending indicator: the active view
 /// filter (and, on the board, the search query) prefixed onto
-/// `app.status_line`.
+/// `app.status_line`. While the board's broadcast input is open, just the
+/// draft being typed, with a trailing `_` cursor.
 fn status_line_with_filter(app: &App) -> String {
+    if app.screen == Screen::Board && app.board_broadcasting {
+        return format!("Broadcast: {}_", app.broadcast_draft);
+    }
     let filter_text = if app.screen == Screen::Runs {
         let mut parts = Vec::new();
         if let Some(kind) = &app.runs_kind_filter {
@@ -326,6 +332,11 @@ const SEARCH_HINT: &str = "type to search  Backspace delete  Enter keep  Esc cle
 /// `is_ticket_only_action` in `crate::tui::app`), plus `E` to go back.
 const EPICS_HINT: &str = "h/l column  j/k move  Enter open/move  r refresh  o browser  O jira  E tickets  i or / search  ? help  q quit";
 
+/// The status-bar key hint while the board's broadcast input is open
+/// (GitHub issue #225).
+const BROADCAST_HINT: &str =
+    "type a message for every lane  Backspace delete  Enter send  Esc cancel";
+
 /// The key-hint text shown in the status bar for `screen`. `show_run_detail`
 /// picks the detail-window variant on [`Screen::Board`], [`Screen::Runs`]
 /// and [`Screen::Overview`] -- the run-detail overlay's keymap
@@ -335,7 +346,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  e epic  E epics  A assign  p priority  a audit  Y mark audited  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  Space queue  R retro  P autopilot  i or / search  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  e epic  E epics  A assign  p priority  a audit  Y mark audited  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  Space queue  R retro  P autopilot  i or / search  C broadcast  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -1954,7 +1965,9 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("m       manual session"),
         Line::from("w       work (autonomous run)"),
         Line::from("b       watch review bots"),
-        Line::from("c       create ticket"),
+        // The column is at the overlay's 17 inner rows on a 24-row
+        // terminal, so `C` shares the `c` line.
+        Line::from("c/C     create / broadcast"),
         Line::from("v       view run"),
         Line::from("L       run logs"),
         Line::from("V       vdiff review"),
@@ -2580,6 +2593,7 @@ mod tests {
             "Space queue",
             "R retro",
             "i or / search",
+            "C broadcast",
             "?",
             "q",
         ] {
@@ -2742,6 +2756,34 @@ mod tests {
         assert!(text.contains("Esc clear"), "{text}");
         let text = buffer_text(&render_with_size(&search_board("", true), 120, 30));
         assert!(text.contains("Search: _"), "{text}");
+    }
+
+    #[test]
+    fn broadcast_input_shows_the_draft_and_its_hint() {
+        let app = App {
+            board_broadcasting: true,
+            broadcast_draft: "rebase".to_string(),
+            ..search_board("login", false)
+        };
+        let text = buffer_text(&render_with_size(&app, 120, 30));
+        assert!(text.contains("Broadcast: rebase_"), "{text}");
+        assert!(text.contains("Enter send"), "{text}");
+        assert!(text.contains("Esc cancel"), "{text}");
+    }
+
+    #[test]
+    fn help_overlay_lists_the_broadcast_key_within_24_rows() {
+        let app = App {
+            show_help: true,
+            ..App::new()
+        };
+        let text = buffer_text(&render_with_size(&app, 80, 24));
+        for phrase in ["broadcast", "merge queue", "retro", "autopilot"] {
+            assert!(
+                text.contains(phrase),
+                "help overlay should show `{phrase}` on a 24-row terminal:\n{text}"
+            );
+        }
     }
 
     #[test]
