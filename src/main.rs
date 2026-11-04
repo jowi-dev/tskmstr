@@ -1203,6 +1203,7 @@ fn net_deps_builder(
 ) -> Result<NetDepsBuilder, Box<dyn std::error::Error>> {
     let db_path = run_db_path_from_config(config);
     let inherit_epic_blockers = config.inherit_epic_blockers;
+    let require_audit = config.require_audit;
     match config.backend {
         BackendKind::Jira => {
             let token = resolve_token(keychain, env_token)?;
@@ -1220,12 +1221,13 @@ fn net_deps_builder(
                 ),
                 gh: Box::new(ShellGhCli::new()),
                 git: Box::new(ShellGitOps::new()),
-                store: tskmstr::runs::RunStore::open(&db_path).ok(),
+                store: tskmstr::runs::RunStore::open(&db_path).map_err(|e| e.to_string()),
                 lanes: ctx.lanes,
                 cwd: ctx.cwd,
                 backend_identity: ctx.backend_identity,
                 runner: ctx.runner,
                 inherit_epic_blockers,
+                require_audit,
             }))
         }
         BackendKind::Github => {
@@ -1247,12 +1249,13 @@ fn net_deps_builder(
                     jira: Box::new(provider),
                     gh: Box::new(ShellGhCli::new()),
                     git: Box::new(ShellGitOps::new()),
-                    store: tskmstr::runs::RunStore::open(&db_path).ok(),
+                    store: tskmstr::runs::RunStore::open(&db_path).map_err(|e| e.to_string()),
                     lanes: ctx.lanes,
                     cwd: ctx.cwd,
                     backend_identity: ctx.backend_identity,
                     runner: ctx.runner,
                     inherit_epic_blockers,
+                    require_audit,
                 }
             }))
         }

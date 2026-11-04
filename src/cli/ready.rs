@@ -93,8 +93,9 @@ pub enum AuditGate<'a> {
 
 impl AuditGate<'_> {
     /// Why `key` fails the gate, or `None` if it passes. A store read error
-    /// fails closed, like [`AuditGate::Unavailable`].
-    fn needs_audit(&self, key: &str) -> Option<String> {
+    /// fails closed, like [`AuditGate::Unavailable`]. The board shows the
+    /// same reason on a card (see `crate::tui::event::board_readiness`).
+    pub fn needs_audit(&self, key: &str) -> Option<String> {
         match self {
             AuditGate::Off => None,
             AuditGate::Unavailable(err) => Some(format!("audit store unavailable: {err}")),

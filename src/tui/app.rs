@@ -1090,6 +1090,10 @@ pub struct App {
     /// are never open at once, since each overlay makes every other key
     /// inert.
     pub lane_confirm: Option<LaneConfirm>,
+    /// The mark-audited confirmation overlay's ticket key (`Y` on a board
+    /// card, GitHub issue #193), or `None` when closed. Shares the
+    /// confirm/cancel keys with the other confirmation overlays.
+    pub audit_mark_confirm: Option<String>,
     /// Tickets queued on [`Screen::Overview`] for a batch merge (`Space`,
     /// GitHub issue #88), each with the repo root its `tm merge` runs in.
     /// Separate from the board's [`App::merge_queue`]: the overview spans
@@ -1181,13 +1185,14 @@ impl App {
         self
     }
 
-    /// Whether any confirmation overlay -- single merge, batch merge, or
-    /// blocked lane launch -- is open, which is what gates
+    /// Whether any confirmation overlay -- single merge, batch merge,
+    /// blocked lane launch, or mark audited -- is open, which is what gates
     /// [`crate::tui::keymap::map_key`] down to its confirm/cancel keys.
     pub fn confirm_open(&self) -> bool {
         self.merge_confirm.is_some()
             || self.batch_merge_confirm.is_some()
             || self.lane_confirm.is_some()
+            || self.audit_mark_confirm.is_some()
             || self.overview_merge_confirm.is_some()
     }
 
@@ -1740,6 +1745,18 @@ pub enum Msg {
     /// launch a lane run for it, per [`lane_run_action`]'s precedence rule
     /// (already-active guard, zero/one/many configured lanes).
     LaneRunAction,
+    /// The `Y` key was pressed on [`Screen::Board`] for the selected ticket:
+    /// ask to record a passing audit verdict for it by hand, with no audit
+    /// session (GitHub issue #193). See [`mark_audited_action`].
+    MarkAuditedAction,
+    /// [`Cmd::RecordAudit`] succeeded: report it and refresh the board so
+    /// the card's readiness marker reflects the new verdict.
+    AuditMarked {
+        /// Ticket key the verdict was recorded for.
+        key: String,
+    },
+    /// [`Cmd::RecordAudit`] failed, with the status-line message.
+    AuditMarkFailed(String),
     /// Move the lane picker's highlighted lane up.
     LanePickerUp,
     /// Move the lane picker's highlighted lane down.
@@ -2140,6 +2157,12 @@ pub enum Cmd {
         /// The query to search with.
         query: TicketQuery,
     },
+    /// Record a passing audit verdict for `key`, the same row `tm ticket
+    /// audit KEY --record ready` writes (GitHub issue #193).
+    RecordAudit {
+        /// Ticket key to record the verdict for.
+        key: String,
+    },
     /// Record a retro verdict for `key`.
     RecordRetro {
         /// Ticket key to record a verdict for.
@@ -2330,7 +2353,7 @@ pub fn admit_net_cmds(app: &mut App, cmds: Vec<Cmd>) -> Vec<Cmd> {
 
 /// Whether `msg` is a board action that only makes sense on a workable
 /// ticket, and so is refused in [`BoardView::Epics`]: launching a lane or a
-/// manual session, auditing, merging, queueing a merge, and the assignee
+/// manual session, auditing or marking audited, merging, queueing a merge, and the assignee
 /// and epic filters, which the epics view ignores.
 fn is_ticket_only_action(msg: &Msg) -> bool {
     matches!(
@@ -2338,6 +2361,7 @@ fn is_ticket_only_action(msg: &Msg) -> bool {
         Msg::LaneRunAction
             | Msg::ManualSessionAction
             | Msg::AuditAction
+            | Msg::MarkAuditedAction
             | Msg::MergePrAction
             | Msg::ToggleMergeQueue
             | Msg::OpenFilterPicker
@@ -2458,6 +2482,8 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::ConfirmAccept => {
             if let Some(confirm) = app.lane_confirm.take() {
                 launch_lane(app, confirm.key)
+            } else if let Some(key) = app.audit_mark_confirm.take() {
+                (app, vec![Cmd::RecordAudit { key }])
             } else if let Some(confirm) = app.overview_merge_confirm.take() {
                 crate::tui::overview_actions::confirm_accept(app, confirm)
             } else if let Some(confirm) = app.batch_merge_confirm.take() {
@@ -2469,6 +2495,8 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::ConfirmCancel => {
             if let Some(confirm) = app.lane_confirm.take() {
                 app.status_line = format!("lane run for {} cancelled", confirm.key);
+            } else if let Some(key) = app.audit_mark_confirm.take() {
+                app.status_line = format!("mark audited for {key} cancelled");
             } else if let Some(confirm) = app.overview_merge_confirm.take() {
                 app.status_line = format!("merge of {} cancelled", confirm.label());
             } else if let Some(confirm) = app.batch_merge_confirm.take() {
@@ -2839,6 +2867,19 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, Vec::new())
         }
         Msg::LaneRunAction => lane_run_action(app),
+        Msg::MarkAuditedAction => mark_audited_action(app),
+        Msg::AuditMarked { key } => {
+            app.status_line = format!(
+                "Recorded audit for {key}: {}",
+                crate::cli::ready::PASSING_AUDIT_VERDICT
+            );
+            let query = query_for_filter(&app.filter, &app.project_key);
+            (app, vec![Cmd::FetchTickets { query }])
+        }
+        Msg::AuditMarkFailed(err) => {
+            app.status_line = err;
+            (app, Vec::new())
+        }
         Msg::LanePickerUp => {
             app.lane_picker_selected = app.lane_picker_selected.saturating_sub(1);
             (app, Vec::new())
@@ -3320,6 +3361,21 @@ fn lane_run_action(mut app: App) -> (App, Vec<Cmd>) {
         return (app, Vec::new());
     }
     launch_lane(app, key)
+}
+
+/// Handle [`Msg::MarkAuditedAction`]: open the mark-audited confirmation
+/// for the selected ticket (GitHub issue #193). Only [`Msg::ConfirmAccept`]
+/// goes on to [`Cmd::RecordAudit`], so a stray `Y` records nothing. A no-op
+/// with no selection or while another confirmation is open.
+fn mark_audited_action(mut app: App) -> (App, Vec<Cmd>) {
+    if app.confirm_open() {
+        return (app, Vec::new());
+    }
+    let Some(ticket) = app.selected_ticket() else {
+        return (app, Vec::new());
+    };
+    app.audit_mark_confirm = Some(ticket.key.clone());
+    (app, Vec::new())
 }
 
 /// Launch a lane run for `key` past [`lane_run_action`]'s guards (and, for
@@ -4963,6 +5019,7 @@ mod tests {
             Msg::LaneRunAction,
             Msg::ManualSessionAction,
             Msg::AuditAction,
+            Msg::MarkAuditedAction,
             Msg::MergePrAction,
             Msg::ToggleMergeQueue,
             Msg::OpenFilterPicker,
@@ -8992,6 +9049,71 @@ mod tests {
             assert!(app.lane_confirm.is_none(), "{readiness:?}");
             assert_eq!(cmds.len(), 1, "{readiness:?} should launch directly");
         }
+    }
+
+    #[test]
+    fn mark_audited_action_asks_before_recording_anything() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(app, Msg::MarkAuditedAction);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(app.audit_mark_confirm.as_deref(), Some("PROJ-1"));
+        assert!(app.confirm_open());
+    }
+
+    #[test]
+    fn confirming_mark_audited_records_a_ready_verdict_and_starts_no_session() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, _) = update(app, Msg::MarkAuditedAction);
+        let (app, cmds) = update(app, Msg::ConfirmAccept);
+        assert_eq!(
+            cmds,
+            vec![Cmd::RecordAudit {
+                key: "PROJ-1".to_string()
+            }]
+        );
+        assert!(app.audit_mark_confirm.is_none());
+    }
+
+    #[test]
+    fn cancelling_mark_audited_records_nothing() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, _) = update(app, Msg::MarkAuditedAction);
+        let (app, cmds) = update(app, Msg::ConfirmCancel);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(app.audit_mark_confirm.is_none());
+        assert_eq!(app.status_line, "mark audited for PROJ-1 cancelled");
+    }
+
+    #[test]
+    fn mark_audited_action_with_no_selected_ticket_is_a_noop() {
+        let app = board_with(vec![], 0);
+        let (app, cmds) = update(app, Msg::MarkAuditedAction);
+        assert!(cmds.is_empty());
+        assert!(app.audit_mark_confirm.is_none());
+    }
+
+    #[test]
+    fn audit_marked_reports_it_and_refreshes_the_board() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(
+            app,
+            Msg::AuditMarked {
+                key: "PROJ-1".to_string(),
+            },
+        );
+        assert_eq!(app.status_line, "Recorded audit for PROJ-1: ready");
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::FetchTickets { .. }]),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn audit_mark_failed_reports_the_error() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(app, Msg::AuditMarkFailed("disk full".to_string()));
+        assert!(cmds.is_empty());
+        assert_eq!(app.status_line, "disk full");
     }
 
     #[test]

@@ -309,6 +309,7 @@ pub fn map_key(
         }
         KeyCode::Char('c') if *screen == Screen::Board => Some(Msg::CreateAction),
         KeyCode::Char('R') if *screen == Screen::Board => Some(Msg::OpenRetro),
+        KeyCode::Char('Y') if *screen == Screen::Board => Some(Msg::MarkAuditedAction),
         KeyCode::Char('E') if *screen == Screen::Board => Some(Msg::ToggleEpicsView),
         KeyCode::Char('d') if *screen == Screen::Retro => Some(Msg::RetroDefectStart),
         KeyCode::Char('c') if *screen == Screen::Retro => Some(Msg::RetroMarkClean),
@@ -2690,6 +2691,22 @@ mod tests {
                 None,
                 "{key:?} should be inert while the merge prompt is up"
             );
+        }
+    }
+
+    #[test]
+    fn capital_y_marks_audited_on_board_only() {
+        let press = |screen: &Screen| plain_key(screen, KeyCode::Char('Y'));
+        assert_eq!(press(&Screen::Board), Some(Msg::MarkAuditedAction));
+        for screen in [
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+            Screen::Retro,
+            Screen::Overview,
+        ] {
+            assert_eq!(press(&screen), None, "{screen:?}");
         }
     }
 

@@ -220,6 +220,7 @@ pub fn readiness_glyph(readiness: &Readiness) -> &'static str {
     match readiness {
         Readiness::Ready => "✓",
         Readiness::Stackable { .. } => "◐",
+        Readiness::NeedsAudit { .. } => "!",
         Readiness::Blocked { .. } => "✗",
         Readiness::Unknown => "?",
     }
@@ -234,12 +235,14 @@ pub const MERGE_QUEUED_GLYPH: &str = "+";
 pub const MERGE_QUEUED: Style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
 
 /// The color for [`readiness_glyph`]: green ready, cyan stackable (workable,
-/// on top of another branch), red blocked, dim unknown -- never green, since
-/// an unknown ticket must not read as launchable.
+/// on top of another branch), yellow needs audit (fine to work, but
+/// autopilot won't until it's audited), red blocked, dim unknown -- never
+/// green, since an unknown ticket must not read as launchable.
 pub fn readiness_style(readiness: &Readiness) -> Style {
     match readiness {
         Readiness::Ready => Style::new().fg(Color::Green),
         Readiness::Stackable { .. } => Style::new().fg(Color::Cyan),
+        Readiness::NeedsAudit { .. } => Style::new().fg(Color::Yellow),
         Readiness::Blocked { .. } => Style::new().fg(Color::Red),
         Readiness::Unknown => DIM,
     }
@@ -365,11 +368,14 @@ pub fn event_kind_style(kind: &str) -> Style {
 mod tests {
     use super::*;
 
-    fn every_readiness() -> [Readiness; 4] {
+    fn every_readiness() -> [Readiness; 5] {
         [
             Readiness::Ready,
             Readiness::Stackable {
                 blocker_key: "PROJ-9".to_string(),
+            },
+            Readiness::NeedsAudit {
+                reason: "not audited".to_string(),
             },
             Readiness::Blocked {
                 blocker_keys: vec!["PROJ-9".to_string()],
@@ -393,6 +399,20 @@ mod tests {
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), glyphs.len(), "{glyphs:?}");
+    }
+
+    #[test]
+    fn needs_audit_readiness_never_shares_a_launchable_color() {
+        let needs_audit = readiness_style(&Readiness::NeedsAudit {
+            reason: "not audited".to_string(),
+        });
+        assert_ne!(needs_audit, readiness_style(&Readiness::Ready));
+        assert_ne!(
+            needs_audit,
+            readiness_style(&Readiness::Stackable {
+                blocker_key: "PROJ-9".to_string(),
+            })
+        );
     }
 
     #[test]
