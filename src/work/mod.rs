@@ -40,3 +40,4 @@ pub mod thatch_chat;
 pub mod tmux;
 pub mod vdiff;
 pub mod viewer;
+pub mod walkthrough;
