@@ -1455,6 +1455,7 @@ board still loads, without epic lines, and the status line says why.
 | `r` | Refresh from Jira |
 | `o` | Open the selected ticket in the browser |
 | `f` | Open the assignee filter picker (board only) |
+| `e` | Open the epic filter picker; see "Filtering the board by epic" below (board only) |
 | `i` / `/` | Start searching the board's cards; see "Searching the board" below (board only) |
 | `A` | Open the assign picker for the selected ticket (board only) |
 | `p` | Open the priority (stack-rank) view (board only) |
@@ -1484,6 +1485,27 @@ cached for the rest of the session). `j`/`k` navigate the list, `Enter`
 applies the highlighted filter and refetches the board, `Esc`/`q` closes the
 picker without changing anything. The currently active filter is marked with
 a leading `*`.
+
+### Filtering the board by epic
+
+Pressing `e` on the board opens a floating picker listing `All epics`, `No
+epic`, and each epic that the loaded cards belong to, shown as `KEY  Title`
+and sorted by key. `j`/`k` navigate, `Enter` applies the highlighted choice,
+`Esc`/`q` closes the picker without changing anything. The active choice is
+marked with a leading `*`.
+
+Choosing an epic narrows every column to that epic's child cards; `No epic`
+shows only cards with no parent, and `All epics` clears the filter. Columns
+keep their order and stay on screen when empty, every column title reads
+`shown/total` while the filter is applied, and the status line shows `Epic:
+KEY  Title`.
+
+Like the search, the epic filter works on the cards the board has already
+loaded, so it combines with the `f` assignee filter and the `i`/`/` search
+and survives `r` refreshes and `f` refetches. The picker only offers epics
+with at least one loaded card. The one exception is the active epic: if a
+refetch leaves it with no cards, the board shows empty columns and the
+picker keeps the epic listed, rather than clearing the filter.
 
 ### Searching the board
 

@@ -25,8 +25,8 @@ use crate::runs::system::SystemHeader;
 use crate::runs::{RetroSeverity, RunStatus};
 use crate::tui::app::{
     App, AssignChoice, AssigneeFilter, AuditStatusEntry, AutoReviewBadge, BotWatchIndicator,
-    Column, OverviewLayout, RETRO_SEVERITIES, RUN_COLUMNS, RunCard, RunIndicator, Screen,
-    TicketSummary,
+    Column, EpicFilter, OverviewLayout, RETRO_SEVERITIES, RUN_COLUMNS, RunCard, RunIndicator,
+    Screen, TicketSummary,
 };
 use crate::tui::theme;
 
@@ -144,6 +144,10 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
         draw_filter_picker(frame, app);
     }
 
+    if app.show_epic_picker {
+        draw_epic_picker(frame, app);
+    }
+
     if app.show_assign_picker {
         draw_assign_picker(frame, app);
     }
@@ -182,7 +186,8 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
 }
 
 /// The status bar's left-hand text: the active filter — the board's
-/// assignee filter (when it isn't `Me`), or the watch screen's kind/scope
+/// assignee filter (when it isn't `Me`) and epic filter (when it isn't
+/// `All epics`), or the watch screen's kind/scope
 /// view filters (GitHub issue #25) — prefixed onto `app.status_line`, with
 /// the pending indicator for in-flight network actions (GitHub issue #56)
 /// appended after both.
@@ -238,6 +243,9 @@ fn status_line_with_filter(app: &App) -> String {
         let mut parts = Vec::new();
         if app.screen != Screen::Rank && app.filter != AssigneeFilter::Me {
             parts.push(format!("Filter: {}", app.filter.label()));
+        }
+        if app.screen == Screen::Board && app.epic_filter != EpicFilter::All {
+            parts.push(format!("Epic: {}", app.epic_filter.label()));
         }
         if let Some(search) = board_search_text(app) {
             parts.push(search);
@@ -305,7 +313,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  A assign  p priority  a audit  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  Space queue  R retro  P autopilot  i or / search  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  e epic  A assign  p priority  a audit  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  Space queue  R retro  P autopilot  i or / search  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -356,12 +364,13 @@ fn draw_board_columns(frame: &mut Frame, app: &App, area: Rect) {
         merge_queue: &app.merge_queue,
     };
 
-    let searching = !app.board_search_query.is_empty();
+    let narrowed = !app.board_search_query.is_empty() || app.epic_filter != EpicFilter::All;
     for (index, column) in app.columns.iter().enumerate() {
         let selected_row = (index == app.selected_col).then_some(app.selected_row);
         let tickets = app.tickets_in_col(index);
-        // While a search query is applied, the count reads `shown/total`.
-        let count = if searching {
+        // While a search query or epic filter is applied, the count reads
+        // `shown/total`.
+        let count = if narrowed {
             format!("{}/{}", tickets.len(), column.tickets.len())
         } else {
             column.tickets.len().to_string()
@@ -1885,7 +1894,8 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("press any key to close"),
     ];
     let actions = vec![
-        Line::from("f       filter by assignee"),
+        // Shared line: this column already fills a 24-row terminal.
+        Line::from("f/e     filter assignee/epic"),
         Line::from("A       assign ticket"),
         Line::from("p       priority (rank) view"),
         Line::from("a       audit ticket"),
@@ -1951,6 +1961,43 @@ fn draw_filter_picker(frame: &mut Frame, app: &App) {
     if !options.is_empty() {
         state.select(Some(app.filter_picker_selected.min(options.len() - 1)));
     }
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// A centered floating window listing the board's epic filter options
+/// (GitHub issue #199): `All epics`, `No epic`, then each epic on the loaded
+/// cards as `KEY  Title`. The active choice is marked with a leading `*`,
+/// like [`draw_filter_picker`].
+fn draw_epic_picker(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 50, frame.area());
+    frame.render_widget(Clear, area);
+
+    let options = app.epic_options();
+    let items: Vec<ListItem> = options
+        .iter()
+        .map(|option| {
+            let line = if option == &app.epic_filter {
+                Line::from(vec![
+                    Span::styled("* ", theme::ACTIVE_FILTER_MARKER),
+                    Span::raw(option.label()),
+                ])
+            } else {
+                Line::from(format!("  {}", option.label()))
+            };
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(bold_title("Filter: epic")),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    let mut state = ListState::default();
+    state.select(Some(app.epic_picker_selected.min(options.len() - 1)));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -2262,8 +2309,8 @@ mod tests {
     use super::*;
     use crate::runs::RetroSeverity;
     use crate::runs::overview::OverviewRow;
-    use crate::ticketing::types::{Status, StatusCategory, Transition};
-    use crate::tui::app::BrowserPickerOption;
+    use crate::ticketing::types::{ParentRef, Status, StatusCategory, Transition};
+    use crate::tui::app::{BrowserPickerOption, EpicFilter};
     use crate::tui::app::{
         Column, RETRO_SEVERITIES, RetroRow, RetroRunInfo, TicketSummary, group_into_columns,
     };
@@ -2429,6 +2476,7 @@ mod tests {
             "o browser",
             "O jira",
             "f filter",
+            "e epic",
             "A assign",
             "p priority",
             "a audit",
@@ -2516,6 +2564,71 @@ mod tests {
             text.contains("Filter: Everyone  |  Search: login"),
             "{text}"
         );
+    }
+
+    /// [`search_board`] with PROJ-1 and PROJ-4 under epic PROJ-90, filtered
+    /// by `filter` (GitHub issue #199).
+    fn epic_board(filter: EpicFilter) -> App {
+        let mut app = search_board("", false);
+        for column in &mut app.columns {
+            for ticket in &mut column.tickets {
+                if ticket.key == "PROJ-1" || ticket.key == "PROJ-4" {
+                    ticket.epic = Some(ParentRef {
+                        key: "PROJ-90".to_string(),
+                        summary: "Auth revamp".to_string(),
+                    });
+                }
+            }
+        }
+        App {
+            epic_filter: filter,
+            ..app
+        }
+    }
+
+    fn auth_epic() -> EpicFilter {
+        EpicFilter::Epic(ParentRef {
+            key: "PROJ-90".to_string(),
+            summary: "Auth revamp".to_string(),
+        })
+    }
+
+    #[test]
+    fn draws_epic_picker_with_key_and_title_and_active_marker() {
+        let app = App {
+            show_epic_picker: true,
+            ..epic_board(auth_epic())
+        };
+        let text = buffer_text(&render_with_size(&app, 120, 30));
+        assert!(text.contains("Filter: epic"), "{text}");
+        assert!(text.contains("All epics"), "{text}");
+        assert!(text.contains("No epic"), "{text}");
+        assert!(text.contains("* PROJ-90  Auth revamp"), "{text}");
+    }
+
+    #[test]
+    fn epic_filter_hides_other_cards_and_counts_shown_over_total() {
+        let text = buffer_text(&render_with_size(&epic_board(auth_epic()), 120, 30));
+        assert!(text.contains("PROJ-1"), "{text}");
+        assert!(!text.contains("PROJ-2"), "{text}");
+        assert!(text.contains("In Progress (1/3)"), "{text}");
+        assert!(text.contains("Done (1/1)"), "{text}");
+    }
+
+    #[test]
+    fn status_bar_shows_the_epic_filter_next_to_the_assignee_filter() {
+        let app = App {
+            filter: AssigneeFilter::Everyone,
+            board_search_query: "login".to_string(),
+            ..epic_board(auth_epic())
+        };
+        let text = buffer_text(&render_with_size(&app, 160, 30));
+        assert!(
+            text.contains("Filter: Everyone  |  Epic: PROJ-90  Auth revamp  |  Search: login"),
+            "{text}"
+        );
+        let text = buffer_text(&render_with_size(&epic_board(EpicFilter::All), 160, 30));
+        assert!(!text.contains("Epic:"), "{text}");
     }
 
     #[test]
@@ -2791,6 +2904,7 @@ mod tests {
             "merge queue",
             "retro",
             "search cards",
+            "epic",
         ] {
             assert!(
                 text.contains(phrase),

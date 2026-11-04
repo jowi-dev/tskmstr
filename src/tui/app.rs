@@ -92,6 +92,41 @@ pub fn query_for_filter(filter: &AssigneeFilter, project_key: &str) -> TicketQue
     }
 }
 
+/// The board's epic filter (GitHub issue #199): which epic's cards to show.
+/// Applied client-side in [`App::tickets_in_col`], alongside the search
+/// query, against each card's [`TicketSummary::epic`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EpicFilter {
+    /// Every card, whatever its epic (no filter).
+    #[default]
+    All,
+    /// Only cards with no parent epic.
+    NoEpic,
+    /// Only the children of this epic.
+    Epic(ParentRef),
+}
+
+impl EpicFilter {
+    /// The human-readable label for this choice, used both in the picker
+    /// list and the board's status line: an epic shows as `KEY  Title`.
+    pub fn label(&self) -> String {
+        match self {
+            EpicFilter::All => "All epics".to_string(),
+            EpicFilter::NoEpic => "No epic".to_string(),
+            EpicFilter::Epic(epic) => format!("{}  {}", epic.key, epic.summary),
+        }
+    }
+
+    /// Whether `ticket` passes this filter.
+    fn matches(&self, ticket: &TicketSummary) -> bool {
+        match self {
+            EpicFilter::All => true,
+            EpicFilter::NoEpic => ticket.epic.is_none(),
+            EpicFilter::Epic(epic) => ticket.epic.as_ref().is_some_and(|e| e.key == epic.key),
+        }
+    }
+}
+
 /// One option in the board's assign picker: who to hand the selected card
 /// to. Unlike [`AssigneeFilter`] there is no `Everyone`, and `Me` is an
 /// action (assign to the current user) rather than a view.
@@ -830,6 +865,15 @@ pub struct App {
     /// [`App::tickets_in_col`]). Kept separate from [`App::filter`], so it
     /// survives `r` refreshes and `f` refetches.
     pub board_search_query: String,
+    /// The board's epic filter (GitHub issue #199), applied client-side in
+    /// [`App::tickets_in_col`] together with [`App::board_search_query`].
+    /// Like the search query, it survives `r` refreshes and `f` refetches,
+    /// even when a refetch leaves the chosen epic with no cards.
+    pub epic_filter: EpicFilter,
+    /// Whether the epic filter picker overlay is shown.
+    pub show_epic_picker: bool,
+    /// Index into [`App::epic_options`] of the currently highlighted option.
+    pub epic_picker_selected: usize,
     /// Index into the picker's option list of the currently highlighted
     /// option.
     pub filter_picker_selected: usize,
@@ -1124,9 +1168,10 @@ impl App {
             .copied()
     }
 
-    /// The tickets of board column `col` that match
-    /// [`App::board_search_query`] (GitHub issue #152): every ticket when the
-    /// query is empty, otherwise those whose key or summary contains it,
+    /// The tickets of board column `col` that pass [`App::epic_filter`]
+    /// (GitHub issue #199) and match [`App::board_search_query`] (GitHub
+    /// issue #152): with an empty query, every ticket the epic filter keeps,
+    /// otherwise those whose key or summary also contains the query,
     /// case-insensitive, in column order. Empty (rather than panicking) if
     /// `col` is out of bounds. `columns` stays the unfiltered source of
     /// truth; selection, movement and rendering all go through this view.
@@ -1138,6 +1183,7 @@ impl App {
         column
             .tickets
             .iter()
+            .filter(|t| self.epic_filter.matches(t))
             .filter(|t| {
                 query.is_empty()
                     || t.key.to_lowercase().contains(&query)
@@ -1172,6 +1218,30 @@ impl App {
         if let Some(users) = &self.assignable_users {
             options.extend(users.iter().cloned().map(AssigneeFilter::User));
         }
+        options
+    }
+
+    /// The epic filter picker's options, in display order: `All epics`, `No
+    /// epic`, then each distinct epic among the loaded cards, sorted by key.
+    /// Built from the loaded cards (not an epics query) so it never offers
+    /// an epic with no cards on the board; the one exception is the active
+    /// epic, kept even after a refetch empties it so the picker can still
+    /// mark it.
+    pub fn epic_options(&self) -> Vec<EpicFilter> {
+        let mut epics: Vec<&ParentRef> = self
+            .columns
+            .iter()
+            .flat_map(|c| &c.tickets)
+            .filter_map(|t| t.epic.as_ref())
+            .collect();
+        if let EpicFilter::Epic(active) = &self.epic_filter {
+            epics.push(active);
+        }
+        epics.sort_by(|a, b| a.key.cmp(&b.key));
+        epics.dedup_by(|a, b| a.key == b.key);
+
+        let mut options = vec![EpicFilter::All, EpicFilter::NoEpic];
+        options.extend(epics.into_iter().cloned().map(EpicFilter::Epic));
         options
     }
 
@@ -1385,6 +1455,18 @@ pub enum Msg {
     FilterPickerSelect,
     /// Close the filter picker without changing the active filter.
     FilterPickerClose,
+    /// Open the epic filter picker overlay (GitHub issue #199). Only
+    /// meaningful on [`Screen::Board`]; [`crate::tui::keymap::map_key`] only
+    /// ever emits this from there.
+    OpenEpicPicker,
+    /// Move the epic picker's highlighted option up.
+    EpicPickerUp,
+    /// Move the epic picker's highlighted option down.
+    EpicPickerDown,
+    /// Apply the epic picker's highlighted option and close the picker.
+    EpicPickerSelect,
+    /// Close the epic picker without changing the active epic filter.
+    EpicPickerClose,
     /// Enter board search mode (GitHub issue #152): every printable key now
     /// edits [`App::board_search_query`] until [`Msg::SearchSubmit`] or
     /// [`Msg::SearchCancel`]. Only meaningful on [`Screen::Board`];
@@ -2436,6 +2518,37 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, Vec::new())
         }
         Msg::FilterPickerSelect => filter_picker_select(app),
+        Msg::OpenEpicPicker => {
+            app.show_epic_picker = true;
+            app.epic_picker_selected = app
+                .epic_options()
+                .iter()
+                .position(|option| option == &app.epic_filter)
+                .unwrap_or(0);
+            (app, Vec::new())
+        }
+        Msg::EpicPickerUp => {
+            app.epic_picker_selected = app.epic_picker_selected.saturating_sub(1);
+            (app, Vec::new())
+        }
+        Msg::EpicPickerDown => {
+            let count = app.epic_options().len();
+            app.epic_picker_selected = (app.epic_picker_selected + 1).min(count - 1);
+            (app, Vec::new())
+        }
+        Msg::EpicPickerSelect => {
+            if let Some(choice) = app.epic_options().get(app.epic_picker_selected).cloned() {
+                let preferred_key = app.selected_ticket().map(|t| t.key.clone());
+                app.epic_filter = choice;
+                reselect(&mut app, preferred_key);
+            }
+            app.show_epic_picker = false;
+            (app, Vec::new())
+        }
+        Msg::EpicPickerClose => {
+            app.show_epic_picker = false;
+            (app, Vec::new())
+        }
         Msg::StartSearch => {
             app.board_searching = true;
             (app, Vec::new())
@@ -4694,6 +4807,201 @@ mod tests {
         app.merge_queue.insert("PROJ-1".to_string());
         app.board_search_query = "login".to_string();
         assert_eq!(merge_queue_in_board_order(&app), ["PROJ-1", "PROJ-2"]);
+    }
+
+    fn epic(key: &str, summary: &str) -> ParentRef {
+        ParentRef {
+            key: key.to_string(),
+            summary: summary.to_string(),
+        }
+    }
+
+    fn under(epic_ref: &ParentRef, ticket: TicketSummary) -> TicketSummary {
+        TicketSummary {
+            epic: Some(epic_ref.clone()),
+            ..ticket
+        }
+    }
+
+    /// A two-column board for the epic filter tests (GitHub issue #199). To
+    /// Do: PROJ-1 "Fix login" (epic PROJ-90), PROJ-2 "Add search" (no epic),
+    /// PROJ-3 "Login copy" (epic PROJ-80); Done: PROJ-4 "Search docs" (epic
+    /// PROJ-90).
+    fn epic_board() -> App {
+        let auth = epic("PROJ-90", "Auth revamp");
+        let copy = epic("PROJ-80", "Copy pass");
+        board_with(
+            vec![
+                under(&auth, titled("PROJ-1", "To Do", "Fix login")),
+                titled("PROJ-2", "To Do", "Add search"),
+                under(&copy, titled("PROJ-3", "To Do", "Login copy")),
+                under(&auth, titled("PROJ-4", "Done", "Search docs")),
+            ],
+            0,
+        )
+    }
+
+    #[test]
+    fn epic_options_list_all_none_then_each_loaded_epic_once_by_key() {
+        let app = epic_board();
+        assert_eq!(
+            app.epic_options(),
+            [
+                EpicFilter::All,
+                EpicFilter::NoEpic,
+                EpicFilter::Epic(epic("PROJ-80", "Copy pass")),
+                EpicFilter::Epic(epic("PROJ-90", "Auth revamp")),
+            ]
+        );
+    }
+
+    #[test]
+    fn epic_options_on_an_empty_board_are_all_and_none() {
+        let app = board_with(vec![], 0);
+        assert_eq!(app.epic_options(), [EpicFilter::All, EpicFilter::NoEpic]);
+    }
+
+    #[test]
+    fn epic_options_keep_an_active_epic_with_no_loaded_cards() {
+        let mut app = board_with(vec![titled("PROJ-2", "To Do", "Add search")], 0);
+        app.epic_filter = EpicFilter::Epic(epic("PROJ-90", "Auth revamp"));
+        assert_eq!(
+            app.epic_options(),
+            [
+                EpicFilter::All,
+                EpicFilter::NoEpic,
+                EpicFilter::Epic(epic("PROJ-90", "Auth revamp")),
+            ]
+        );
+    }
+
+    #[test]
+    fn epic_filter_labels_show_key_and_title() {
+        assert_eq!(EpicFilter::All.label(), "All epics");
+        assert_eq!(EpicFilter::NoEpic.label(), "No epic");
+        assert_eq!(
+            EpicFilter::Epic(epic("PROJ-90", "Auth revamp")).label(),
+            "PROJ-90  Auth revamp"
+        );
+    }
+
+    #[test]
+    fn epic_filter_narrows_every_column_to_the_epics_children() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::Epic(epic("PROJ-90", "Auth revamp"));
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-1"]);
+        assert_eq!(keys_in_col(&app, 1), ["PROJ-4"]);
+    }
+
+    #[test]
+    fn no_epic_filter_shows_only_cards_without_a_parent() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::NoEpic;
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-2"]);
+        assert!(keys_in_col(&app, 1).is_empty());
+    }
+
+    #[test]
+    fn epic_filter_combines_with_the_search_query() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::Epic(epic("PROJ-90", "Auth revamp"));
+        app.board_search_query = "search".to_string();
+        assert!(keys_in_col(&app, 0).is_empty());
+        assert_eq!(keys_in_col(&app, 1), ["PROJ-4"]);
+    }
+
+    #[test]
+    fn open_epic_picker_highlights_the_active_choice() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::Epic(epic("PROJ-90", "Auth revamp"));
+        let (app, cmds) = update(app, Msg::OpenEpicPicker);
+        assert!(app.show_epic_picker);
+        assert_eq!(app.epic_picker_selected, 3);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn epic_picker_up_and_down_navigate_and_clamp() {
+        let (app, _) = update(epic_board(), Msg::OpenEpicPicker);
+        let (app, _) = update(app, Msg::EpicPickerUp);
+        assert_eq!(app.epic_picker_selected, 0);
+        let mut app = app;
+        for _ in 0..10 {
+            (app, _) = update(app, Msg::EpicPickerDown);
+        }
+        assert_eq!(app.epic_picker_selected, 3);
+    }
+
+    #[test]
+    fn epic_picker_select_applies_the_choice_and_reselects_a_visible_card() {
+        let mut app = epic_board();
+        app.selected_row = 1; // PROJ-2, which has no epic
+        let (app, _) = update(app, Msg::OpenEpicPicker);
+        let (app, _) = update(app, Msg::EpicPickerDown);
+        let (app, _) = update(app, Msg::EpicPickerDown); // PROJ-80
+        let (app, cmds) = update(app, Msg::EpicPickerSelect);
+        assert!(!app.show_epic_picker);
+        assert_eq!(
+            app.epic_filter,
+            EpicFilter::Epic(epic("PROJ-80", "Copy pass"))
+        );
+        assert_eq!(
+            app.selected_ticket().map(|t| t.key.as_str()),
+            Some("PROJ-3")
+        );
+        assert!(cmds.is_empty(), "the epic filter is client-side");
+    }
+
+    #[test]
+    fn epic_picker_select_all_clears_the_filter() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::NoEpic;
+        let (app, _) = update(app, Msg::OpenEpicPicker);
+        let (app, _) = update(app, Msg::EpicPickerUp);
+        let (app, _) = update(app, Msg::EpicPickerSelect);
+        assert_eq!(app.epic_filter, EpicFilter::All);
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-1", "PROJ-2", "PROJ-3"]);
+    }
+
+    #[test]
+    fn epic_picker_close_keeps_the_active_filter() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::NoEpic;
+        let (app, _) = update(app, Msg::OpenEpicPicker);
+        let (app, _) = update(app, Msg::EpicPickerDown);
+        let (app, _) = update(app, Msg::EpicPickerClose);
+        assert!(!app.show_epic_picker);
+        assert_eq!(app.epic_filter, EpicFilter::NoEpic);
+    }
+
+    #[test]
+    fn epic_filter_survives_a_refetch_that_leaves_it_empty() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::Epic(epic("PROJ-90", "Auth revamp"));
+        let (app, _) = update(app, Msg::Refresh);
+        assert_eq!(
+            app.epic_filter,
+            EpicFilter::Epic(epic("PROJ-90", "Auth revamp"))
+        );
+        let (app, _) = update(
+            app,
+            Msg::TicketsLoaded(vec![titled("PROJ-2", "To Do", "Add search")]),
+        );
+        assert_eq!(
+            app.epic_filter,
+            EpicFilter::Epic(epic("PROJ-90", "Auth revamp"))
+        );
+        assert!(keys_in_col(&app, 0).is_empty());
+        assert!(app.selected_ticket().is_none());
+    }
+
+    #[test]
+    fn assignee_filter_change_keeps_the_epic_filter() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::NoEpic;
+        let (app, _) = update(app, Msg::OpenFilterPicker);
+        let (app, _) = update(app, Msg::FilterPickerSelect);
+        assert_eq!(app.epic_filter, EpicFilter::NoEpic);
     }
 
     #[test]
