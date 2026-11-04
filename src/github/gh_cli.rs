@@ -399,6 +399,16 @@ pub trait GhCli {
     /// comment.
     fn run_failed_log(&self, dir: &Path, run_id: u64) -> Result<String, GhError>;
 
+    /// The logs of the failed steps of one GitHub Actions job `job_id`
+    /// (`gh run view --job <job_id> --log-failed`), returned as `gh` prints
+    /// them. Unlike [`GhCli::run_failed_log`], this leaves out the other
+    /// failed jobs of the same run.
+    ///
+    /// `job_id` comes from [`CheckResult::job_id`]. `dir` is an explicit
+    /// repo root, same rationale as [`GhCli::pr_review_threads`]'s doc
+    /// comment.
+    fn job_failed_log(&self, dir: &Path, job_id: u64) -> Result<String, GhError>;
+
     /// List the review threads on pull request `number`, same as
     /// [`GhCli::pr_review_threads`] but with each thread's first comment's
     /// full body/path/line/URL, for handing bot findings to a cleanup
@@ -878,6 +888,10 @@ pub struct CheckResult {
     /// `None` for checks posted by other CI systems. This is what
     /// [`GhCli::run_failed_log`] takes.
     pub run_id: Option<u64>,
+    /// The GitHub Actions job id from [`CheckResult::details_url`], when the
+    /// link names one (`.../actions/runs/<run_id>/job/<job_id>`). This is
+    /// what [`GhCli::job_failed_log`] takes.
+    pub job_id: Option<u64>,
     /// The check's link: a `CheckRun`'s `detailsUrl` or a `StatusContext`'s
     /// `targetUrl`.
     pub details_url: Option<String>,
@@ -1774,6 +1788,23 @@ impl GhCli for ShellGhCli {
             .output()
             .map_err(|err| GhError::Spawn {
                 command: "gh run view".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_run_failed_log_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn job_failed_log(&self, dir: &Path, job_id: u64) -> Result<String, GhError> {
+        let output = Command::new("gh")
+            .args(["run", "view", "--job", &job_id.to_string(), "--log-failed"])
+            .current_dir(dir)
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh run view --job".to_string(),
                 message: err.to_string(),
             })?;
 
@@ -2907,6 +2938,15 @@ fn actions_run_id(url: &str) -> Option<u64> {
     rest.split(['/', '?', '#']).next()?.parse().ok()
 }
 
+/// The GitHub Actions job id in a check's details URL of the form
+/// `https://github.com/<owner>/<repo>/actions/runs/<run_id>/job/<job_id>`.
+/// `None` for a run-level link or any other URL.
+fn actions_job_id(url: &str) -> Option<u64> {
+    let (_, rest) = url.split_once("/actions/runs/")?;
+    let (_, job) = rest.split_once("/job/")?;
+    job.split(['/', '?', '#']).next()?.parse().ok()
+}
+
 /// Interpret the result of a `gh run view <run_id> --log-failed`
 /// invocation: stdout unchanged on success, a [`GhError::Command`]
 /// otherwise.
@@ -3015,6 +3055,7 @@ impl RawCheck {
             name: self.name.or(self.context).unwrap_or_default(),
             state,
             run_id: details_url.as_deref().and_then(actions_run_id),
+            job_id: details_url.as_deref().and_then(actions_job_id),
             details_url,
             conclusion,
         }
@@ -4188,6 +4229,8 @@ pub struct FakeGhCli {
     pr_checks_results: RefCell<HashMap<u64, Result<PrChecks, GhError>>>,
     pr_checks_calls: RefCell<Vec<u64>>,
     run_failed_log_results: RefCell<HashMap<u64, Result<String, GhError>>>,
+    job_failed_log_results: RefCell<HashMap<u64, Result<String, GhError>>>,
+    job_failed_log_calls: RefCell<Vec<u64>>,
     run_failed_log_calls: RefCell<Vec<u64>>,
     finding_details_results: RefCell<HashMap<u64, Result<Vec<FindingDetail>, GhError>>>,
     finding_details_calls: RefCell<Vec<u64>>,
@@ -4290,6 +4333,8 @@ impl Default for FakeGhCli {
             pr_checks_calls: RefCell::new(Vec::new()),
             run_failed_log_results: RefCell::new(HashMap::new()),
             run_failed_log_calls: RefCell::new(Vec::new()),
+            job_failed_log_results: RefCell::new(HashMap::new()),
+            job_failed_log_calls: RefCell::new(Vec::new()),
             finding_details_results: RefCell::new(HashMap::new()),
             finding_details_calls: RefCell::new(Vec::new()),
             full_threads_results: RefCell::new(HashMap::new()),
@@ -4491,6 +4536,22 @@ impl FakeGhCli {
     /// The run ids passed to `run_failed_log`, in call order.
     pub fn run_failed_log_calls(&self) -> Vec<u64> {
         self.run_failed_log_calls.borrow().clone()
+    }
+
+    /// Set the result `job_failed_log` will return for Actions job `job_id`.
+    ///
+    /// A job id with no configured result returns `Ok(String::new())`, an
+    /// empty log.
+    pub fn with_job_failed_log(self, job_id: u64, result: Result<String, GhError>) -> Self {
+        self.job_failed_log_results
+            .borrow_mut()
+            .insert(job_id, result);
+        self
+    }
+
+    /// The job ids passed to `job_failed_log`, in call order.
+    pub fn job_failed_log_calls(&self) -> Vec<u64> {
+        self.job_failed_log_calls.borrow().clone()
     }
 
     /// Set the result `pr_bot_finding_details` will return for pull request
@@ -4976,6 +5037,14 @@ impl GhCli for FakeGhCli {
         }
     }
 
+    fn job_failed_log(&self, _dir: &Path, job_id: u64) -> Result<String, GhError> {
+        self.job_failed_log_calls.borrow_mut().push(job_id);
+        match self.job_failed_log_results.borrow().get(&job_id) {
+            Some(result) => result.clone(),
+            None => Ok(String::new()),
+        }
+    }
+
     fn pr_bot_finding_details(
         &self,
         _dir: &Path,
@@ -5369,6 +5438,7 @@ mod tests {
                 name: "test".to_string(),
                 state: ChecksState::Failing,
                 run_id: Some(123456),
+                job_id: Some(789),
                 details_url: Some("https://github.com/o/r/actions/runs/123456/job/789".to_string()),
                 conclusion: Some("FAILURE".to_string()),
             }]
@@ -5427,6 +5497,7 @@ mod tests {
                 name: "ci/external".to_string(),
                 state: ChecksState::Passing,
                 run_id: None,
+                job_id: None,
                 details_url: Some("https://ci.example.com/build/9".to_string()),
                 conclusion: Some("SUCCESS".to_string()),
             }]
@@ -5467,6 +5538,19 @@ mod tests {
             Some(42)
         );
         assert_eq!(actions_run_id("https://ci.example.com/build/42"), None);
+    }
+
+    #[test]
+    fn actions_job_id_parses_only_job_urls() {
+        assert_eq!(
+            actions_job_id("https://github.com/o/r/actions/runs/42/job/7?pr=3"),
+            Some(7)
+        );
+        assert_eq!(
+            actions_job_id("https://github.com/o/r/actions/runs/42"),
+            None
+        );
+        assert_eq!(actions_job_id("https://ci.example.com/job/42"), None);
     }
 
     // --- run_failed_log ---

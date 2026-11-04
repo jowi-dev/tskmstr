@@ -3345,6 +3345,7 @@ mod tests {
                     name: (*name).to_string(),
                     state: *state,
                     run_id: Some(9),
+                    job_id: None,
                     details_url: Some("https://github.com/o/r/actions/runs/9".to_string()),
                     conclusion: match state {
                         crate::github::gh_cli::ChecksState::Failing => Some("FAILURE".to_string()),

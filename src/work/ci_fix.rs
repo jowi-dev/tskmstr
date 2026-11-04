@@ -149,12 +149,17 @@ fn fence_for(text: &str) -> String {
 }
 
 /// One [`FailedCheck`] per check in `checks` that
-/// [`crate::github::gh_cli::CheckResult::failed_for_fix`], with its log from
-/// [`GhCli::run_failed_log`] run in `dir`.
+/// [`crate::github::gh_cli::CheckResult::failed_for_fix`], with its log
+/// fetched in `dir`.
 ///
-/// Several checks often share one GitHub Actions run, so each run's log is
-/// fetched once and reused. A check that is not an Actions run, or whose
-/// log `gh` could not fetch, carries the reason instead.
+/// A check whose link names its Actions job gets that job's log alone
+/// ([`GhCli::job_failed_log`]). `gh run view <run> --log-failed` prints
+/// every failed job of the run, so fetching per run would hand each of
+/// several failing jobs the same combined log and spend the prompt's log
+/// budget on copies. A check linked only to its run falls back to
+/// [`GhCli::run_failed_log`], fetched once per run. A check that is not an
+/// Actions run, or whose log `gh` could not fetch, carries the reason
+/// instead.
 pub fn collect_failures(gh: &dyn GhCli, dir: &Path, checks: &PrChecks) -> Vec<FailedCheck> {
     let mut logs: HashMap<u64, Result<String, String>> = HashMap::new();
     checks
@@ -162,15 +167,18 @@ pub fn collect_failures(gh: &dyn GhCli, dir: &Path, checks: &PrChecks) -> Vec<Fa
         .iter()
         .filter(|check| check.failed_for_fix())
         .map(|check| {
-            let log = match check.run_id {
-                Some(run_id) => logs
+            let log = match (check.job_id, check.run_id) {
+                (Some(job_id), _) => gh
+                    .job_failed_log(dir, job_id)
+                    .map_err(|err| err.to_string()),
+                (None, Some(run_id)) => logs
                     .entry(run_id)
                     .or_insert_with(|| {
                         gh.run_failed_log(dir, run_id)
                             .map_err(|err| err.to_string())
                     })
                     .clone(),
-                None => Err(match &check.details_url {
+                (None, None) => Err(match &check.details_url {
                     Some(url) => format!("not a GitHub Actions run; see {url}"),
                     None => "not a GitHub Actions run, and no details link".to_string(),
                 }),
@@ -362,6 +370,7 @@ mod tests {
             name: name.to_string(),
             state,
             run_id,
+            job_id: None,
             details_url: run_id.map(|id| format!("https://github.com/o/r/actions/runs/{id}")),
             conclusion: match state {
                 ChecksState::Failing => Some("FAILURE".to_string()),
@@ -588,6 +597,7 @@ mod tests {
                     name: "ci/external".to_string(),
                     state: ChecksState::Failing,
                     run_id: None,
+                    job_id: None,
                     details_url: Some("https://ci.example.com/9".to_string()),
                     conclusion: Some("FAILURE".to_string()),
                 },
@@ -605,6 +615,28 @@ mod tests {
         assert!(failed[2].log.as_ref().unwrap_err().contains("no such run"));
         let external = failed[3].log.as_ref().unwrap_err();
         assert!(external.contains("https://ci.example.com/9"), "{external}");
+    }
+
+    #[test]
+    fn collect_failures_fetches_each_job_alone_when_the_link_names_it() {
+        let gh = FakeGhCli::new()
+            .with_job_failed_log(21, Ok("unit log".to_string()))
+            .with_job_failed_log(22, Ok("integration log".to_string()));
+        let job = |name: &str, job_id: u64| CheckResult {
+            job_id: Some(job_id),
+            details_url: Some(format!(
+                "https://github.com/o/r/actions/runs/2/job/{job_id}"
+            )),
+            ..check(name, ChecksState::Failing, Some(2))
+        };
+        let checks = pr_checks("abc", vec![job("unit", 21), job("integration", 22)]);
+
+        let failed = collect_failures(&gh, Path::new("/repo"), &checks);
+
+        assert_eq!(gh.job_failed_log_calls(), vec![21, 22]);
+        assert!(gh.run_failed_log_calls().is_empty());
+        assert_eq!(failed[0].log, Ok("unit log".to_string()));
+        assert_eq!(failed[1].log, Ok("integration log".to_string()));
     }
 
     // --- sweep ---
