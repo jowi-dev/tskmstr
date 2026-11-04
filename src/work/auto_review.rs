@@ -35,12 +35,17 @@ pub const LOOP_PID_EVENT: &str = "auto_review_loop_pid";
 /// the window as finished for [`crate::work::hibernate::ended_launch_windows`].
 pub const SIGNAL_EVENT: &str = "auto_review_signalled";
 
-/// Skill a first round reviews with.
-pub const FIRST_ROUND_SKILL: &str = "thatch-code-review";
-
 /// Skill every later round reviews with, against the previous round's
 /// archived comments.
 pub const FOLLOWUP_SKILL: &str = "thatch-review-followup";
+
+/// Skill or command a first round reviews with: `[work.auto_review]`'s
+/// `first_round_skill` when set, otherwise `runner_default`, the lane
+/// runner's [`crate::agent::AgentRunner::auto_review_skill`] (GitHub issue
+/// #203).
+pub fn first_round_skill<'a>(cfg: &'a AutoReviewConfig, runner_default: &'a str) -> &'a str {
+    cfg.first_round_skill.as_deref().unwrap_or(runner_default)
+}
 
 /// Built-in round prompt, used when `[work.auto_review]` sets neither
 /// `prompt` nor `prompt_file`. Placeholders are those of [`render_prompt`].
@@ -267,7 +272,8 @@ pub fn fix_completion_section(marker: &Path) -> String {
 }
 
 /// Renders a round's prompt from `template`, replacing `{key}`, `{round}`,
-/// `{skill}`, `{findings_file}`, `{archive}` (empty on round 1) and
+/// `{skill}` (`first_round_skill` on round 1, [`FOLLOWUP_SKILL`] after),
+/// `{findings_file}`, `{archive}` (empty on round 1) and
 /// `{prior}` (a sentence pointing a follow-up round at `archive`, empty on
 /// round 1), then appends [`review_completion_section`], so a custom
 /// template that never mentions the findings file still signals.
@@ -275,11 +281,12 @@ pub fn render_prompt(
     template: &str,
     key: &str,
     round: u32,
+    first_round_skill: &str,
     findings_file: &Path,
     archive: Option<&Path>,
 ) -> String {
     let skill = if round <= 1 {
-        FIRST_ROUND_SKILL
+        first_round_skill
     } else {
         FOLLOWUP_SKILL
     };
@@ -366,6 +373,10 @@ pub trait AutoReviewOps {
     /// the comment store, so the fix about to run addresses them too
     /// (GitHub issue #145). Returns how many were imported.
     fn import_bot_comments(&self) -> Result<usize, AutoReviewError>;
+    /// The lane runner's own first-round review entry point,
+    /// [`crate::agent::AgentRunner::auto_review_skill`]; see
+    /// [`first_round_skill`].
+    fn runner_review_skill(&self) -> &'static str;
 }
 
 /// How waiting on one step's signal ended.
@@ -488,6 +499,7 @@ pub fn run_loop(
         0 => i64::MAX,
         mins => i64::try_from(mins.saturating_mul(60)).unwrap_or(i64::MAX),
     };
+    let first_skill = first_round_skill(cfg, ops.runner_review_skill());
     let mut archive: Option<PathBuf> = None;
     for round in 1..=max {
         let findings_file = findings_path(git_dir, loop_id, round);
@@ -496,7 +508,14 @@ pub fn run_loop(
             std::fs::create_dir_all(dir).map_err(|e| AutoReviewError::step("review", e))?;
         }
 
-        let prompt = render_prompt(template, key, round, &findings_file, archive.as_deref());
+        let prompt = render_prompt(
+            template,
+            key,
+            round,
+            first_skill,
+            &findings_file,
+            archive.as_deref(),
+        );
         let run_id = ops.review(round, prompt)?;
         let stopped = |verdict: RoundVerdict| -> Result<LoopOutcome, AutoReviewError> {
             ops.record(run_id, ROUND_EVENT, &round_detail(round, max, verdict))?;
@@ -746,6 +765,10 @@ mod tests {
             Ok(self.fix_cap_reached)
         }
 
+        fn runner_review_skill(&self) -> &'static str {
+            RUNNER_SKILL
+        }
+
         fn import_bot_comments(&self) -> Result<usize, AutoReviewError> {
             self.import_at.borrow_mut().push(self.log.borrow().len());
             let comments = std::mem::take(&mut *self.bot_comments.borrow_mut());
@@ -761,6 +784,9 @@ mod tests {
     }
 
     const LOOP_ID: &str = "42-1787054400";
+
+    /// [`FakeOps::runner_review_skill`].
+    const RUNNER_SKILL: &str = "runner-review";
 
     const MEDIUM: &str = r#"[{"path": "src/a.rs", "start_line": 4, "end_line": 6,
         "severity": "MEDIUM", "specialist": "state-flow", "body": "race"}]"#;
@@ -840,7 +866,14 @@ mod tests {
     fn render_prompt_appends_the_completion_section_even_to_a_custom_template() {
         let findings = Path::new("/g/vdiff/auto-review/findings-1.json");
 
-        let prompt = render_prompt("Review {key} your own way.", "GH-1", 1, findings, None);
+        let prompt = render_prompt(
+            "Review {key} your own way.",
+            "GH-1",
+            1,
+            "thatch-code-review",
+            findings,
+            None,
+        );
 
         assert!(prompt.starts_with("Review GH-1 your own way."));
         assert!(prompt.ends_with(&review_completion_section(findings)));
@@ -891,7 +924,14 @@ mod tests {
 
     #[test]
     fn render_prompt_uses_code_review_first_and_followup_with_the_archive_after() {
-        let first = render_prompt(DEFAULT_PROMPT, "GH-1", 1, Path::new("/g/f-1.json"), None);
+        let first = render_prompt(
+            DEFAULT_PROMPT,
+            "GH-1",
+            1,
+            "thatch-code-review",
+            Path::new("/g/f-1.json"),
+            None,
+        );
         assert!(first.contains("`thatch-code-review`"));
         assert!(first.contains("/g/f-1.json"));
         assert!(first.contains("GH-1"));
@@ -920,11 +960,51 @@ mod tests {
             DEFAULT_PROMPT,
             "GH-1",
             2,
+            "thatch-code-review",
             Path::new("/g/f-2.json"),
             Some(Path::new("/g/archive/1.json")),
         );
         assert!(second.contains("`thatch-review-followup`"));
         assert!(second.contains("/g/archive/1.json"));
+    }
+
+    #[test]
+    fn first_round_skill_is_the_runners_unless_config_pins_one() {
+        assert_eq!(first_round_skill(&cfg(), "runner-review"), "runner-review");
+        let pinned = AutoReviewConfig {
+            first_round_skill: Some("pinned-review".to_string()),
+            ..cfg()
+        };
+        assert_eq!(first_round_skill(&pinned, "runner-review"), "pinned-review");
+    }
+
+    #[test]
+    fn round_one_reviews_with_the_runners_skill_and_later_rounds_follow_up() {
+        let tmp = TempDir::new().unwrap();
+        let ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
+
+        run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
+
+        let prompts = ops.prompts.borrow();
+        assert!(prompts[0].contains(&format!("`{RUNNER_SKILL}`")));
+        assert!(prompts[1].contains(&format!("`{FOLLOWUP_SKILL}`")));
+        assert!(!prompts[1].contains(RUNNER_SKILL));
+    }
+
+    #[test]
+    fn a_pinned_first_round_skill_wins_over_the_runners() {
+        let tmp = TempDir::new().unwrap();
+        let ops = FakeOps::new(tmp.path(), vec!["[]"]);
+        let cfg = AutoReviewConfig {
+            first_round_skill: Some("pinned-review".to_string()),
+            ..cfg()
+        };
+
+        run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
+
+        let prompts = ops.prompts.borrow();
+        assert!(prompts[0].contains("`pinned-review`"));
+        assert!(!prompts[0].contains(RUNNER_SKILL));
     }
 
     #[test]
