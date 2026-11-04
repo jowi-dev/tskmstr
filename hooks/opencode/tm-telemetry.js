@@ -23,8 +23,13 @@
 //     this plugin only emits live `tm runs event --kind usage` snapshots (like
 //     tm-usage.sh); the supervisor folds the latest one into runs.model_usage.
 //   - TSKMSTR_SESSION_RUN_ID set (and TSKMSTR_RUN_ID unset) => registered
-//     interactive session. This plugin finishes the run on exit (like
-//     tm-session-end.sh's inverted lane-run gate).
+//     interactive session. This plugin emits the same live usage snapshots
+//     against that run (like tm-usage.sh's marker fallback), and finishes the
+//     run on exit (like tm-session-end.sh's inverted lane-run gate).
+//
+// Every `tm runs event` bumps the run's heartbeat. An interactive lane's row
+// starts with no pid, so without these events its heartbeat goes stale and
+// the reaper fails the run while the agent is still working (GitHub #196).
 //   - neither set => a session tm did not launch. No-op beyond the harmless
 //     OPENCODE_SESSION_ID export.
 //
@@ -118,6 +123,9 @@ export default async () => {
   // gate — a registered interactive session (TSKMSTR_SESSION_RUN_ID) with no
   // supervising lane wrapper (TSKMSTR_RUN_ID) is the one this plugin finishes.
   const finishRunId = !laneRunId && sessionRunId ? sessionRunId : null;
+  // The run live usage snapshots go to: the lane run, else the registered
+  // interactive session's run.
+  const usageRunId = laneRunId || sessionRunId || null;
 
   let finished = false;
   function finishOnce() {
@@ -167,15 +175,15 @@ export default async () => {
       const info = event.properties && event.properties.info;
       recordMessage(info);
 
-      // Live lane-run usage snapshot (like tm-usage.sh): full snapshot, latest
-      // wins, wrapped in {"models": ...}. Only for headless lane runs.
-      if (laneRunId) {
+      // Live usage snapshot (like tm-usage.sh): full snapshot, latest wins,
+      // wrapped in {"models": ...}. Doubles as the run's heartbeat.
+      if (usageRunId) {
         const map = aggregate();
         if (!isEmpty(map)) {
           tmDetached([
             "runs",
             "event",
-            laneRunId,
+            usageRunId,
             "--kind",
             "usage",
             "--detail",

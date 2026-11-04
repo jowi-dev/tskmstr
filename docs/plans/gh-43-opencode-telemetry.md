@@ -136,11 +136,14 @@ phase 5), adapting only the delivery mechanism.
     harmless, and the only thing AC "session identity" needs).
   - `event`: accumulate per-model usage regardless; on exit, look at
     `TSKMSTR_SESSION_RUN_ID` (interactive) — if set, `tm runs finish <id>
-    --status done [--model-usage <map>]`, mirroring `tm-session-end.sh`. When
-    `TSKMSTR_RUN_ID` is set instead (a headless lane run), emit
-    `tm runs event <id> --kind usage --detail {"models":...}` as usage
-    accrues, mirroring `tm-usage.sh` — the lane supervisor's finish folds the
-    latest usage snapshot into `runs.model_usage`.
+    --status done [--model-usage <map>]`, mirroring `tm-session-end.sh`. As
+    usage accrues, emit `tm runs event <id> --kind usage --detail
+    {"models":...}` against `TSKMSTR_RUN_ID` (a headless lane run), else
+    `TSKMSTR_SESSION_RUN_ID`, mirroring `tm-usage.sh` and its marker
+    fallback — the lane supervisor's finish folds the latest usage snapshot
+    into `runs.model_usage`. The interactive events are also the run's
+    heartbeat: an interactive lane row starts with no pid, so without them
+    the reaper fails a working run as stale (GitHub issue #196).
 
 ### Distribution / versioning
 
