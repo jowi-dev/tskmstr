@@ -45,11 +45,11 @@ use crate::jira::client::RankAnchor;
 use crate::ticketing::error::ProviderError;
 use crate::ticketing::provider::{TicketProvider, TicketQuery};
 use crate::ticketing::types::Issue;
+use crate::tui::app::update;
 use crate::tui::app::{
     App, AssignChoice, AuditStatusEntry, Cmd, Msg, TicketSummary, audit_indicator,
     auto_review_indicator, bot_watch_indicator, lane_run_indicator,
 };
-use crate::tui::app::{query_for_filter, update};
 use crate::tui::keymap::{RetroOverlay, map_key};
 use crate::tui::launcher::LaneLauncher;
 use crate::tui::ui::draw;
@@ -405,7 +405,7 @@ pub fn run(deps: TuiDeps, net: NetDepsBuilder) -> Result<(), TuiError> {
     .with_lane_names(deps.lane_names.clone())
     .with_hidden_lane_count(deps.hidden_lane_count)
     .with_status_on_merge(deps.status_on_merge.clone());
-    let query = query_for_filter(&app.filter, &app.project_key);
+    let query = app.board_query();
     // Registered through `admit_net_cmds` like every `update`-emitted
     // command, so the initial fetch shows the pending indicator and can't
     // be doubled by an early `r` press.

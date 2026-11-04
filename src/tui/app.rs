@@ -46,6 +46,21 @@ pub struct TicketSummary {
     pub epic: Option<ParentRef>,
 }
 
+/// Which kind of card [`Screen::Board`] shows (GitHub issue #200). Epics are
+/// kept off the ticket board's queries, since nobody works an epic directly,
+/// so the epics view is the board's place to see and move them. Toggled by
+/// [`Msg::ToggleEpicsView`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoardView {
+    /// Workable tickets under the active [`AssigneeFilter`].
+    #[default]
+    Tickets,
+    /// The project's open epics ([`TicketQuery::OpenEpics`]), whatever the
+    /// assignee filter. Ticket-only actions are refused here; see
+    /// [`is_ticket_only_action`].
+    Epics,
+}
+
 /// The board's assignee filter: which subset of tickets to show.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AssigneeFilter {
@@ -848,8 +863,12 @@ pub struct App {
     /// sort first, in this order; unlisted columns keep the default
     /// category-then-name ordering and sort after. Empty when unconfigured.
     pub board_column_order: Vec<String>,
-    /// The board's active assignee filter.
+    /// The board's active assignee filter. Kept as is while
+    /// [`App::board_view`] is [`BoardView::Epics`], so toggling back
+    /// restores the same ticket board.
     pub filter: AssigneeFilter,
+    /// Whether the board shows tickets or epics.
+    pub board_view: BoardView,
     /// Assignable users for `project_key`, fetched lazily the first time the
     /// filter picker opens and cached for the rest of the session. `None`
     /// until a fetch has succeeded at least once.
@@ -1126,6 +1145,18 @@ impl App {
         Self::default()
     }
 
+    /// The query [`Screen::Board`] fetches its cards with: the active
+    /// [`AssigneeFilter`]'s ([`query_for_filter`]) in the ticket view, or
+    /// every open epic in the epics view.
+    pub fn board_query(&self) -> TicketQuery {
+        match self.board_view {
+            BoardView::Tickets => query_for_filter(&self.filter, &self.project_key),
+            BoardView::Epics => TicketQuery::OpenEpics {
+                project_key: self.project_key.clone(),
+            },
+        }
+    }
+
     /// Set `lane_names`, for threading the board's repo-compatible
     /// `[work.lanes]` names into the board at construction (see
     /// [`App::lane_names`]'s doc comment). Called from `tui::event::run`.
@@ -1169,7 +1200,7 @@ impl App {
     }
 
     /// The tickets of board column `col` that pass [`App::epic_filter`]
-    /// (GitHub issue #199) and match [`App::board_search_query`] (GitHub
+    /// (GitHub issue #199; ignored in [`BoardView::Epics`]) and match [`App::board_search_query`] (GitHub
     /// issue #152): with an empty query, every ticket the epic filter keeps,
     /// otherwise those whose key or summary also contains the query,
     /// case-insensitive, in column order. Empty (rather than panicking) if
@@ -1183,7 +1214,7 @@ impl App {
         column
             .tickets
             .iter()
-            .filter(|t| self.epic_filter.matches(t))
+            .filter(|t| self.board_view == BoardView::Epics || self.epic_filter.matches(t))
             .filter(|t| {
                 query.is_empty()
                     || t.key.to_lowercase().contains(&query)
@@ -1761,6 +1792,10 @@ pub enum Msg {
         /// stderr otherwise (e.g. no open PR, or already watching).
         result: Result<(), String>,
     },
+    /// Switch [`Screen::Board`] between [`BoardView::Tickets`] and
+    /// [`BoardView::Epics`], clearing the shown cards and refetching under
+    /// the new view.
+    ToggleEpicsView,
     /// Open the retro board. Only meaningful on [`Screen::Board`];
     /// [`crate::tui::keymap::map_key`] only ever emits this from there.
     OpenRetro,
@@ -1820,8 +1855,8 @@ pub enum Msg {
 /// resulting `Msg` back through `update`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
-    /// Fetch tickets matching `query`, built by [`query_for_filter`] from the
-    /// board's active [`AssigneeFilter`].
+    /// Fetch tickets matching `query`, built by [`App::board_query`] from the
+    /// board's active [`BoardView`] and [`AssigneeFilter`].
     FetchTickets {
         /// The query to search with.
         query: TicketQuery,
@@ -2293,6 +2328,23 @@ pub fn admit_net_cmds(app: &mut App, cmds: Vec<Cmd>) -> Vec<Cmd> {
     admitted
 }
 
+/// Whether `msg` is a board action that only makes sense on a workable
+/// ticket, and so is refused in [`BoardView::Epics`]: launching a lane or a
+/// manual session, auditing, merging, queueing a merge, and the assignee
+/// and epic filters, which the epics view ignores.
+fn is_ticket_only_action(msg: &Msg) -> bool {
+    matches!(
+        msg,
+        Msg::LaneRunAction
+            | Msg::ManualSessionAction
+            | Msg::AuditAction
+            | Msg::MergePrAction
+            | Msg::ToggleMergeQueue
+            | Msg::OpenFilterPicker
+            | Msg::OpenEpicPicker
+    )
+}
+
 /// Advance `app` in response to `msg`, returning the new state and any
 /// commands the caller should execute.
 ///
@@ -2313,6 +2365,13 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
 /// The per-[`Msg`] reducer arms of [`update`], which see already-cleared
 /// in-flight state and whose emitted `Cmd`s the wrapper gates afterward.
 fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
+    if app.screen == Screen::Board
+        && app.board_view == BoardView::Epics
+        && is_ticket_only_action(&msg)
+    {
+        app.status_line = "not available in the epics view; press E for tickets".to_string();
+        return (app, Vec::new());
+    }
     match msg {
         Msg::Up => {
             move_up(&mut app);
@@ -2348,7 +2407,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
                 };
                 (app, vec![Cmd::FetchRankTickets { query }])
             } else {
-                let query = query_for_filter(&app.filter, &app.project_key);
+                let query = app.board_query();
                 (app, vec![Cmd::FetchTickets { query }])
             }
         }
@@ -2432,7 +2491,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             }
             app.status_line = message;
             if merged {
-                let query = query_for_filter(&app.filter, &app.project_key);
+                let query = app.board_query();
                 (app, vec![Cmd::FetchTickets { query }])
             } else {
                 (app, Vec::new())
@@ -2631,7 +2690,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             // now-non-matching card doesn't linger until a manual `r`; the
             // local patch above still keeps the card visually correct in the
             // meantime.
-            let query = query_for_filter(&app.filter, &app.project_key);
+            let query = app.board_query();
             (app, vec![Cmd::FetchTickets { query }])
         }
         Msg::AssignFailed(err) => {
@@ -2843,6 +2902,18 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
                 Err(err) => format!("PR watch failed for {key}: {err}"),
             };
             (app, Vec::new())
+        }
+        Msg::ToggleEpicsView => {
+            app.board_view = match app.board_view {
+                BoardView::Tickets => BoardView::Epics,
+                BoardView::Epics => BoardView::Tickets,
+            };
+            app.columns.clear();
+            app.selected_col = 0;
+            app.selected_row = 0;
+            app.status_line = "Refreshing...".to_string();
+            let query = app.board_query();
+            (app, vec![Cmd::FetchTickets { query }])
         }
         Msg::OpenRetro => open_retro(app),
         Msg::RetroTicketsLoaded(tickets) => {
@@ -4120,7 +4191,7 @@ fn filter_picker_select(mut app: App) -> (App, Vec<Cmd>) {
     app.filter = filter;
     app.show_filter_picker = false;
     app.status_line = "Refreshing...".to_string();
-    let query = query_for_filter(&app.filter, &app.project_key);
+    let query = app.board_query();
     (app, vec![Cmd::FetchTickets { query }])
 }
 
@@ -4809,6 +4880,129 @@ mod tests {
         assert_eq!(merge_queue_in_board_order(&app), ["PROJ-1", "PROJ-2"]);
     }
 
+    fn everyone_board() -> App {
+        App {
+            project_key: "PROJ".to_string(),
+            filter: AssigneeFilter::Everyone,
+            ..board_with(vec![ticket("PROJ-1"), ticket("PROJ-2")], 1)
+        }
+    }
+
+    fn open_epics() -> Cmd {
+        Cmd::FetchTickets {
+            query: TicketQuery::OpenEpics {
+                project_key: "PROJ".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn toggle_epics_view_clears_the_board_and_fetches_open_epics() {
+        let (app, cmds) = update(everyone_board(), Msg::ToggleEpicsView);
+        assert_eq!(app.board_view, BoardView::Epics);
+        assert!(app.columns.is_empty(), "ticket cards must not linger");
+        assert_eq!((app.selected_col, app.selected_row), (0, 0));
+        assert_eq!(cmds, vec![open_epics()]);
+    }
+
+    #[test]
+    fn toggling_back_refetches_tickets_under_the_kept_filter() {
+        let (app, _) = update(everyone_board(), Msg::ToggleEpicsView);
+        let (app, cmds) = update(app, Msg::ToggleEpicsView);
+        assert_eq!(app.board_view, BoardView::Tickets);
+        assert_eq!(app.filter, AssigneeFilter::Everyone);
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchTickets {
+                query: TicketQuery::Everyone {
+                    project_key: "PROJ".to_string()
+                }
+            }]
+        );
+    }
+
+    #[test]
+    fn refresh_in_the_epics_view_refetches_open_epics() {
+        let app = App {
+            board_view: BoardView::Epics,
+            ..everyone_board()
+        };
+        let (_, cmds) = update(app, Msg::Refresh);
+        assert_eq!(cmds, vec![open_epics()]);
+    }
+
+    #[test]
+    fn transition_moves_an_epic_into_its_new_column_in_the_epics_view() {
+        let app = App {
+            board_view: BoardView::Epics,
+            screen: Screen::TransitionMenu,
+            ..board_with(
+                vec![ticket("PROJ-9"), ticket_with("PROJ-8", "Done", "done")],
+                0,
+            )
+        };
+        let (app, _) = update(
+            app,
+            Msg::TransitionApplied {
+                key: "PROJ-9".to_string(),
+                status: "In Progress".to_string(),
+                status_category: "indeterminate".to_string(),
+            },
+        );
+        assert_eq!(app.board_view, BoardView::Epics);
+        let moved = app.selected_ticket().expect("the epic stays selected");
+        assert_eq!(
+            (moved.key.as_str(), moved.status.as_str()),
+            ("PROJ-9", "In Progress")
+        );
+    }
+
+    #[test]
+    fn ticket_only_actions_do_nothing_in_the_epics_view() {
+        for msg in [
+            Msg::LaneRunAction,
+            Msg::ManualSessionAction,
+            Msg::AuditAction,
+            Msg::MergePrAction,
+            Msg::ToggleMergeQueue,
+            Msg::OpenFilterPicker,
+            Msg::OpenEpicPicker,
+        ] {
+            let app = App {
+                board_view: BoardView::Epics,
+                lane_names: vec!["main".to_string()],
+                ..everyone_board()
+            };
+            let (app, cmds) = update(app, msg.clone());
+            assert!(cmds.is_empty(), "{msg:?} must not dispatch: {cmds:?}");
+            assert!(app.merge_queue.is_empty(), "{msg:?}");
+            assert!(
+                !app.show_filter_picker && !app.show_epic_picker && !app.show_lane_picker,
+                "{msg:?}"
+            );
+            assert!(
+                app.merge_confirm.is_none() && app.lane_confirm.is_none(),
+                "{msg:?}"
+            );
+            assert!(
+                app.status_line.contains("epics view"),
+                "{msg:?} should explain itself: {:?}",
+                app.status_line
+            );
+        }
+    }
+
+    #[test]
+    fn merge_action_on_the_overview_ignores_the_board_view() {
+        let app = App {
+            board_view: BoardView::Epics,
+            screen: Screen::Overview,
+            ..App::new()
+        };
+        let (app, _) = update(app, Msg::MergePrAction);
+        assert!(!app.status_line.contains("epics view"));
+    }
+
     fn epic(key: &str, summary: &str) -> ParentRef {
         ParentRef {
             key: key.to_string(),
@@ -4993,6 +5187,14 @@ mod tests {
         );
         assert!(keys_in_col(&app, 0).is_empty());
         assert!(app.selected_ticket().is_none());
+    }
+
+    #[test]
+    fn epics_view_ignores_the_epic_filter() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::NoEpic;
+        app.board_view = BoardView::Epics;
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-1", "PROJ-2", "PROJ-3"]);
     }
 
     #[test]

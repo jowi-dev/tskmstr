@@ -1444,6 +1444,11 @@ status. Tickets without a parent epic render without either line, and
 their cards keep their usual height. If the epics can't be loaded, the
 board still loads, without epic lines, and the status line says why.
 
+Epics themselves never appear as cards on the ticket board, under any
+assignee filter: nobody works an epic directly, so the board, the priority
+view, `tm ready`, and `tm dispatch` all leave them out. Press `E` to see and
+move them in the epics view instead; see "The epics view" below.
+
 | Key | Action |
 |---|---|
 | `j` / `Down` | Move selection down |
@@ -1455,6 +1460,7 @@ board still loads, without epic lines, and the status line says why.
 | `r` | Refresh from Jira |
 | `o` | Open the selected ticket in the browser |
 | `f` | Open the assignee filter picker (board only) |
+| `E` | Switch between the ticket board and the epics view (board only); see "The epics view" below |
 | `e` | Open the epic filter picker; see "Filtering the board by epic" below (board only) |
 | `i` / `/` | Start searching the board's cards; see "Searching the board" below (board only) |
 | `A` | Open the assign picker for the selected ticket (board only) |
@@ -1485,6 +1491,22 @@ cached for the rest of the session). `j`/`k` navigate the list, `Enter`
 applies the highlighted filter and refetches the board, `Esc`/`q` closes the
 picker without changing anything. The currently active filter is marked with
 a leading `*`.
+
+### The epics view
+
+Pressing `E` on the board swaps its cards for every open epic in
+`default_project_key` (Jira issues of the `epic_issue_type`, GitHub issues
+labeled `tm:epic`), in the same status columns. The status line reads
+`View: Epics`. `h`/`j`/`k`/`l`, `Enter`, the "Move to" transition window,
+`r`, `o`, and search all work as they do on tickets, so moving an epic as
+its children finish is the same as moving a ticket. Done epics are hidden,
+the same way the board hides done tickets; `tm graph` still shows them.
+
+Keys that only make sense on a workable ticket do nothing in the epics view
+except set a status-line message: `w` (lane run), `m` (manual session), `a`
+(audit), `M` and `Space` (merge), and `f` and `e` (the assignee and epic
+filters do not apply to epics). Press `E` again to return to the ticket
+board under the assignee and epic filters you left it with.
 
 ### Filtering the board by epic
 

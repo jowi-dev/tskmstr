@@ -254,6 +254,18 @@ impl<'a> GithubProvider<'a> {
             .collect())
     }
 
+    /// [`Self::list_and_map`] with epic-labeled issues left out: what every
+    /// board query lists, since an epic groups tickets rather than being
+    /// worked itself (GitHub issue #200). Filtered client-side because `gh
+    /// issue list` has no label exclusion.
+    fn list_tickets(&self, filter: IssueListFilter) -> Result<Vec<Issue>, ProviderError> {
+        Ok(self
+            .list_and_map(filter)?
+            .into_iter()
+            .filter(|issue| !self.is_epic(issue))
+            .collect())
+    }
+
     /// The rank-store scope every rank read/write of this provider uses:
     /// its own repo's [`crate::config::BackendIdentity::scope`]. GitHub
     /// issue numbers restart at 1 per repo, so `GH-3`'s rank in this repo
@@ -779,31 +791,31 @@ impl TicketProvider for GithubProvider<'_> {
         let issues = match query {
             TicketQuery::MyOpen => {
                 let login = self.current_login()?;
-                self.list_and_map(IssueListFilter {
+                self.list_tickets(IssueListFilter {
                     state: IssueListState::Open,
                     assignee: Some(login),
                     ..Default::default()
                 })?
             }
             TicketQuery::Unassigned { .. } => self
-                .list_and_map(IssueListFilter {
+                .list_tickets(IssueListFilter {
                     state: IssueListState::Open,
                     ..Default::default()
                 })?
                 .into_iter()
                 .filter(|issue| issue.fields.assignee.is_none())
                 .collect(),
-            TicketQuery::Everyone { .. } => self.list_and_map(IssueListFilter {
+            TicketQuery::Everyone { .. } => self.list_tickets(IssueListFilter {
                 state: IssueListState::Open,
                 ..Default::default()
             })?,
-            TicketQuery::Assignee { account_id, .. } => self.list_and_map(IssueListFilter {
+            TicketQuery::Assignee { account_id, .. } => self.list_tickets(IssueListFilter {
                 state: IssueListState::Open,
                 assignee: Some(account_id.clone()),
                 ..Default::default()
             })?,
             TicketQuery::Ranked { .. } => {
-                let issues = self.list_and_map(IssueListFilter {
+                let issues = self.list_tickets(IssueListFilter {
                     state: IssueListState::Open,
                     ..Default::default()
                 })?;
@@ -832,7 +844,7 @@ impl TicketProvider for GithubProvider<'_> {
             TicketQuery::ReadyCandidates => {
                 let login = self.current_login()?;
                 let issues: Vec<Issue> = self
-                    .list_and_map(IssueListFilter {
+                    .list_tickets(IssueListFilter {
                         state: IssueListState::Open,
                         assignee: Some(login),
                         ..Default::default()
@@ -868,6 +880,11 @@ impl TicketProvider for GithubProvider<'_> {
                     ..Default::default()
                 })?
             }
+            TicketQuery::OpenEpics { .. } => self.list_and_map(IssueListFilter {
+                state: IssueListState::Open,
+                labels: vec![EPIC_LABEL.to_string()],
+                ..Default::default()
+            })?,
         };
         Ok(SearchResult {
             issues,
@@ -1959,6 +1976,68 @@ mod tests {
         let calls = fake.issue_list_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1.state, IssueListState::All);
+        assert_eq!(calls[0].1.labels, vec![EPIC_LABEL.to_string()]);
+    }
+
+    #[test]
+    fn board_queries_leave_out_epic_labeled_issues() {
+        let mix = || {
+            vec![
+                issue_info(1, "Epic", IssueState::Open, &[EPIC_LABEL, "tm:status/todo"]),
+                issue_info(2, "Ticket", IssueState::Open, &["tm:status/todo"]),
+            ]
+        };
+        let project = || "ignored".to_string();
+        let queries = [
+            TicketQuery::MyOpen,
+            TicketQuery::Unassigned {
+                project_key: project(),
+            },
+            TicketQuery::Everyone {
+                project_key: project(),
+            },
+            TicketQuery::Assignee {
+                project_key: project(),
+                account_id: "jowi-dev".to_string(),
+            },
+            TicketQuery::Ranked {
+                project_key: project(),
+            },
+            TicketQuery::ReadyCandidates,
+        ];
+        for query in queries {
+            let fake = FakeGhCli::new()
+                .with_current_user_login(Ok(Some("jowi-dev".to_string())))
+                .with_issue_list(Ok(mix()));
+            let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+            let result = provider.search(&query).unwrap();
+
+            let keys: Vec<&str> = result.issues.iter().map(|i| i.key.as_str()).collect();
+            assert_eq!(keys, ["GH-2"], "{query:?} must leave out the epic");
+        }
+    }
+
+    #[test]
+    fn search_open_epics_lists_only_open_epic_labeled_issues() {
+        let fake = FakeGhCli::new().with_issue_list(Ok(vec![issue_info(
+            1,
+            "Open epic",
+            IssueState::Open,
+            &[EPIC_LABEL],
+        )]));
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        let result = provider
+            .search(&TicketQuery::OpenEpics {
+                project_key: "ignored".to_string(),
+            })
+            .unwrap();
+
+        let keys: Vec<_> = result.issues.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["GH-1"]);
+        let calls = fake.issue_list_calls();
+        assert_eq!(calls[0].1.state, IssueListState::Open);
         assert_eq!(calls[0].1.labels, vec![EPIC_LABEL.to_string()]);
     }
 

@@ -24,9 +24,9 @@ use crate::runs::overview::{LIFECYCLE_COLUMNS, Stage};
 use crate::runs::system::SystemHeader;
 use crate::runs::{RetroSeverity, RunStatus};
 use crate::tui::app::{
-    App, AssignChoice, AssigneeFilter, AuditStatusEntry, AutoReviewBadge, BotWatchIndicator,
-    Column, EpicFilter, OverviewLayout, RETRO_SEVERITIES, RUN_COLUMNS, RunCard, RunIndicator,
-    Screen, TicketSummary,
+    App, AssignChoice, AssigneeFilter, AuditStatusEntry, AutoReviewBadge, BoardView,
+    BotWatchIndicator, Column, EpicFilter, OverviewLayout, RETRO_SEVERITIES, RUN_COLUMNS, RunCard,
+    RunIndicator, Screen, TicketSummary,
 };
 use crate::tui::theme;
 
@@ -131,6 +131,11 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
         &status_line_text(app),
         if app.screen == Screen::Board && app.board_searching {
             SEARCH_HINT
+        } else if app.screen == Screen::Board
+            && app.board_view == BoardView::Epics
+            && !app.show_run_detail
+        {
+            EPICS_HINT
         } else {
             hint_for(app.screen, app.show_run_detail)
         },
@@ -241,10 +246,17 @@ fn status_line_with_filter(app: &App) -> String {
         format!("Filter: {}", parts.join(", "))
     } else {
         let mut parts = Vec::new();
-        if app.screen != Screen::Rank && app.filter != AssigneeFilter::Me {
+        if app.screen != Screen::Rank && app.board_view == BoardView::Epics {
+            // The epics view ignores the assignee filter, so naming it would
+            // mislead.
+            parts.push("View: Epics".to_string());
+        } else if app.screen != Screen::Rank && app.filter != AssigneeFilter::Me {
             parts.push(format!("Filter: {}", app.filter.label()));
         }
-        if app.screen == Screen::Board && app.epic_filter != EpicFilter::All {
+        if app.screen == Screen::Board
+            && app.board_view == BoardView::Tickets
+            && app.epic_filter != EpicFilter::All
+        {
             parts.push(format!("Epic: {}", app.epic_filter.label()));
         }
         if let Some(search) = board_search_text(app) {
@@ -304,6 +316,11 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, status_line: &str, hints: &str
 /// [`hint_for`]'s board hint (every printable key types into the query).
 const SEARCH_HINT: &str = "type to search  Backspace delete  Enter keep  Esc clear";
 
+/// The status-bar key hint in the board's epics view, replacing
+/// [`hint_for`]'s board hint: only the keys that work on an epic (see
+/// `is_ticket_only_action` in `crate::tui::app`), plus `E` to go back.
+const EPICS_HINT: &str = "h/l column  j/k move  Enter open/move  r refresh  o browser  O jira  E tickets  i or / search  ? help  q quit";
+
 /// The key-hint text shown in the status bar for `screen`. `show_run_detail`
 /// picks the detail-window variant on [`Screen::Board`], [`Screen::Runs`]
 /// and [`Screen::Overview`] -- the run-detail overlay's keymap
@@ -313,7 +330,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  e epic  A assign  p priority  a audit  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  Space queue  R retro  P autopilot  i or / search  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  e epic  E epics  A assign  p priority  a audit  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  Space queue  R retro  P autopilot  i or / search  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -1908,8 +1925,8 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("L       run logs"),
         Line::from("V       vdiff review"),
         Line::from("F       apply review fixes"),
-        Line::from("M       merge PR / merge queue"),
-        Line::from("Space   toggle merge queue"),
+        Line::from("M/Space merge PR / merge queue"),
+        Line::from("E       toggle epics view"),
         Line::from("R       retro verdict"),
         Line::from("P       toggle autopilot"),
     ];
@@ -2476,6 +2493,7 @@ mod tests {
             "o browser",
             "O jira",
             "f filter",
+            "E epics",
             "e epic",
             "A assign",
             "p priority",
@@ -2904,6 +2922,7 @@ mod tests {
             "merge queue",
             "retro",
             "search cards",
+            "epics view",
             "epic",
         ] {
             assert!(
@@ -3803,6 +3822,38 @@ mod tests {
         let text = buffer_text(&render(&app));
         assert!(text.contains("><"));
         assert!(text.contains("grabbed"));
+    }
+
+    #[test]
+    fn epics_view_status_bar_names_the_view_instead_of_the_filter() {
+        for screen in [Screen::Board, Screen::Detail] {
+            let app = App {
+                screen,
+                board_view: BoardView::Epics,
+                filter: AssigneeFilter::Everyone,
+                columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+                ..App::new()
+            };
+            let text = buffer_text(&render_with_size(&app, 200, 20));
+            assert!(text.contains("View: Epics"), "{screen:?}:\n{text}");
+            assert!(!text.contains("Filter:"), "{screen:?}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn epics_view_hint_offers_the_way_back_and_no_ticket_only_keys() {
+        let app = App {
+            board_view: BoardView::Epics,
+            ..App::new()
+        };
+        let text = buffer_text(&render_with_size(&app, 200, 20));
+        assert!(text.contains("E tickets"), "{text}");
+        for key in ["w work", "a audit", "m manual", "M merge", "f filter"] {
+            assert!(
+                !text.contains(key),
+                "`{key}` is refused in the epics view:\n{text}"
+            );
+        }
     }
 
     #[test]

@@ -309,6 +309,7 @@ pub fn map_key(
         }
         KeyCode::Char('c') if *screen == Screen::Board => Some(Msg::CreateAction),
         KeyCode::Char('R') if *screen == Screen::Board => Some(Msg::OpenRetro),
+        KeyCode::Char('E') if *screen == Screen::Board => Some(Msg::ToggleEpicsView),
         KeyCode::Char('d') if *screen == Screen::Retro => Some(Msg::RetroDefectStart),
         KeyCode::Char('c') if *screen == Screen::Retro => Some(Msg::RetroMarkClean),
         _ => None,
@@ -3146,6 +3147,26 @@ mod tests {
             false,
             key,
         )
+    }
+
+    /// GitHub issue #200: `E` toggles the board's epics view, and is unbound
+    /// on every other screen.
+    #[test]
+    fn capital_e_toggles_the_epics_view_only_on_the_board() {
+        assert_eq!(
+            plain_key(&Screen::Board, KeyCode::Char('E')),
+            Some(Msg::ToggleEpicsView)
+        );
+        for screen in [
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+            Screen::Retro,
+            Screen::Overview,
+        ] {
+            assert_eq!(plain_key(&screen, KeyCode::Char('E')), None, "{screen:?}");
+        }
     }
 
     /// GitHub issue #199: `e` opens the epic filter picker, on the board
