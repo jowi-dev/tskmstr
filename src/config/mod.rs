@@ -577,8 +577,9 @@ pub struct RawAuditConfig {
     /// responsibility. Required to enable launching at all.
     pub dir: Option<String>,
     /// Prompt template fed to `claude` on launch, with `{key}` replaced by
-    /// the ticket key, e.g. `/ticket-audit {key}`. Defaults to
-    /// `/ticket-audit {key}` when unset.
+    /// the ticket key, e.g. `/ticket-audit {key}`. Defaults to the agent
+    /// runner's audit template when unset (see
+    /// [`crate::agent::AgentRunner::default_audit_prompt_template`]).
     pub prompt: Option<String>,
     /// Model the launched session passes as `--model`, e.g. `opus`. Takes
     /// precedence over [`RawWorkConfig::default_model`] for audits: an

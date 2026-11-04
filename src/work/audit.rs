@@ -318,7 +318,7 @@ mod tests {
     fn audit_prompt_defaults_to_ticket_audit_template() {
         assert_eq!(
             audit_prompt(ClaudeRunner.default_audit_prompt_template(), "PROJ-1"),
-            "/ticket-audit PROJ-1"
+            "/ticket-audit PROJ-1 (investigate with /thatch:refine on its PROPOSED APPROACH)"
         );
     }
 
@@ -412,7 +412,7 @@ mod tests {
                     dir: "/Users/jowi/Projects/axiom".to_string(),
                     window_name: "audit".to_string(),
                     env: vec![(SESSION_RUN_ID_ENV.to_string(), outcome.run_id.to_string())],
-                    command: "claude --model 'opus' '/ticket-audit PROJ-1'".to_string(),
+                    command: "claude --model 'opus' '/ticket-audit PROJ-1 (investigate with /thatch:refine on its PROPOSED APPROACH)'".to_string(),
                 },
                 TmuxCall::NewWindow {
                     name: "tm-proj-proj-1".to_string(),
@@ -537,7 +537,7 @@ mod tests {
                     window_name: "audit".to_string(),
                     dir: "/repo/axiom".to_string(),
                     env: vec![(SESSION_RUN_ID_ENV.to_string(), outcome.run_id.to_string())],
-                    command: "claude --model 'opus' '/ticket-audit PROJ-1'".to_string(),
+                    command: "claude --model 'opus' '/ticket-audit PROJ-1 (investigate with /thatch:refine on its PROPOSED APPROACH)'".to_string(),
                 },
             ]
         );
@@ -660,7 +660,7 @@ mod tests {
 
         assert_eq!(
             launched_command(&tmux),
-            Some("claude --model 'opus' '/ticket-audit PROJ-9'".to_string())
+            Some("claude --model 'opus' '/ticket-audit PROJ-9 (investigate with /thatch:refine on its PROPOSED APPROACH)'".to_string())
         );
     }
 
@@ -701,7 +701,7 @@ mod tests {
             assert_eq!(
                 launched_command(&tmux),
                 Some(format!(
-                    "claude --model '{expected}' '/ticket-audit PROJ-9'"
+                    "claude --model '{expected}' '/ticket-audit PROJ-9 (investigate with /thatch:refine on its PROPOSED APPROACH)'"
                 ))
             );
         }

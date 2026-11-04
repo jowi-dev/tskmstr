@@ -501,7 +501,7 @@ impl AgentRunner for ClaudeRunner {
     }
 
     fn default_audit_prompt_template(&self) -> &'static str {
-        "/ticket-audit {key}"
+        "/ticket-audit {key} (investigate with /thatch:refine on its PROPOSED APPROACH)"
     }
 
     fn default_cleanup_prompt_template(&self) -> &'static str {
@@ -956,10 +956,10 @@ mod tests {
     }
 
     #[test]
-    fn default_audit_prompt_template_is_ticket_audit() {
+    fn default_audit_prompt_template_is_ticket_audit_with_refine() {
         assert_eq!(
             ClaudeRunner.default_audit_prompt_template(),
-            "/ticket-audit {key}"
+            "/ticket-audit {key} (investigate with /thatch:refine on its PROPOSED APPROACH)"
         );
     }
 

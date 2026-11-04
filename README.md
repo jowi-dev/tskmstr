@@ -1756,7 +1756,7 @@ terminal to that session (the board suspends, tmux takes over; detach with
 ```toml
 [work.audit]
 dir = "~/Projects/axiom"            # required: where the session runs
-# prompt = "/ticket-audit {key}"    # optional; this is the default
+# prompt = "/ticket-audit {key}"    # optional; the default also names /thatch:refine (below)
 # prompt_file = ".tskmstr/prompts/audit.md"  # optional; see below
 # model = "opus"                    # optional; see "Which model a launch uses"
 ```
@@ -1788,6 +1788,17 @@ runner's default (see "Which model a launch uses"). The session always
 passes `--model`, so an enterprise-managed claude model pin never applies.
 Since an audit is where digging quality matters most, it is worth setting
 deliberately.
+
+The audit's investigation step is `/thatch:refine` run on the ticket's
+PROPOSED APPROACH, so the approach's premises are checked against the code
+before a lane runs it (GitHub issue #206). The default prompt is
+`/ticket-audit {key} (investigate with /thatch:refine on its PROPOSED
+APPROACH)`, and the `.tskmstr/prompts/audit.md` scaffold `tm init` writes
+carries the same step. Refine runs unmodified; the audit still checks links,
+blockers and lane size itself, writes refine's revisions back to the ticket
+body, and only then records a verdict with `tm ticket audit <KEY> --record`.
+A user-level `ticket-audit` skill lives outside this repo, so update it to
+match.
 
 Each card with a live `audit` window (or a live audit run) shows a badge:
 `audit: starting` (window up, run not registered yet), `audit: running`, `audit:
