@@ -4632,6 +4632,24 @@ mod tests {
     }
 
     #[test]
+    fn memory_prompt_only_asks_for_thatch_calls_that_exist() {
+        let mut fx = up_to_date_fixture();
+        fx.merge_cfg.consolidate_memories = true;
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        let windows = memory_windows(&fx);
+        let (_, _, command) = &windows[0];
+        // memory_list takes only `store`; branch scope shows up as a
+        // `(branch:<name>)` suffix on each label in its output.
+        assert!(command.contains("memory_list once"), "{command}");
+        assert!(command.contains("(branch:<name>)"), "{command}");
+        assert!(command.contains("archived: true"), "{command}");
+        assert!(command.contains("exact full label"), "{command}");
+    }
+
+    #[test]
     fn memory_session_is_skipped_when_disabled() {
         let fx = up_to_date_fixture();
 

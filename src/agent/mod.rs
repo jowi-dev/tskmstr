@@ -890,21 +890,27 @@ pub trait AgentRunner: Sync {
     /// caller (`crate::work::merge`) with one `- <branch>` line per merged
     /// branch.
     ///
-    /// The session checks for branch-scoped memories itself because
-    /// `thatch list` does not show branch scope, so tm cannot skip an empty
-    /// branch before launching. Runner-neutral for the same reason as
+    /// The session checks for branch-scoped memories itself, so tm never
+    /// filters them: thatch's MCP `memory_list` takes only a `store`, but
+    /// tags each branch-scoped label with a `(branch:<name>)` suffix, and the
+    /// prompt has the agent pick entries by that suffix. (The `thatch list`
+    /// CLI does not show branch scope, which is why tm cannot skip an empty
+    /// branch before launching.) Runner-neutral for the same reason as
     /// [`AgentRunner::default_merge_conflict_prompt_template`]: it names
     /// thatch's MCP tools, which every runner reaches the same way.
     fn default_memory_consolidation_prompt_template(&self) -> &'static str {
         "These git branches were just merged and deleted:\n\n\
          {branch_list}\n\n\
-         Your job is bounded: consolidate their thatch memories. Using thatch's MCP tools on \
-         this repository's project store, list the memories scoped to each branch \
-         (memory_list with that branch). If no branch has any, stop now and do nothing else. \
-         Otherwise, for each branch that has memories, save one unscoped archived record \
-         (memory_remember) summarizing what the branch delivered and any decisions, gotchas, \
-         or follow-ups still worth knowing, then forget the branch-scoped originals \
-         (memory_forget). Do not change code, git state, or tickets."
+         Your job is bounded: consolidate their thatch memories in this repository's project \
+         store, using thatch's MCP tools. Call memory_list once, with no arguments. Each \
+         branch-scoped entry's label ends with a (branch:<name>) suffix; pick the entries \
+         whose suffix names one of the branches above. If none match, stop now and do \
+         nothing else. Otherwise, for each branch with matching entries, read them with \
+         memory_show, then save one unscoped record with memory_remember, passing \
+         archived: true and no branch, summarizing what the branch delivered and any \
+         decisions, gotchas, or follow-ups still worth knowing. Then remove each original \
+         with memory_forget, which needs the exact full label as memory_list printed it. Do \
+         not change code, git state, or tickets."
     }
 
     /// Deploy this runner's telemetry artifacts (hook scripts + a settings
