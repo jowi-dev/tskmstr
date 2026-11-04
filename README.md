@@ -57,10 +57,23 @@ runner's built-in default model (`opus` for claude,
 leaves the key unset, and runs then resolve their model through the rest of
 the chain described in "Which model a launch uses".
 
-The scaffolded lane prompt is a generic skeleton, so after everything is
-written the wizard offers to launch an agent-assisted setup session
-(GitHub issue #30): an interactive session, in the repo root, prompted to
-explore the repo, verify the build/test/lint/format gates that actually
+The scaffolded lane prompt gives lane runs the same thatch session shape
+the create, audit and review prompts have (GitHub issue #205): recall
+project and branch-scoped memory for the ticket before reading code,
+investigate with the `thatch-code-archaeology` skill and plan with
+`thatch-coding-workflow`, keep work-in-progress notes as memories scoped
+to the lane's branch, draft the `tm pr create` body with
+`thatch-pr-description`, and record what the session learned with
+`thatch-session-reflection` before the final message. There is no
+self-review step: `/thatch:self-review` is interactive, and the post-PR
+review loop covers review. `tm check` reports any of those skills that
+isn't installed. Existing lane prompts are never rewritten, so a repo
+onboarded earlier adopts the steps by hand or through the setup session.
+
+Beyond that, the scaffolded lane prompt is a generic skeleton, so after
+everything is written the wizard offers to launch an agent-assisted setup
+session (GitHub issue #30): an interactive session, in the repo root,
+prompted to explore the repo, verify the build/test/lint/format gates that actually
 exist here, fill the scaffolded lane and thatch session prompts out in
 place, and author any session skills the config references but that exist
 nowhere on disk —
