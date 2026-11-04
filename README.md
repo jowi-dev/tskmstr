@@ -1338,10 +1338,14 @@ tm dispatch off --all       # kill switch: the next tick launches nothing
 `status` prints, for example:
 
 ```
-github:o/r: on, 1 lanes running, last tick 2026-10-19T14:03:22Z, last launch 2h10m ago
+github:o/r: on, 1 lanes running (GH-5), last tick 2026-10-19T14:03:22Z, last launch 2h10m ago
   repo: /home/me/r
   blocked for 45m: not launching: 1 lanes running (GH-5), [dispatch] max_lanes is 1
 ```
+
+The lane count is the one `max_lanes` caps: this scope's running lanes,
+plus legacy lanes recorded before runs carried a scope. The board's
+`lanes` count reads the same rows, so the two always agree.
 
 The `blocked` line appears only while the newest tick refused.
 `tick` prints one line per launch, naming the runner the lane landed on,
