@@ -1178,6 +1178,8 @@ fn run_board(
             status_on_merge: config.status_on_merge,
             autopilot,
             admission,
+            thatch: Box::new(tskmstr::work::thatch_chat::ShellThatchRunner),
+            thatch_project: tskmstr::work::thatch_chat::detect_project(&cwd),
         },
         net,
     )?;

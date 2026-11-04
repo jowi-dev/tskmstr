@@ -1582,6 +1582,7 @@ move them in the epics view instead; see "The epics view" below.
 | `Space` | Toggle the selected ticket in or out of the merge queue, marked `+` on its card (board only; on the priority screen `Space` grabs/drops instead) |
 | `R` | Open the retro board (board only); see "Retro board" below |
 | `P` | Turn autopilot on or off for the board's repo, or for the highlighted row's repo on `tm overview`; see "Running autopilot from the TUI" below |
+| `C` | Type a message and send it to every live agent session in the board's repo through `thatch chat broadcast` (board only); see "Broadcasting to the project's lanes" below |
 | `?` | Toggle the help overlay (any other key closes it; `q` still quits) |
 
 ### Filtering the board by assignee
@@ -1658,6 +1659,32 @@ The search filters only the cards the board has already loaded, so it works
 the same on Jira and GitHub and composes with the `f` assignee filter: the
 query survives `r` refreshes and `f` refetches. A merge queue built with
 `Space` still merges every queued ticket, including ones the search hides.
+
+### Broadcasting to the project's lanes
+
+Pressing `C` on the board opens a one-line message input in the status line.
+Every key you type goes into the message, `Backspace` deletes the last
+character, `Esc` discards it, and `Enter` sends it with:
+
+```
+thatch chat broadcast --project <owner/name> -- <message>
+```
+
+`<owner/name>` is the board repo's `origin` remote slug, which is the project
+label thatch gives every session started in that repo (`thatch chat list`
+shows it). thatch delivers the message to each live session in the project,
+and the status line then reports who received it and which sessions thatch
+skipped, for example `broadcast delivered to 2 sessions (a, b); skipped 1
+(c: stale)`. An empty message sends nothing.
+
+Use it when something every running lane needs to know changes, such as
+`main` moving under them. Open opencode sessions are woken at once; Claude
+lanes and other sessions without an open tab read the message at their next
+prompt.
+
+`C` needs `thatch` on `PATH` and a GitHub `origin` remote. Without either,
+pressing `C` says which is missing in the status line instead of opening the
+input.
 
 ### Assigning a ticket from the board
 

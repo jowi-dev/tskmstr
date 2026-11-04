@@ -116,6 +116,12 @@ fn is_inert_while_rank_grabbed(key: KeyCode) -> bool {
 /// leaves search mode, and `Esc` clears it and leaves. `board_searching` is
 /// ignored on every other screen.
 ///
+/// On [`Screen::Board`], `C` opens the broadcast input
+/// ([`Msg::StartBroadcast`], GitHub issue #225). While it is open
+/// (`board_broadcasting`), keys route the same way as in search mode, to
+/// the `Broadcast*` messages: `Enter` sends and `Esc` discards.
+///
+/// [`Msg::StartBroadcast`]: crate::tui::app::Msg::StartBroadcast
 /// [`Msg::StartSearch`]: crate::tui::app::Msg::StartSearch
 /// [`Msg::SearchChar`]: crate::tui::app::Msg::SearchChar
 /// [`Msg::OpenBrowserAction`]: crate::tui::app::Msg::OpenBrowserAction
@@ -134,8 +140,19 @@ pub fn map_key(
     show_confirm: bool,
     retro_overlay: RetroOverlay,
     board_searching: bool,
+    board_broadcasting: bool,
     key: KeyCode,
 ) -> Option<Msg> {
+    if *screen == Screen::Board && board_broadcasting {
+        return match key {
+            KeyCode::Enter => Some(Msg::BroadcastSubmit),
+            KeyCode::Esc => Some(Msg::BroadcastCancel),
+            KeyCode::Backspace => Some(Msg::BroadcastBackspace),
+            KeyCode::Char(c) => Some(Msg::BroadcastChar(c)),
+            _ => None,
+        };
+    }
+
     if *screen == Screen::Board && board_searching {
         return match key {
             KeyCode::Enter => Some(Msg::SearchSubmit),
@@ -309,6 +326,7 @@ pub fn map_key(
             Some(Msg::ToggleMergeQueue)
         }
         KeyCode::Char('c') if *screen == Screen::Board => Some(Msg::CreateAction),
+        KeyCode::Char('C') if *screen == Screen::Board => Some(Msg::StartBroadcast),
         KeyCode::Char('R') if *screen == Screen::Board => Some(Msg::OpenRetro),
         KeyCode::Char('Y') if *screen == Screen::Board => Some(Msg::MarkAuditedAction),
         KeyCode::Char('E') if *screen == Screen::Board => Some(Msg::ToggleEpicsView),
@@ -345,6 +363,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     key
                 ),
                 Some(expected)
@@ -376,6 +395,7 @@ mod tests {
                         false,
                         RetroOverlay::None,
                         false,
+                        false,
                         key
                     ),
                     Some(expected.clone())
@@ -401,6 +421,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Enter
                 ),
                 Some(Msg::Enter)
@@ -425,6 +446,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Esc
                 ),
                 Some(Msg::Back)
@@ -442,6 +464,7 @@ mod tests {
                     false,
                     false,
                     RetroOverlay::None,
+                    false,
                     false,
                     KeyCode::Char('q')
                 ),
@@ -466,6 +489,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('r')
             ),
             Some(Msg::Refresh)
@@ -487,6 +511,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('o')
             ),
@@ -515,6 +540,7 @@ mod tests {
                     false,
                     false,
                     RetroOverlay::None,
+                    false,
                     false,
                     KeyCode::Char('o')
                 ),
@@ -547,6 +573,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Char('O')
                 ),
                 Some(Msg::OpenInBrowser),
@@ -578,6 +605,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     key
                 ),
                 Some(expected)
@@ -601,6 +629,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Enter
             ),
             Some(Msg::BrowserPickerSelect)
@@ -623,6 +652,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Esc
             ),
             Some(Msg::BrowserPickerClose)
@@ -640,6 +670,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('q')
             ),
@@ -674,6 +705,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     key
                 ),
                 None
@@ -697,6 +729,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('?')
             ),
             Some(Msg::ToggleHelp)
@@ -719,6 +752,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('z')
             ),
             None
@@ -736,6 +770,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Tab
             ),
@@ -759,6 +794,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('z')
             ),
             Some(Msg::ToggleHelp)
@@ -777,6 +813,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Enter
             ),
             Some(Msg::ToggleHelp)
@@ -794,6 +831,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('r')
             ),
@@ -817,6 +855,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('q')
             ),
             Some(Msg::Quit)
@@ -838,6 +877,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('f')
             ),
@@ -861,6 +901,7 @@ mod tests {
                     false,
                     false,
                     RetroOverlay::None,
+                    false,
                     false,
                     KeyCode::Char('f')
                 ),
@@ -892,6 +933,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     key
                 ),
                 Some(expected)
@@ -915,6 +957,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Enter
             ),
             Some(Msg::FilterPickerSelect)
@@ -937,6 +980,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Esc
             ),
             Some(Msg::FilterPickerClose)
@@ -954,6 +998,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('q')
             ),
@@ -976,6 +1021,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('p')
             ),
@@ -1000,6 +1046,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Char('p')
                 ),
                 None
@@ -1022,6 +1069,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('a')
             ),
@@ -1051,6 +1099,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Char('a')
                 ),
                 None
@@ -1076,6 +1125,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('s')
             ),
             Some(Msg::RunSessionAction)
@@ -1097,6 +1147,7 @@ mod tests {
                 true,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('s')
             ),
@@ -1122,6 +1173,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('f')
             ),
             Some(Msg::CycleRunKindFilter)
@@ -1144,6 +1196,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('F')
             ),
             Some(Msg::CycleRunScopeFilter)
@@ -1165,6 +1218,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('m')
             ),
@@ -1194,6 +1248,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Char('m')
                 ),
                 None
@@ -1216,6 +1271,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('s')
             ),
@@ -1242,6 +1298,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Char('s')
                 ),
                 None
@@ -1264,6 +1321,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('w')
             ),
@@ -1293,6 +1351,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Char('w')
                 ),
                 None
@@ -1315,6 +1374,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('b')
             ),
@@ -1343,6 +1403,7 @@ mod tests {
                     false,
                     false,
                     RetroOverlay::None,
+                    false,
                     false,
                     KeyCode::Char('b')
                 ),
@@ -1374,6 +1435,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     key
                 ),
                 Some(expected)
@@ -1397,6 +1459,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Enter
             ),
             Some(Msg::LanePickerSelect)
@@ -1419,6 +1482,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Esc
             ),
             Some(Msg::LanePickerClose)
@@ -1436,6 +1500,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('q')
             ),
@@ -1469,6 +1534,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     key
                 ),
                 None
@@ -1492,6 +1558,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Enter
             ),
             Some(Msg::RankGrabToggle)
@@ -1509,6 +1576,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char(' ')
             ),
@@ -1531,6 +1599,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char(' ')
             ),
@@ -1555,6 +1624,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Char(' ')
                 ),
                 None
@@ -1578,6 +1648,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('j')
             ),
             Some(Msg::Down)
@@ -1595,6 +1666,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('k')
             ),
@@ -1614,6 +1686,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Esc
             ),
             Some(Msg::Back)
@@ -1631,6 +1704,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('q')
             ),
@@ -1650,6 +1724,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('r')
             ),
             Some(Msg::Refresh)
@@ -1668,6 +1743,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('o')
             ),
             Some(Msg::OpenInBrowser)
@@ -1685,6 +1761,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('?')
             ),
@@ -1708,6 +1785,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('r')
             ),
             None
@@ -1729,6 +1807,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('r')
             ),
@@ -1764,6 +1843,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     key
                 ),
                 map_key(
@@ -1778,6 +1858,7 @@ mod tests {
                     false,
                     false,
                     RetroOverlay::None,
+                    false,
                     false,
                     key
                 ),
@@ -1802,6 +1883,7 @@ mod tests {
                     false,
                     false,
                     RetroOverlay::None,
+                    false,
                     false,
                     KeyCode::Char('r')
                 ),
@@ -1835,6 +1917,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     key
                 ),
                 None
@@ -1858,6 +1941,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('A')
             ),
             Some(Msg::OpenAssignPicker)
@@ -1880,6 +1964,7 @@ mod tests {
                     false,
                     false,
                     RetroOverlay::None,
+                    false,
                     false,
                     KeyCode::Char('A')
                 ),
@@ -1911,6 +1996,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     key
                 ),
                 Some(expected)
@@ -1934,6 +2020,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Enter
             ),
             Some(Msg::AssignPickerSelect)
@@ -1956,6 +2043,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Esc
             ),
             Some(Msg::AssignPickerClose)
@@ -1973,6 +2061,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('q')
             ),
@@ -2006,6 +2095,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     key
                 ),
                 None
@@ -2029,6 +2119,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('h')
             ),
             Some(Msg::Left)
@@ -2046,6 +2137,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('l')
             ),
@@ -2065,6 +2157,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('j')
             ),
             Some(Msg::Down)
@@ -2082,6 +2175,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('k')
             ),
@@ -2101,6 +2195,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Enter
             ),
             Some(Msg::Enter)
@@ -2118,6 +2213,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('r')
             ),
@@ -2137,6 +2233,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Esc
             ),
             Some(Msg::Back)
@@ -2154,6 +2251,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('q')
             ),
@@ -2177,6 +2275,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('j')
             ),
             Some(Msg::Down)
@@ -2194,6 +2293,7 @@ mod tests {
                 true,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Down
             ),
@@ -2213,6 +2313,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('k')
             ),
             Some(Msg::Up)
@@ -2230,6 +2331,7 @@ mod tests {
                 true,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Up
             ),
@@ -2249,6 +2351,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Esc
             ),
             Some(Msg::Back)
@@ -2267,6 +2370,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('q')
             ),
             Some(Msg::Back)
@@ -2284,6 +2388,7 @@ mod tests {
                 true,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('r')
             ),
@@ -2315,6 +2420,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     key
                 ),
                 None
@@ -2339,6 +2445,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Char('r')
                 ),
                 Some(Msg::Refresh)
@@ -2361,6 +2468,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('v')
             ),
@@ -2386,6 +2494,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Char('v')
                 ),
                 None
@@ -2408,6 +2517,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('L')
             ),
@@ -2432,6 +2542,7 @@ mod tests {
                     false,
                     false,
                     RetroOverlay::None,
+                    false,
                     false,
                     KeyCode::Char('L')
                 ),
@@ -2469,6 +2580,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     key
                 ),
                 expected
@@ -2491,6 +2603,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('V')
             ),
@@ -2516,6 +2629,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Char('V')
                 ),
                 None
@@ -2539,6 +2653,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('F')
             ),
             Some(Msg::ReviewFixAction)
@@ -2559,6 +2674,7 @@ mod tests {
                     false,
                     false,
                     RetroOverlay::None,
+                    false,
                     false,
                     KeyCode::Char('F')
                 ),
@@ -2582,6 +2698,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('M')
             ),
@@ -2607,6 +2724,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Char('M')
                 ),
                 None
@@ -2631,6 +2749,7 @@ mod tests {
                     false,
                     true,
                     RetroOverlay::None,
+                    false,
                     false,
                     key
                 ),
@@ -2659,6 +2778,7 @@ mod tests {
                     true,
                     RetroOverlay::None,
                     false,
+                    false,
                     key
                 ),
                 Some(Msg::ConfirmCancel),
@@ -2686,6 +2806,7 @@ mod tests {
                     false,
                     true,
                     RetroOverlay::None,
+                    false,
                     false,
                     key
                 ),
@@ -2727,6 +2848,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('R')
             ),
             Some(Msg::OpenRetro)
@@ -2752,6 +2874,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Char('R')
                 ),
                 None
@@ -2774,6 +2897,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('c')
             ),
@@ -2805,6 +2929,7 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     false,
+                    false,
                     KeyCode::Char('c')
                 ),
                 None
@@ -2828,6 +2953,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('d')
             ),
             Some(Msg::RetroDefectStart)
@@ -2845,6 +2971,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Char('c')
             ),
@@ -2877,6 +3004,7 @@ mod tests {
                         false,
                         RetroOverlay::None,
                         false,
+                        false,
                         key
                     ),
                     None,
@@ -2902,6 +3030,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('j')
             ),
             Some(Msg::Down)
@@ -2920,6 +3049,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 KeyCode::Char('r')
             ),
             Some(Msg::Refresh)
@@ -2937,6 +3067,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::None,
+                false,
                 false,
                 KeyCode::Esc
             ),
@@ -2967,6 +3098,7 @@ mod tests {
                     false,
                     RetroOverlay::SeverityPicker,
                     false,
+                    false,
                     key
                 ),
                 Some(expected)
@@ -2990,6 +3122,7 @@ mod tests {
                 false,
                 RetroOverlay::SeverityPicker,
                 false,
+                false,
                 KeyCode::Enter
             ),
             Some(Msg::RetroSeverityPickerSelect)
@@ -3008,6 +3141,7 @@ mod tests {
                     false,
                     false,
                     RetroOverlay::SeverityPicker,
+                    false,
                     false,
                     key
                 ),
@@ -3040,6 +3174,7 @@ mod tests {
                     false,
                     RetroOverlay::SeverityPicker,
                     false,
+                    false,
                     key
                 ),
                 None
@@ -3063,6 +3198,7 @@ mod tests {
                     false,
                     false,
                     RetroOverlay::NoteEntry,
+                    false,
                     false,
                     KeyCode::Char(c)
                 ),
@@ -3088,6 +3224,7 @@ mod tests {
                 false,
                 RetroOverlay::NoteEntry,
                 false,
+                false,
                 KeyCode::Backspace
             ),
             Some(Msg::RetroNoteBackspace)
@@ -3106,6 +3243,7 @@ mod tests {
                 false,
                 RetroOverlay::NoteEntry,
                 false,
+                false,
                 KeyCode::Enter
             ),
             Some(Msg::RetroNoteSubmit)
@@ -3123,6 +3261,7 @@ mod tests {
                 false,
                 false,
                 RetroOverlay::NoteEntry,
+                false,
                 false,
                 KeyCode::Esc
             ),
@@ -3144,6 +3283,7 @@ mod tests {
             false,
             RetroOverlay::None,
             false,
+            false,
             key,
         )
     }
@@ -3162,6 +3302,7 @@ mod tests {
             false,
             false,
             RetroOverlay::None,
+            false,
             false,
             key,
         )
@@ -3310,6 +3451,7 @@ mod tests {
                 false,
                 RetroOverlay::None,
                 false,
+                false,
                 key,
             )
         };
@@ -3364,6 +3506,7 @@ mod tests {
             false,
             RetroOverlay::None,
             board_searching,
+            false,
             key,
         )
     }
@@ -3432,6 +3575,7 @@ mod tests {
             true,
             RetroOverlay::None,
             true,
+            false,
             KeyCode::Char('q'),
         );
         assert_eq!(msg, Some(Msg::SearchChar('q')));
@@ -3443,5 +3587,57 @@ mod tests {
             search_key(Screen::Runs, true, KeyCode::Char('q')),
             Some(Msg::Back)
         );
+    }
+
+    /// `map_key` on `screen` with every overlay closed, with the board's
+    /// broadcast input open or closed.
+    fn broadcast_key(screen: Screen, board_broadcasting: bool, key: KeyCode) -> Option<Msg> {
+        map_key(
+            &screen,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            RetroOverlay::None,
+            false,
+            board_broadcasting,
+            key,
+        )
+    }
+
+    #[test]
+    fn capital_c_starts_a_broadcast_on_the_board_only() {
+        assert_eq!(
+            broadcast_key(Screen::Board, false, KeyCode::Char('C')),
+            Some(Msg::StartBroadcast)
+        );
+        assert_eq!(
+            broadcast_key(Screen::Overview, false, KeyCode::Char('C')),
+            None
+        );
+    }
+
+    #[test]
+    fn broadcast_input_types_every_printable_key_and_binds_enter_and_esc() {
+        for c in ['q', 'C', '?', ' ', 'M'] {
+            assert_eq!(
+                broadcast_key(Screen::Board, true, KeyCode::Char(c)),
+                Some(Msg::BroadcastChar(c))
+            );
+        }
+        let cases = [
+            (KeyCode::Backspace, Some(Msg::BroadcastBackspace)),
+            (KeyCode::Enter, Some(Msg::BroadcastSubmit)),
+            (KeyCode::Esc, Some(Msg::BroadcastCancel)),
+            (KeyCode::Down, None),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(broadcast_key(Screen::Board, true, key), expected, "{key:?}");
+        }
     }
 }
