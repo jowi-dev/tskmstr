@@ -1364,6 +1364,19 @@ fn execute_autopilot(
                 result,
             }]
         }
+        Cmd::SetAutopilotEpic { scope, epic } => {
+            let result = match store {
+                Some(store) => store
+                    .set_autopilot_epic(&scope, epic.as_deref())
+                    .map_err(|err| err.to_string()),
+                None => Err(NO_STORE.to_string()),
+            };
+            vec![Msg::AutopilotEpicSet {
+                scope,
+                epic,
+                result,
+            }]
+        }
         Cmd::SetAutopilotTargets(targets) => {
             if let Some(host) = &autopilot.host {
                 host.set_targets(targets);
@@ -1642,6 +1655,7 @@ fn execute_watch(deps: &WatchDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadSystem => load_system(deps),
         cmd @ (Cmd::LoadAutopilotStatus { .. }
         | Cmd::ToggleAutopilot { .. }
+        | Cmd::SetAutopilotEpic { .. }
         | Cmd::SetAutopilotTargets(_)) => {
             execute_autopilot(Some(&deps.store), &deps.autopilot, cmd)
         }
@@ -1992,6 +2006,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadAutoReviewStatus => load_auto_review_status(deps),
         cmd @ (Cmd::LoadAutopilotStatus { .. }
         | Cmd::ToggleAutopilot { .. }
+        | Cmd::SetAutopilotEpic { .. }
         | Cmd::SetAutopilotTargets(_)) => {
             execute_autopilot(deps.store.as_ref(), &deps.autopilot, cmd)
         }

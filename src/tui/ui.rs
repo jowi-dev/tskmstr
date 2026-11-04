@@ -2018,24 +2018,30 @@ fn draw_filter_picker(frame: &mut Frame, app: &App) {
 /// A centered floating window listing the board's epic filter options
 /// (GitHub issue #199): `All epics`, `No epic`, then each epic on the loaded
 /// cards as `KEY  Title`. The active choice is marked with a leading `*`,
-/// like [`draw_filter_picker`].
+/// like [`draw_filter_picker`]. The board scope's autopilot priority epic
+/// (GitHub issue #237), set with `P`, is marked `(autopilot)`, apart from
+/// the view filter.
 fn draw_epic_picker(frame: &mut Frame, app: &App) {
     let area = centered_rect(50, 50, frame.area());
     frame.render_widget(Clear, area);
 
     let options = app.epic_options();
+    let autopilot_epic = app.autopilot_epic();
     let items: Vec<ListItem> = options
         .iter()
         .map(|option| {
-            let line = if option == &app.epic_filter {
-                Line::from(vec![
-                    Span::styled("* ", theme::ACTIVE_FILTER_MARKER),
-                    Span::raw(option.label()),
-                ])
+            let marker = if option == &app.epic_filter {
+                Span::styled("* ", theme::ACTIVE_FILTER_MARKER)
             } else {
-                Line::from(format!("  {}", option.label()))
+                Span::raw("  ")
             };
-            ListItem::new(line)
+            let mut spans = vec![marker, Span::raw(option.label().trim_end().to_string())];
+            if let EpicFilter::Epic(epic) = option
+                && autopilot_epic == Some(epic.key.as_str())
+            {
+                spans.push(Span::styled("  (autopilot)", theme::ACTIVE_FILTER_MARKER));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -2043,7 +2049,7 @@ fn draw_epic_picker(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(bold_title("Filter: epic")),
+                .title(bold_title("Filter: epic  P autopilot")),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
@@ -2685,6 +2691,22 @@ mod tests {
         assert!(text.contains("All epics"), "{text}");
         assert!(text.contains("No epic"), "{text}");
         assert!(text.contains("* PROJ-90  Auth revamp"), "{text}");
+    }
+
+    #[test]
+    fn epic_picker_marks_the_autopilot_epic_and_names_the_p_key() {
+        let mut app = App {
+            show_epic_picker: true,
+            autopilot_scope: Some("s".to_string()),
+            ..epic_board(EpicFilter::All)
+        };
+        app.autopilot = vec![crate::work::autopilot::AutopilotStatus {
+            priority_epic: Some("PROJ-90".to_string()),
+            ..autopilot_status("s", true, None)
+        }];
+        let text = buffer_text(&render_with_size(&app, 120, 30));
+        assert!(text.contains("PROJ-90  Auth revamp  (autopilot)"), "{text}");
+        assert!(text.contains("P autopilot"), "{text}");
     }
 
     #[test]

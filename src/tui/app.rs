@@ -1260,25 +1260,43 @@ impl App {
     /// The epic filter picker's options, in display order: `All epics`, `No
     /// epic`, then each distinct epic among the loaded cards, sorted by key.
     /// Built from the loaded cards (not an epics query) so it never offers
-    /// an epic with no cards on the board; the one exception is the active
+    /// an epic with no cards on the board; the exceptions are the active
     /// epic, kept even after a refetch empties it so the picker can still
-    /// mark it.
+    /// mark it, and the autopilot priority epic (GitHub issue #237), listed
+    /// by key alone when no card names it, so `P` can still clear it.
     pub fn epic_options(&self) -> Vec<EpicFilter> {
-        let mut epics: Vec<&ParentRef> = self
+        let mut epics: Vec<ParentRef> = self
             .columns
             .iter()
             .flat_map(|c| &c.tickets)
-            .filter_map(|t| t.epic.as_ref())
+            .filter_map(|t| t.epic.clone())
             .collect();
         if let EpicFilter::Epic(active) = &self.epic_filter {
-            epics.push(active);
+            epics.push(active.clone());
+        }
+        // Pushed last so the stable sort keeps a card's titled copy first
+        // and the dedup drops this key-only one.
+        if let Some(key) = self.autopilot_epic() {
+            epics.push(ParentRef {
+                key: key.to_string(),
+                summary: String::new(),
+            });
         }
         epics.sort_by(|a, b| a.key.cmp(&b.key));
         epics.dedup_by(|a, b| a.key == b.key);
 
         let mut options = vec![EpicFilter::All, EpicFilter::NoEpic];
-        options.extend(epics.into_iter().cloned().map(EpicFilter::Epic));
+        options.extend(epics.into_iter().map(EpicFilter::Epic));
         options
+    }
+
+    /// The board scope's autopilot priority epic, from the latest loaded
+    /// autopilot status (GitHub issue #237).
+    pub fn autopilot_epic(&self) -> Option<&str> {
+        let scope = self.autopilot_scope.as_deref()?;
+        crate::tui::autopilot::status_for(self, scope)?
+            .priority_epic
+            .as_deref()
     }
 
     /// The assign picker's option list: `Me` and `Unassign` always, then
@@ -1503,6 +1521,12 @@ pub enum Msg {
     EpicPickerSelect,
     /// Close the epic picker without changing the active epic filter.
     EpicPickerClose,
+    /// `P` in the epic picker (GitHub issue #237): mark the highlighted
+    /// epic as the board scope's autopilot priority epic, or clear it on
+    /// the already-marked epic or `All epics`. Never changes the view
+    /// filter or the autopilot flag. See
+    /// [`crate::tui::autopilot::prioritize_epic`].
+    EpicPickerPrioritize,
     /// Enter board search mode (GitHub issue #152): every printable key now
     /// edits [`App::board_search_query`] until [`Msg::SearchSubmit`] or
     /// [`Msg::SearchCancel`]. Only meaningful on [`Screen::Board`];
@@ -1698,6 +1722,15 @@ pub enum Msg {
         scope: String,
         /// The value written.
         enabled: bool,
+        /// The store error, if the write failed.
+        result: Result<(), String>,
+    },
+    /// [`Cmd::SetAutopilotEpic`] finished.
+    AutopilotEpicSet {
+        /// The scope whose epic was written.
+        scope: String,
+        /// The epic written; `None` cleared it.
+        epic: Option<String>,
         /// The store error, if the write failed.
         result: Result<(), String>,
     },
@@ -1940,6 +1973,14 @@ pub enum Cmd {
         scope: String,
         /// The value to write.
         enabled: bool,
+    },
+    /// Write `scope`'s runs.db autopilot priority epic (GitHub issue
+    /// #237); `None` clears it. Leaves the on/off flag alone.
+    SetAutopilotEpic {
+        /// The scope to write.
+        scope: String,
+        /// The epic key to write, or `None` to clear.
+        epic: Option<String>,
     },
     /// Replace the scopes the autopilot host thread ticks.
     SetAutopilotTargets(Vec<crate::work::autopilot::AutopilotTarget>),
@@ -2636,6 +2677,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             app.show_epic_picker = false;
             (app, Vec::new())
         }
+        Msg::EpicPickerPrioritize => crate::tui::autopilot::prioritize_epic(app),
         Msg::StartSearch => {
             app.board_searching = true;
             (app, Vec::new())
@@ -2826,6 +2868,11 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             enabled,
             result,
         } => crate::tui::autopilot::toggled(app, scope, enabled, result),
+        Msg::AutopilotEpicSet {
+            scope,
+            epic,
+            result,
+        } => crate::tui::autopilot::epic_set(app, scope, epic, result),
         Msg::AutopilotStatusLoaded(result) => (
             crate::tui::autopilot::status_loaded(app, result),
             Vec::new(),
@@ -5223,6 +5270,166 @@ mod tests {
         let (app, _) = update(app, Msg::EpicPickerClose);
         assert!(!app.show_epic_picker);
         assert_eq!(app.epic_filter, EpicFilter::NoEpic);
+    }
+
+    // --- autopilot priority epic from the picker (GitHub issue #237) ---
+
+    /// [`epic_board`] in scope `s`, whose autopilot status names `epic` as
+    /// the priority epic.
+    fn epic_board_prioritizing(epic: Option<&str>) -> App {
+        App {
+            autopilot_scope: Some("s".to_string()),
+            autopilot: vec![crate::work::autopilot::AutopilotStatus {
+                scope: "s".to_string(),
+                enabled: true,
+                running_lanes: Vec::new(),
+                max_lanes: 2,
+                last_refusal: None,
+                blocked_age_secs: None,
+                last_launch_age_secs: None,
+                priority_epic: epic.map(str::to_string),
+            }],
+            ..epic_board()
+        }
+    }
+
+    /// Opens the picker on `app`, moves down `downs` rows, presses `P`.
+    fn prioritize_row(app: App, downs: usize) -> (App, Vec<Cmd>) {
+        let (mut app, _) = update(app, Msg::OpenEpicPicker);
+        for _ in 0..downs {
+            (app, _) = update(app, Msg::EpicPickerDown);
+        }
+        update(app, Msg::EpicPickerPrioritize)
+    }
+
+    #[test]
+    fn epic_picker_p_sets_the_highlighted_epic_without_touching_the_view_filter() {
+        let (app, cmds) = prioritize_row(epic_board_prioritizing(None), 2); // PROJ-80
+        assert_eq!(
+            cmds,
+            [Cmd::SetAutopilotEpic {
+                scope: "s".to_string(),
+                epic: Some("PROJ-80".to_string()),
+            }]
+        );
+        assert!(app.show_epic_picker, "the picker stays open");
+        assert_eq!(app.epic_filter, EpicFilter::All);
+    }
+
+    #[test]
+    fn epic_picker_p_on_the_marked_epic_clears_it() {
+        let (_, cmds) = prioritize_row(epic_board_prioritizing(Some("PROJ-80")), 2);
+        assert_eq!(
+            cmds,
+            [Cmd::SetAutopilotEpic {
+                scope: "s".to_string(),
+                epic: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn epic_picker_p_on_all_epics_clears_it() {
+        let (_, cmds) = prioritize_row(epic_board_prioritizing(Some("PROJ-80")), 0);
+        assert_eq!(
+            cmds,
+            [Cmd::SetAutopilotEpic {
+                scope: "s".to_string(),
+                epic: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn epic_picker_p_on_no_epic_explains_and_writes_nothing() {
+        let (app, cmds) = prioritize_row(epic_board_prioritizing(None), 1);
+        assert!(cmds.is_empty());
+        assert!(
+            app.status_line.contains("pick an epic"),
+            "{}",
+            app.status_line
+        );
+    }
+
+    #[test]
+    fn epic_picker_p_without_a_scope_explains_and_writes_nothing() {
+        let app = App {
+            autopilot_scope: None,
+            ..epic_board_prioritizing(None)
+        };
+        let (app, cmds) = prioritize_row(app, 2);
+        assert!(cmds.is_empty());
+        assert!(app.status_line.contains("config"), "{}", app.status_line);
+    }
+
+    #[test]
+    fn a_written_autopilot_epic_shows_at_once_and_keeps_the_flag() {
+        let mut app = epic_board_prioritizing(None);
+        app.autopilot[0].enabled = false;
+        let (app, cmds) = update(
+            app,
+            Msg::AutopilotEpicSet {
+                scope: "s".to_string(),
+                epic: Some("PROJ-80".to_string()),
+                result: Ok(()),
+            },
+        );
+        assert_eq!(app.status_line, "autopilot epic PROJ-80 for s");
+        assert_eq!(app.autopilot[0].priority_epic.as_deref(), Some("PROJ-80"));
+        assert!(!app.autopilot[0].enabled);
+        assert_eq!(
+            cmds,
+            [Cmd::LoadAutopilotStatus {
+                scopes: vec!["s".to_string()],
+            }]
+        );
+
+        let (app, _) = update(
+            app,
+            Msg::AutopilotEpicSet {
+                scope: "s".to_string(),
+                epic: None,
+                result: Ok(()),
+            },
+        );
+        assert_eq!(app.status_line, "autopilot epic cleared for s");
+        assert_eq!(app.autopilot[0].priority_epic, None);
+    }
+
+    #[test]
+    fn a_failed_autopilot_epic_write_says_so() {
+        let (app, cmds) = update(
+            epic_board_prioritizing(None),
+            Msg::AutopilotEpicSet {
+                scope: "s".to_string(),
+                epic: Some("PROJ-80".to_string()),
+                result: Err("disk I/O error".to_string()),
+            },
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(
+            app.status_line,
+            "could not set the autopilot epic for s: disk I/O error"
+        );
+        assert_eq!(app.autopilot[0].priority_epic, None);
+    }
+
+    #[test]
+    fn epic_options_keep_the_autopilot_epic_with_no_loaded_cards() {
+        let app = App {
+            columns: board_with(vec![titled("PROJ-2", "To Do", "Add search")], 0).columns,
+            ..epic_board_prioritizing(Some("PROJ-70"))
+        };
+        assert_eq!(
+            app.epic_options(),
+            [
+                EpicFilter::All,
+                EpicFilter::NoEpic,
+                EpicFilter::Epic(epic("PROJ-70", "")),
+            ]
+        );
+        let app = epic_board_prioritizing(Some("PROJ-90"));
+        assert_eq!(app.epic_options().len(), 4, "a loaded epic is listed once");
     }
 
     #[test]
