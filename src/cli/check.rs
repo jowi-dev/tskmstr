@@ -1426,7 +1426,7 @@ mod tests {
                 session: "work.audit".to_string(),
                 repo_path: env.repo_dir.join(".claude/skills/ticket-audit"),
                 home_path: env.home.join(".claude/skills/ticket-audit"),
-                prompt: "/ticket-audit {key}".to_string(),
+                prompt: ClaudeRunner.default_audit_prompt_template().to_string(),
             }]
         );
     }

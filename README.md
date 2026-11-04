@@ -1847,6 +1847,18 @@ passes `--model`, so an enterprise-managed claude model pin never applies.
 Since an audit is where digging quality matters most, it is worth setting
 deliberately.
 
+The audit's investigation step is `/thatch:refine` run on the ticket's
+PROPOSED APPROACH, so the approach's premises are checked against the code
+before a lane runs it (GitHub issue #206). The `.tskmstr/prompts/audit.md`
+scaffold `tm init` writes carries this step. The plain default prompt,
+`/ticket-audit {key}`, does not name refine, because tm only checks that the
+prompt's leading skill is installed and refine comes from the thatch plugin.
+The audit still checks links, blockers and lane size itself, writes refine's
+revisions back to the ticket body, and only then records a verdict with `tm
+ticket audit <KEY> --record`. If you use your own `ticket-audit` skill, add a
+`/thatch:refine` step on the ticket's PROPOSED APPROACH so the default or a
+custom `prompt` gets the same investigation.
+
 Each card with a live `audit` window (or a live audit run) shows a badge:
 `audit: starting` (window up, run not registered yet), `audit: running`, `audit:
 waiting` (bold yellow — Claude stopped or asked a question and is waiting
