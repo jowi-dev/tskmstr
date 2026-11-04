@@ -188,7 +188,8 @@ pub struct AutopilotStatus {
     pub scope: String,
     /// The scope's runs.db autopilot flag.
     pub enabled: bool,
-    /// Lane runs running now, across every scope (what `max_lanes` caps).
+    /// The scope's lane runs running now, legacy unscoped ones included
+    /// (what `max_lanes` caps; see [`RunStore::running_lane_tickets`]).
     pub running_lanes: usize,
     /// `[dispatch] max_lanes`.
     pub max_lanes: usize,
@@ -243,7 +244,6 @@ pub fn load_status(
     max_lanes: usize,
     now: i64,
 ) -> Result<Vec<AutopilotStatus>, RunStoreError> {
-    let running_lanes = store.running_lanes()?.len();
     scopes
         .iter()
         .map(|scope| {
@@ -251,7 +251,7 @@ pub fn load_status(
             Ok(AutopilotStatus {
                 scope: scope.clone(),
                 enabled: store.autopilot_enabled(scope)?,
-                running_lanes,
+                running_lanes: store.running_lane_tickets(scope)?.len(),
                 max_lanes,
                 blocked_age_secs: state.blocked.as_ref().map(|b| now - b.since_unix),
                 last_refusal: state.blocked.map(|b| b.detail),
@@ -439,6 +439,35 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn status_counts_each_scopes_own_running_lanes() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store
+            .start_run(&crate::runs::StartRun {
+                scope: "jira:AX".to_string(),
+                ticket: "AX-809".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/wt/ax-809".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        let status = load_status(
+            &store,
+            &["jira:AX".to_string(), "github:o/r".to_string()],
+            1,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(status[0].running_lanes, 1);
+        assert_eq!(status[1].running_lanes, 0);
     }
 
     #[test]

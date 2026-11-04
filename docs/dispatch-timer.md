@@ -30,7 +30,7 @@ example because its config no longer loads. The other scopes still tick.
 ```json
 [{"scope": "github:o/r",
   "launched": [{"ticket": "GH-7", "lane": "backend", "stacked_on": null}],
-  "refused": "not launching: 1 lanes running, [dispatch] max_lanes is 1",
+  "refused": "not launching: 1 lanes running (GH-7), [dispatch] max_lanes is 1",
   "skipped": null,
   "notified": ["tm: GH-3 is awaiting your review"],
   "error": null}]

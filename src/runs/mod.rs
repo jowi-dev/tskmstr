@@ -2418,11 +2418,27 @@ impl RunStore {
         self.peak_estimate("lane", agent, repo)
     }
 
-    /// Every `running` lane-kind run, across every scope. The dispatcher's
-    /// `max_lanes` and the overview's lane count read it; memory admission
-    /// counts every agent kind through [`RunStore::running_agents`].
+    /// Every `running` lane-kind run, across every scope. The overview's
+    /// system header reads it; memory admission counts every agent kind
+    /// through [`RunStore::running_agents`], and `max_lanes` counts per
+    /// scope through [`RunStore::running_lane_tickets`].
     pub fn running_lanes(&self) -> Result<Vec<RunningAgent>, RunStoreError> {
         self.running_of_kinds(&["lane"])
+    }
+
+    /// The tickets of `scope`'s `running` lane-kind runs, oldest first: what
+    /// `[dispatch] max_lanes` caps (GitHub issue #170, ADR-0011). Legacy
+    /// unscoped runs (`scope = ''`) count for every scope, as they do
+    /// elsewhere.
+    pub fn running_lane_tickets(&self, scope: &str) -> Result<Vec<String>, RunStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ticket FROM runs
+              WHERE status = 'running' AND kind = 'lane' AND (scope = ?1 OR scope = '')
+              ORDER BY started_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![scope], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(RunStoreError::from)
     }
 
     /// Every `running` run of an [`AGENT_KINDS`] kind, across every scope,
@@ -9924,6 +9940,38 @@ mod tests {
         assert_eq!(lanes[0].mem_peak_bytes, Some(700));
         assert_eq!(lanes[0].mem_current_bytes, Some(700));
         assert_eq!(lanes[0].pid, Some(1));
+    }
+
+    #[test]
+    fn running_lane_tickets_counts_the_scope_and_legacy_unscoped_lanes() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let scoped = |ticket: &str, scope: &str, kind: &str| {
+            store
+                .start_run(&StartRun {
+                    scope: scope.to_string(),
+                    kind: kind.to_string(),
+                    ..start_params(ticket)
+                })
+                .unwrap()
+        };
+        scoped("GH-1", "github:jowi-dev/tskmstr", "lane");
+        scoped("AX-809", "jira:AX", "lane");
+        scoped("GH-2", "", "lane");
+        scoped("GH-3", "github:jowi-dev/tskmstr", "audit");
+        let ended = scoped("GH-4", "github:jowi-dev/tskmstr", "lane");
+        finish_done(&store, ended);
+
+        assert_eq!(
+            store
+                .running_lane_tickets("github:jowi-dev/tskmstr")
+                .unwrap(),
+            vec!["GH-1", "GH-2"]
+        );
+        assert_eq!(
+            store.running_lane_tickets("jira:AX").unwrap(),
+            vec!["AX-809", "GH-2"]
+        );
     }
 
     fn start_kind(store: &RunStore, kind: &str, agent: &str, repo: &str) -> i64 {

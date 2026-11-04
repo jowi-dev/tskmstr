@@ -547,7 +547,10 @@ mod tests {
                     stacked_on: Some("gh-1-branch".to_string()),
                 },
             ],
-            refused: Some(Refusal::MaxLanes { running: 2, max: 2 }),
+            refused: Some(Refusal::MaxLanes {
+                running: vec!["GH-7".to_string(), "GH-8".to_string()],
+                max: 2,
+            }),
             skipped: None,
             notified: vec!["tm: GH-0 is awaiting your review".to_string()],
         }
@@ -586,7 +589,7 @@ mod tests {
             out,
             "github:o/one: launched GH-1 in lane backend on claude\n\
              github:o/one: launched GH-2 in lane backend on opencode (stacked on gh-1-branch)\n\
-             github:o/one: not launching: 2 lanes running, [dispatch] max_lanes is 2\n\
+             github:o/one: not launching: 2 lanes running (GH-7, GH-8), [dispatch] max_lanes is 2\n\
              github:o/one: notified: tm: GH-0 is awaiting your review\n\
              github:o/two: skipped: another host is ticking this scope\n\
              github:o/idle: nothing to launch\n\
@@ -648,7 +651,7 @@ mod tests {
                         {"ticket": "GH-1", "lane": "backend", "runner": "claude", "stacked_on": null},
                         {"ticket": "GH-2", "lane": "backend", "runner": "opencode", "stacked_on": "gh-1-branch"},
                     ],
-                    "refused": "not launching: 2 lanes running, [dispatch] max_lanes is 2",
+                    "refused": "not launching: 2 lanes running (GH-7, GH-8), [dispatch] max_lanes is 2",
                     "skipped": null,
                     "notified": ["tm: GH-0 is awaiting your review"],
                     "error": null,

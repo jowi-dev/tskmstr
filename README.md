@@ -1250,8 +1250,9 @@ it. A tick:
    --unattended <lane> <KEY>`. The lane is the first one the board would
    offer for this repo. A stackable ticket is stacked by `tm work run`
    itself. Launching stops at the first of these refusals:
-   - `max_lanes` lanes are running (every running lane counts, however it
-     was launched);
+   - `max_lanes` lanes are running in this repo's scope (every running
+     lane in the scope counts, however it was launched; lanes in other
+     repos do not, ADR-0011). The refusal names the lanes it counted;
    - the repo launched `max_launches_per_day` lanes in the last 24 hours, a
      backstop against a runaway dispatcher;
    - no lane matches the repo;
@@ -1318,7 +1319,7 @@ supervisor-driven `claude -p` run.
 
 ```toml
 [dispatch]
-max_lanes = 1               # default; the most lane runs at once
+max_lanes = 1               # default; the most lane runs at once in this repo's scope
 allow_paid_fallback = false # default; see "Usage admission" above
 tick_secs = 60              # default; how often an open TUI ticks (10 minimum)
 max_launches_per_day = 20   # default; launches per repo in any rolling 24 hours
@@ -1347,11 +1348,11 @@ The board's status bar starts with its repo's state. On the overview, a
 project with autopilot on shows it at the end of its strip line:
 
 ```
-autopilot on · lanes 1/2 · launched 12m ago · not launching: 2 lanes running, [dispatch] max_lanes is 2 (5m)
+autopilot on · lanes 2/2 · launched 12m ago · not launching: 2 lanes running (GH-7, GH-8), [dispatch] max_lanes is 2 (5m)
 ```
 
-- **lanes**: lane runs running now, across every repo, against `max_lanes`
-  from the config you started the TUI from
+- **lanes**: this repo's lane runs running now, against `max_lanes` from
+  the config you started the TUI from
 - **launched**: how long ago this repo last launched a lane. It is left out
   when the repo has never launched one.
 - the last part is the newest tick's refusal, from `dispatch_events`, and
@@ -1382,7 +1383,7 @@ tm dispatch off --all       # kill switch: the next tick launches nothing
 ```
 github:o/r: on, 1 lanes running, last tick 2026-10-19T14:03:22Z, last launch 2h10m ago
   repo: /home/me/r
-  blocked for 45m: not launching: 1 lanes running, [dispatch] max_lanes is 1
+  blocked for 45m: not launching: 1 lanes running (GH-5), [dispatch] max_lanes is 1
 ```
 
 The `blocked` line appears only while the newest tick refused.
