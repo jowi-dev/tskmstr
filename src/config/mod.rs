@@ -768,7 +768,8 @@ pub struct RawReviewWatchConfig {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct RawAutoReviewConfig {
     /// Prompt template for each review round, with `{key}`, `{round}`,
-    /// `{skill}`, `{findings_file}` and `{archive}` replaced. Defaults to
+    /// `{skill}` (see [`RawAutoReviewConfig::first_round_skill`]),
+    /// `{findings_file}` and `{archive}` replaced. Defaults to
     /// the built-in `crate::work::auto_review::DEFAULT_PROMPT` when unset.
     pub prompt: Option<String>,
     /// File form of [`RawAutoReviewConfig::prompt`], resolved like
@@ -794,6 +795,11 @@ pub struct RawAutoReviewConfig {
     /// loop then waits until the step signals, its agent is hibernated, or
     /// its row ends. Defaults to 60.
     pub round_timeout_mins: Option<u64>,
+    /// Skill or command a first review round runs, filling the prompt's
+    /// `{skill}` (GitHub issue #203). Pins the entry point for every
+    /// runner. Defaults to the lane runner's own
+    /// [`crate::agent::AgentRunner::auto_review_skill`] when unset.
+    pub first_round_skill: Option<String>,
 }
 
 /// Raw, partially-specified `[work.lanes.<name>]` subsection as parsed
@@ -1493,6 +1499,9 @@ pub struct AutoReviewConfig {
     pub auto: bool,
     /// See [`RawAutoReviewConfig::round_timeout_mins`]. Defaults to 60.
     pub round_timeout_mins: u64,
+    /// See [`RawAutoReviewConfig::first_round_skill`]. `None` means the
+    /// runner's default.
+    pub first_round_skill: Option<String>,
 }
 
 impl Default for AutoReviewConfig {
@@ -1505,6 +1514,7 @@ impl Default for AutoReviewConfig {
             publish: false,
             auto: false,
             round_timeout_mins: 60,
+            first_round_skill: None,
         }
     }
 }
@@ -2973,6 +2983,7 @@ fn merge_auto_review(
             .round_timeout_mins
             .or(global.round_timeout_mins)
             .unwrap_or(defaults.round_timeout_mins),
+        first_round_skill: repo.first_round_skill.or(global.first_round_skill),
     })
 }
 
@@ -5359,6 +5370,7 @@ mod tests {
         assert_eq!(auto.round_timeout_mins, 60);
         assert_eq!(auto.prompt, None);
         assert_eq!(auto.prompt_file, None);
+        assert_eq!(auto.first_round_skill, None);
     }
 
     #[test]
@@ -5372,12 +5384,14 @@ mod tests {
             publish = true
             auto = true
             round_timeout_mins = 15
+            first_round_skill = "my-review"
             "#,
         )
         .expect("should load");
 
         let auto = &cfg.work.auto_review;
         assert_eq!(auto.round_timeout_mins, 15);
+        assert_eq!(auto.first_round_skill.as_deref(), Some("my-review"));
         assert_eq!(auto.prompt.as_deref(), Some("review {key}"));
         assert_eq!(auto.fix_threshold, Severity::High);
         assert_eq!(auto.max_review_rounds, 3);

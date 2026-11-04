@@ -705,6 +705,15 @@ pub trait AgentRunner: Sync {
     /// runner-specific, which is why this is adapter-owned.
     fn agent_definition_template(&self, name: &str, model: Option<&str>) -> String;
 
+    /// The thatch review entry point a first `tm review auto` round names
+    /// when `[work.auto_review].first_round_skill` is unset (GitHub issue
+    /// #203). thatch ships its review pipeline in a different form per host
+    /// (`thatch-code-review` fans out sub-agents, which not every runner
+    /// supports), so which entry point actually runs here is the adapter's
+    /// call. Later rounds use `crate::work::auto_review::FOLLOWUP_SKILL` on
+    /// every runner.
+    fn auto_review_skill(&self) -> &'static str;
+
     /// Build one run's argv/env (headless or interactive). `admitted` is
     /// the proof the launch passed memory and usage admission (GitHub issue
     /// #149); see [`crate::work::admission::Admitted`].

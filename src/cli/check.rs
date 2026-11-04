@@ -1168,10 +1168,11 @@ fn configured_prompts(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) ->
         let Some(text) = text else { continue };
         let session = format!("work.{table}");
         if table == "auto_review" {
-            for skill in [
-                crate::work::auto_review::FIRST_ROUND_SKILL,
-                crate::work::auto_review::FOLLOWUP_SKILL,
-            ] {
+            // Round one uses `first_round_skill` when set, else the runner's
+            // own review skill (GitHub issue #203).
+            let first = str_at(doc, &["work", "auto_review", "first_round_skill"])
+                .unwrap_or(ctx.runner.auto_review_skill());
+            for skill in [first, crate::work::auto_review::FOLLOWUP_SKILL] {
                 prompts.push(PromptText {
                     session: session.clone(),
                     text: text.replace("{skill}", skill),
@@ -2542,7 +2543,7 @@ mod tests {
     fn thatch_lane_repo(env: &TestEnv) {
         for skill in [
             "thatch-coding-workflow",
-            crate::work::auto_review::FIRST_ROUND_SKILL,
+            ClaudeRunner.auto_review_skill(),
             crate::work::auto_review::FOLLOWUP_SKILL,
         ] {
             write_home_skill(env, skill, "A thatch skill.");
@@ -2602,7 +2603,7 @@ mod tests {
             findings,
             vec![DriftFinding::ThatchMissing {
                 session: "work.auto_review".to_string(),
-                skill: crate::work::auto_review::FIRST_ROUND_SKILL.to_string(),
+                skill: crate::work::auto_review::FOLLOWUP_SKILL.to_string(),
             }]
         );
     }
@@ -2712,7 +2713,8 @@ mod tests {
             &env,
             "schema_version = 2\n\
              [work.auto_review]\n\
-             fix_threshold = \"medium\"\n",
+             fix_threshold = \"medium\"\n\
+             first_round_skill = \"thatch-code-review\"\n",
         );
 
         let (findings, rendered) = check_with(
@@ -2744,7 +2746,12 @@ mod tests {
     fn named_skill_absent_from_the_runners_skills_dirs_is_reported() {
         let env = test_env();
         write_home_skill(&env, "thatch-review-followup", "Follow-up review rounds.");
-        write_repo_config(&env, "schema_version = 2\n");
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.auto_review]\n\
+             first_round_skill = \"thatch-code-review\"\n",
+        );
 
         let (findings, rendered) = check_with(
             &env,

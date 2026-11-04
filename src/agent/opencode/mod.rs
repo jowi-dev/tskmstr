@@ -249,6 +249,12 @@ impl AgentRunner for OpencodeRunner {
         "opencode"
     }
 
+    /// thatch's coordinator skill, which fans the review out to specialist
+    /// sub-agents.
+    fn auto_review_skill(&self) -> &'static str {
+        "thatch-code-review"
+    }
+
     /// opencode's native skills dir. It also discovers `skill/` (singular)
     /// and Claude-format `.claude/skills`, so `tm init`'s advisory probe
     /// (which only checks this one path) may under-detect skills opencode
@@ -882,6 +888,11 @@ mod tests {
     #[test]
     fn display_name_is_lowercase_opencode() {
         assert_eq!(OpencodeRunner.display_name(), "opencode");
+    }
+
+    #[test]
+    fn auto_review_skill_is_thatch_code_review() {
+        assert_eq!(OpencodeRunner.auto_review_skill(), "thatch-code-review");
     }
 
     #[test]

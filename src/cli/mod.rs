@@ -423,7 +423,8 @@ pub enum ReviewCmd {
     },
     /// Run thatch auto-review rounds over KEY's PR branch.
     ///
-    /// Each round is an interactive review (`thatch-code-review`, then
+    /// Each round is an interactive review (the runner's thatch review
+    /// entry point or `[work.auto_review].first_round_skill`, then
     /// `thatch-review-followup`) in a `review` window of the ticket's
     /// `tm-<scope>-<key>` session (`review-2` for round 2). Its confirmed
     /// findings go into the worktree's vdiff comment store, and any finding

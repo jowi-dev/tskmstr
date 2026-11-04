@@ -837,6 +837,10 @@ impl CliAutoReviewOps<'_, '_> {
 }
 
 impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
+    fn runner_review_skill(&self) -> &'static str {
+        self.deps.runner.auto_review_skill()
+    }
+
     fn review(&self, round: u32, prompt: String) -> Result<i64, AutoReviewError> {
         let deps = self.deps;
         // Admitted before anything else, so a round waiting for admission
@@ -2479,7 +2483,10 @@ mod tests {
             .map(|path| std::fs::read_to_string(path).unwrap())
             .unwrap();
         assert!(prompt.contains("tm runs register --kind auto-review PROJ-1"));
-        assert!(prompt.contains("thatch-code-review"));
+        assert!(
+            prompt.contains("`thatch:peer-review`"),
+            "round 1 names the claude runner's review entry point: {prompt}"
+        );
         assert!(prompt.contains("## Completion signal"));
         let store = crate::work::comment_store::load(&git_dir).unwrap();
         assert_eq!(store[0]["text"], "[auto-review · pedantic · LOW] typo");
