@@ -346,7 +346,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  e epic  E epics  A assign  p priority  a audit  Y mark audited  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  Space queue  R retro  P autopilot  i or / search  C broadcast  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  e epic  E epics  A assign  p priority  a audit  Y mark audited  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  W walkthrough  F fix  M merge  Space queue  R retro  P autopilot  i or / search  C broadcast  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -1970,7 +1970,8 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("c/C     create / broadcast"),
         Line::from("v       view run"),
         Line::from("L       run logs"),
-        Line::from("V       vdiff review"),
+        // Shares a row with `V`: the column is at its 17-row budget.
+        Line::from("V / W   vdiff / walkthrough"),
         Line::from("F       apply review fixes"),
         Line::from("M/Space merge PR / merge queue"),
         Line::from("E       toggle epics view"),
@@ -2588,6 +2589,7 @@ mod tests {
             "v view run",
             "L logs",
             "V vdiff",
+            "W walkthrough",
             "F fix",
             "M merge",
             "Space queue",
@@ -3099,6 +3101,7 @@ mod tests {
             "merge",
             "merge queue",
             "retro",
+            "walkthrough",
             "search cards",
             "epics view",
             "epic",

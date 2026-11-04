@@ -1162,6 +1162,7 @@ fn run_board(
             create,
             manual: config.work.manual,
             review_watch: config.work.review_watch,
+            walkthrough: config.work.walkthrough,
             work_default_model: config.work.default_model.clone(),
             models: config.models.clone(),
             xdg_data_home,
