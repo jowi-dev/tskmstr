@@ -21,6 +21,12 @@
           # runs::footprint Linux test spawns perl to hold ~200 MB in a
           # child process, so perl must be on PATH too.
           nativeCheckInputs = [ pkgs.git pkgs.perl ];
+          # nixpkgs' cargo setup hook sets LIBSQLITE3_SYS_USE_PKG_CONFIG=1,
+          # which overrides rusqlite's `bundled` feature: libsqlite3-sys skips
+          # its bundled SQLite and links the system one found by pkg-config.
+          # Plain `cargo build` outside Nix still uses the bundled copy.
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.sqlite ];
         };
 
         devShells.default = pkgs.mkShell {
