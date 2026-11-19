@@ -17,7 +17,7 @@
 use std::path::Path;
 
 use crate::config::session_slug_from_scope;
-use crate::github::gh_cli::{GhCli, PrLifecycle};
+use crate::github::gh_cli::{GhCli, PrLifecycle, PrSummary};
 use crate::runs::{Run, RunStatus, RunStore, RunStoreError};
 use crate::work::naming::{create_session_name, ticket_session_name};
 use crate::work::tmux::TmuxOps;
@@ -124,6 +124,21 @@ pub fn classify_session(
     gh: &dyn GhCli,
     pid_alive: &dyn Fn(u32) -> bool,
 ) -> Result<KillSafetyVerdict, RunStoreError> {
+    classify_session_with(session, store, tmux, &mut |dir| gh.pr_list_all(dir).ok(), pid_alive)
+}
+
+/// [`classify_session`] with the PR listing injected: `list_prs` is handed
+/// the deciding run's worktree and returns every PR of its repository, or
+/// `None` when the listing failed. Lets a caller classifying many sessions
+/// of one repository (the sweep, GitHub issue #253) answer every lookup
+/// from a single `gh pr list` instead of one per session.
+pub fn classify_session_with(
+    session: &str,
+    store: &RunStore,
+    tmux: &dyn TmuxOps,
+    list_prs: &mut dyn FnMut(&Path) -> Option<Vec<PrSummary>>,
+    pid_alive: &dyn Fn(u32) -> bool,
+) -> Result<KillSafetyVerdict, RunStoreError> {
     if tmux
         .root_session_targets()
         .unwrap_or_default()
@@ -170,7 +185,7 @@ pub fn classify_session(
         });
     }
 
-    let Ok(prs) = gh.pr_list_all(worktree) else {
+    let Some(prs) = list_prs(worktree) else {
         return Ok(KillSafetyVerdict {
             tier: KillSafetyTier::Unknown,
             detail: format!("gh failed listing PRs for {branch}"),
@@ -206,7 +221,7 @@ pub fn classify_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::gh_cli::{FakeGhCli, PrSummary};
+    use crate::github::gh_cli::FakeGhCli;
     use crate::runs::StartRun;
     use crate::work::tmux::FakeTmuxOps;
     use tempfile::tempdir;
