@@ -14,7 +14,7 @@ files, and the recommended cadence (GitHub issue #117).
 | `tm dispatch off` | Turn autopilot off for the current repo. Running lanes keep running |
 | `tm dispatch off --all` | The kill switch: every scope off, so the next tick launches nothing |
 | `tm dispatch tick` | One pass for the current repo |
-| `tm dispatch tick --all [--json]` | One pass for every scope that is on. This is what the timer runs |
+| `tm dispatch tick --all [--json]` | One pass for every scope that is on, or that has tickets in its merge queue. This is what the timer runs |
 | `tm dispatch status` | Per scope: on or off, running lanes, last tick, time since the last launch, and the refusal blocking it now |
 
 Every command except `status` takes `--scope S` (a scope as `status` prints
@@ -48,9 +48,15 @@ finds the lock taken by another host (an open `tm board`, or a previous
 timer tick that is still running) skips that scope. Two hosts therefore
 never launch the same ticket.
 
-`tick --all` visits only scopes that are on, and each tick reads the flag
+`tick --all` visits the scopes that are on, and each tick reads the flag
 again after it takes the lock. So `tm dispatch off --all` stops launches
 from the next tick on, even for a tick that had already listed its scopes.
+
+It also visits a scope that is off but has tickets in its merge queue
+(GitHub issue #247). That tick launches nothing; it only merges the tickets
+you queued by hand (`tm merge --queue`, or `+` in the TUI). Tickets that
+autopilot queued wait until autopilot is on again. `tm merge --queue`
+records the repo, like `tm dispatch on`, so the timer can find it.
 
 A scope is found through the repo that `tm dispatch on` recorded. A scope
 turned on some other way (the TUI, or `on --scope`) has no recorded repo,
