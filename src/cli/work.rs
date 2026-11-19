@@ -1387,6 +1387,7 @@ mod tests {
             merge: crate::config::MergeConfig::default(),
             retro: crate::config::RetroConfig::default(),
             walkthrough: crate::config::WalkthroughConfig::default(),
+            coordinator: crate::config::CoordinatorConfig::default(),
             review_watch: crate::config::ReviewWatchConfig::default(),
             auto_review: crate::config::AutoReviewConfig::default(),
             manual: crate::config::ManualConfig::default(),
