@@ -2466,7 +2466,9 @@ fn run_ready_check(key: String) -> ExitCode {
 /// session never resolved (see
 /// [`tskmstr::work::merge::MergeFlowOutcome::ConflictsHandedBack`]): the
 /// rebase is left in progress on disk and the caller should attach to
-/// finish it by hand — distinct from `0` (merged) and `1` (any other
+/// finish it by hand. Also used when the PR's checks were still running at
+/// the timeout ([`tskmstr::work::merge::MergeFlowOutcome::ChecksPending`]):
+/// the ticket is handed back the same way, to rerun later — distinct from `0` (merged) and `1` (any other
 /// error) so an autonomous agent can branch on "needs a human" without
 /// parsing stdout. Exit codes are scoped per-command: `tm pr watch` and `tm
 /// check` also use `2`, for their own distinct meanings unrelated to this
@@ -2476,7 +2478,7 @@ const MERGE_EXIT_CONFLICTS: u8 = 2;
 /// `tm merge <KEY>`: build real dependencies and run
 /// [`tskmstr::work::merge::run_merge`], mapping its
 /// [`tskmstr::work::merge::MergeFlowOutcome`] to an exit code (`0` merged,
-/// `2` conflicts handed back — see [`MERGE_EXIT_CONFLICTS`]'s doc comment
+/// `2` conflicts or pending checks handed back — see [`MERGE_EXIT_CONFLICTS`]'s doc comment
 /// — `1` any other error) rather than `dispatch`'s uniform 0/1.
 ///
 /// With two or more `keys`, runs [`tskmstr::work::merge::run_merge_batch`]
@@ -2547,6 +2549,7 @@ fn run_merge_cmd(keys: Vec<String>, allow_red_base: bool) -> ExitCode {
             sessions_dir: &sessions_dir,
             kill_pid: &tskmstr::runs::pid::kill_pid,
             allow_red_base,
+            run_verify: &tskmstr::work::merge::run_verify_command,
         };
         let mut stdout = std::io::stdout();
 
@@ -2568,6 +2571,12 @@ fn run_merge_cmd(keys: Vec<String>, allow_red_base: bool) -> ExitCode {
             Ok(tskmstr::work::merge::MergeFlowOutcome::ConflictsHandedBack) => {
                 eprintln!(
                     "conflicts handed back for {key}: resolve in the merge tmux window, then rerun `tm merge {key}`"
+                );
+                ExitCode::from(MERGE_EXIT_CONFLICTS)
+            }
+            Ok(tskmstr::work::merge::MergeFlowOutcome::ChecksPending) => {
+                eprintln!(
+                    "checks still running for {key}: not merged; rerun `tm merge {key}` once they finish"
                 );
                 ExitCode::from(MERGE_EXIT_CONFLICTS)
             }

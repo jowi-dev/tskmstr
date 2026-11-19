@@ -5,7 +5,12 @@
 //! [`run_merge`] is the whole flow, staged roughly as: resolve the ticket's
 //! open PR, locate a local checkout of its branch (if any), fetch and
 //! rebase (opening a conflict-resolution tmux session and polling it to
-//! completion when the rebase stops on conflicts), merge the PR via `gh`
+//! completion when the rebase stops on conflicts), run the optional
+//! `[work.merge] verify_command` and push the rebased tip, wait for the
+//! PR's checks to pass on the commit about to merge (GitHub issue #241, see
+//! [`wait_for_checks`]: a failing check stops the merge, and checks that
+//! outlast the timeout hand the ticket back as
+//! [`MergeFlowOutcome::ChecksPending`]), merge the PR via `gh`
 //! (rebasing and retrying once when GitHub rejects a stale base; GitHub
 //! issue #109), fast-forward the local base branch, best-effort clean up
 //! the worktree,
@@ -64,7 +69,7 @@ use thiserror::Error;
 use crate::agent::{AgentInvocation, AgentRunner, InvocationInputs, RunMode, shell_quote};
 use crate::cli::pr::{PrCliError, resolve_watch_repo_root};
 use crate::config::{BackendIdentity, LaneConfig, MergeConfig, MergeStrategy};
-use crate::github::gh_cli::{GhCli, GhError, RepoMergeMethod};
+use crate::github::gh_cli::{ChecksState, GhCli, GhError, PrChecks, RepoMergeMethod};
 use crate::github::pr::{find_issue_key, find_pr_for_ticket};
 use crate::runs::pid::pid_alive;
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
@@ -89,6 +94,14 @@ pub const CONFLICT_POLL_SECS: u64 = 5;
 /// Wall-clock seconds the conflict poll loop waits before giving up and
 /// handing the rebase back to the caller.
 pub const CONFLICT_TIMEOUT_SECS: i64 = 900;
+
+/// Seconds between polls of a PR's checks while [`wait_for_checks`] waits
+/// for them to finish (GitHub issue #241).
+pub const CHECKS_POLL_SECS: u64 = 15;
+
+/// Seconds between "still waiting" progress lines while the checks on a
+/// PR's head are unchanged.
+pub const CHECKS_HEARTBEAT_SECS: i64 = 120;
 
 /// Base name (before [`unique_window_name`] suffixing) of the tmux window a
 /// conflict-resolution session runs in.
@@ -220,6 +233,42 @@ pub enum MergeError {
         failing: Vec<String>,
     },
 
+    /// A check failed on the PR's head commit, so the merge stopped before
+    /// `gh pr merge` (GitHub issue #241). The PR stays open and the branch
+    /// stays pushed.
+    #[error(
+        "checks failed on PR #{number}: {}; not merged (the branch stays pushed: fix it, then rerun `tm merge`)",
+        checks.join(", ")
+    )]
+    ChecksFailed {
+        /// The PR number.
+        number: u64,
+        /// The names of the failing checks.
+        checks: Vec<String>,
+    },
+
+    /// `[work.merge] verify_command` exited non-zero after the rebase, so
+    /// nothing was pushed or merged.
+    #[error(
+        "verify_command `{command}` failed in {}; nothing pushed",
+        dir.display()
+    )]
+    VerifyFailed {
+        /// The configured command.
+        command: String,
+        /// The checkout it ran in.
+        dir: PathBuf,
+    },
+
+    /// `[work.merge] verify_command` could not be started.
+    #[error("failed to run verify_command `{command}`: {source}")]
+    VerifySpawn {
+        /// The configured command.
+        command: String,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+
     /// `origin/<branch>` no longer exists — the remote branch may have been
     /// deleted.
     #[error("origin/{branch} no longer exists; it may have been deleted upstream")]
@@ -239,6 +288,11 @@ pub enum MergeFlowOutcome {
     /// died); the rebase is left in progress on disk and the caller should
     /// attach to finish it by hand.
     ConflictsHandedBack,
+    /// The PR's checks were still running when
+    /// `[work.merge] checks_timeout_secs` ran out (GitHub issue #241). The
+    /// branch is pushed and the PR left open; rerunning `tm merge` waits
+    /// on the same head again.
+    ChecksPending,
 }
 
 /// Dependencies [`run_merge`] needs, gathered the same way
@@ -310,6 +364,27 @@ pub struct MergeDeps<'a> {
     /// [`MergeError::BaseRed`]), for the operator merging the fix for the
     /// broken base itself.
     pub allow_red_base: bool,
+    /// Runs `[work.merge] verify_command` (the second argument) in a
+    /// checkout (the first) and reports whether it exited zero; production
+    /// passes [`run_verify_command`].
+    pub run_verify: &'a VerifyRunner,
+}
+
+/// Runs `[work.merge] verify_command` (the second argument) in a checkout
+/// (the first) and reports whether it exited zero. See
+/// [`MergeDeps::run_verify`].
+pub type VerifyRunner = dyn Fn(&Path, &str) -> std::io::Result<bool>;
+
+/// Production [`MergeDeps::run_verify`]: runs `command` with `sh -c` in
+/// `dir`, its output going straight to the terminal, and reports whether it
+/// exited zero.
+pub fn run_verify_command(dir: &Path, command: &str) -> std::io::Result<bool> {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(dir)
+        .status()
+        .map(|status| status.success())
 }
 
 /// The first 12 characters of a commit SHA, for messages.
@@ -1150,17 +1225,20 @@ pub struct BatchMergeReport {
     /// Keys that failed with an error, each paired with the error message.
     /// One ticket's failure never stops the rest of the batch.
     pub failed: Vec<(String, String)>,
+    /// Keys whose PR checks were still running at the timeout (see
+    /// [`MergeFlowOutcome::ChecksPending`]); pushed but not merged.
+    pub checks_pending: Vec<String>,
 }
 
 impl BatchMergeReport {
     /// The `tm merge` exit code for this batch: `1` if any ticket failed,
-    /// otherwise `2` if any was handed back, otherwise `0`. A failure
-    /// outranks a hand-back because it needs investigating, not just
-    /// finishing.
+    /// otherwise `2` if any was handed back or still has checks pending,
+    /// otherwise `0`. A failure outranks a hand-back because it needs
+    /// investigating, not just finishing.
     pub fn exit_code(&self) -> u8 {
         if !self.failed.is_empty() {
             1
-        } else if !self.handed_back.is_empty() {
+        } else if !self.handed_back.is_empty() || !self.checks_pending.is_empty() {
             2
         } else {
             0
@@ -1292,9 +1370,10 @@ pub fn run_merge_batch(
 
     writeln!(
         out,
-        "batch done: {} merged, {} handed back, {} failed",
+        "batch done: {} merged, {} handed back, {} checks pending, {} failed",
         report.merged.len(),
         report.handed_back.len(),
+        report.checks_pending.len(),
         report.failed.len()
     )?;
     for key in &report.handed_back {
@@ -1302,6 +1381,12 @@ pub fn run_merge_batch(
             out,
             "  handed back: {key} (finish the {}, then rerun `tm merge {key}`)",
             operation(deps.merge_cfg.strategy)
+        )?;
+    }
+    for key in &report.checks_pending {
+        writeln!(
+            out,
+            "  checks pending: {key} (rerun `tm merge {key}` once its checks finish)"
         )?;
     }
     for (key, err) in &report.failed {
@@ -1339,6 +1424,10 @@ fn finish_into_report(
         }
         Ok(MergeFlowOutcome::ConflictsHandedBack) => {
             report.handed_back.push(prepared.key.clone());
+            Ok(false)
+        }
+        Ok(MergeFlowOutcome::ChecksPending) => {
+            report.checks_pending.push(prepared.key.clone());
             Ok(false)
         }
         Err(err) => record_failure(report, &prepared.key, &err, out).map(|()| false),
@@ -1903,8 +1992,11 @@ fn push_branch(
 }
 
 /// Stages 3-7 of the flow for a ticket whose rebase (if any) is complete:
-/// push the local tip when [`PreparedMerge::needs_push`] says to, `gh pr
-/// merge` (rebasing and retrying once on a stale-base rejection, see
+/// run `[work.merge] verify_command` and push the local tip when
+/// [`PreparedMerge::needs_push`] says to (see [`verify_and_push`]), wait
+/// for the PR's checks to pass on its head (see [`wait_for_checks`];
+/// [`MergeFlowOutcome::ChecksPending`] when they outlast the timeout),
+/// `gh pr merge` (rebasing and retrying once on a stale-base rejection, see
 /// [`merge_pr_with_retry`] — the only way this returns
 /// [`MergeFlowOutcome::ConflictsHandedBack`], before any cleanup), sync
 /// the local base, best-effort clean up (worktree, local
@@ -1936,13 +2028,18 @@ fn finish_merge(
     } = prepared;
     let (key, number, needs_push) = (key.as_str(), *number, *needs_push);
 
+    let mut pushed = None;
     if needs_push && let Some(dir) = checkout_dir.as_deref() {
         let force = deps.merge_cfg.strategy != MergeStrategy::Merge || *needs_force;
-        push_branch(deps, dir, branch, force, out)?;
+        pushed = Some(verify_and_push(deps, prepared, dir, force, out)?);
+    }
+    if wait_for_checks(deps, prepared, pushed.as_ref(), out)? == ChecksVerdict::TimedOut {
+        return Ok(MergeFlowOutcome::ChecksPending);
     }
 
-    if merge_pr_with_retry(deps, prepared, out)? == MergeFlowOutcome::ConflictsHandedBack {
-        return Ok(MergeFlowOutcome::ConflictsHandedBack);
+    let merge_outcome = merge_pr_with_retry(deps, prepared, out)?;
+    if merge_outcome != MergeFlowOutcome::Merged {
+        return Ok(merge_outcome);
     }
 
     writeln!(out, "syncing local {base}...")?;
@@ -2065,6 +2162,189 @@ fn finish_merge(
     Ok(MergeFlowOutcome::Merged)
 }
 
+/// The head [`verify_and_push`] published, which [`wait_for_checks`]
+/// requires the PR's checks to have run on.
+#[derive(Debug, Clone)]
+struct PushedHead {
+    /// The pushed commit. Empty when the checks gate is off.
+    sha: String,
+    /// Whether the PR had checks before the push. If so, an empty check
+    /// list on the pushed head means CI hasn't queued them yet, not that
+    /// the repo has no CI.
+    expect_checks: bool,
+}
+
+/// Runs `[work.merge] verify_command` (if set) in `dir`, then pushes the
+/// branch through [`push_branch`] (GitHub issue #241), with lease
+/// protection when `force`. A failing command stops the
+/// merge before anything is pushed. With the checks gate on, it first notes
+/// whether the PR has checks at all, and afterwards which commit was
+/// pushed, for [`wait_for_checks`].
+fn verify_and_push(
+    deps: &MergeDeps<'_>,
+    prepared: &PreparedMerge,
+    dir: &Path,
+    force: bool,
+    out: &mut dyn Write,
+) -> Result<PushedHead, MergeError> {
+    let branch = &prepared.branch;
+    if let Some(command) = deps.merge_cfg.verify_command.as_deref() {
+        writeln!(
+            out,
+            "running verify_command `{command}` in {}...",
+            dir.display()
+        )?;
+        out.flush()?;
+        let passed = (deps.run_verify)(dir, command).map_err(|source| MergeError::VerifySpawn {
+            command: command.to_string(),
+            source,
+        })?;
+        if !passed {
+            return Err(MergeError::VerifyFailed {
+                command: command.to_string(),
+                dir: dir.to_path_buf(),
+            });
+        }
+        writeln!(out, "verify_command passed")?;
+    }
+
+    let gate = deps.merge_cfg.wait_for_checks;
+    let expect_checks = gate
+        && !deps
+            .gh
+            .pr_checks(&prepared.repo_root, prepared.number)?
+            .checks
+            .is_empty();
+    push_branch(deps, dir, branch, force, out)?;
+    let sha = if gate {
+        deps.git.rev_parse(dir, branch)?
+    } else {
+        String::new()
+    };
+    Ok(PushedHead { sha, expect_checks })
+}
+
+/// How [`wait_for_checks`] ended, short of a failing check (an error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChecksVerdict {
+    /// Every check passed, or the PR has none: safe to merge.
+    Passed,
+    /// Checks were still running when the timeout ran out.
+    TimedOut,
+}
+
+/// One reading of a PR's checks against what [`wait_for_checks`] needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChecksReading {
+    Passed,
+    Failed(Vec<String>),
+    /// Not finished yet; the text says what is being waited on.
+    Waiting(String),
+}
+
+/// Reads `checks` against `pushed` (the head the checks must have run on,
+/// `None` when nothing was pushed and the PR's current head stands).
+fn read_checks(checks: &PrChecks, pushed: Option<&PushedHead>) -> ChecksReading {
+    if let Some(head) = pushed
+        && checks.head_sha != head.sha
+    {
+        return ChecksReading::Waiting(format!(
+            "waiting for GitHub to see the pushed head {}",
+            short_sha(&head.sha)
+        ));
+    }
+    let failing: Vec<String> = checks.failing().map(|check| check.name.clone()).collect();
+    if !failing.is_empty() {
+        return ChecksReading::Failed(failing);
+    }
+    if checks.checks.is_empty() {
+        return if pushed.is_some_and(|head| head.expect_checks) {
+            ChecksReading::Waiting("waiting for checks to start on the pushed head".to_string())
+        } else {
+            ChecksReading::Passed
+        };
+    }
+    let pending = checks
+        .checks
+        .iter()
+        .filter(|check| check.state == ChecksState::Pending)
+        .count();
+    if pending == 0 {
+        ChecksReading::Passed
+    } else {
+        ChecksReading::Waiting(format!(
+            "waiting for checks: {pending} of {} still running",
+            checks.checks.len()
+        ))
+    }
+}
+
+/// The checks gate before `gh pr merge` (GitHub issue #241): polls the PR's
+/// checks every [`CHECKS_POLL_SECS`] until every check on its head has
+/// passed (or it has none), so `tm merge` never merges a commit CI hasn't
+/// tested. After a push, `pushed` names the new head: checks GitHub still
+/// reports for the old one don't count. A failing check is
+/// [`MergeError::ChecksFailed`]; checks still running after
+/// `[work.merge] checks_timeout_secs` are [`ChecksVerdict::TimedOut`]. A
+/// `gh` error while polling only warns, so one network blip doesn't
+/// throw away a long wait. `[work.merge] wait_for_checks = false` skips
+/// the gate.
+fn wait_for_checks(
+    deps: &MergeDeps<'_>,
+    prepared: &PreparedMerge,
+    pushed: Option<&PushedHead>,
+    out: &mut dyn Write,
+) -> Result<ChecksVerdict, MergeError> {
+    if !deps.merge_cfg.wait_for_checks {
+        return Ok(ChecksVerdict::Passed);
+    }
+    let number = prepared.number;
+    let started = deps.clock.now_unix_secs();
+    let timeout = i64::try_from(deps.merge_cfg.checks_timeout_secs).unwrap_or(i64::MAX);
+    let mut last_line: Option<String> = None;
+    let mut last_printed = started;
+    loop {
+        let line = match deps.gh.pr_checks(&prepared.repo_root, number) {
+            Ok(checks) => match read_checks(&checks, pushed) {
+                ChecksReading::Passed => {
+                    if !checks.checks.is_empty() {
+                        writeln!(out, "checks passed on PR #{number}")?;
+                    }
+                    return Ok(ChecksVerdict::Passed);
+                }
+                ChecksReading::Failed(names) => {
+                    return Err(MergeError::ChecksFailed {
+                        number,
+                        checks: names,
+                    });
+                }
+                ChecksReading::Waiting(line) => format!("PR #{number}: {line}"),
+            },
+            Err(err) => format!("warning: failed to read checks on PR #{number}: {err}"),
+        };
+
+        let now = deps.clock.now_unix_secs();
+        let elapsed = now.saturating_sub(started);
+        if last_line.as_deref() != Some(line.as_str())
+            || now.saturating_sub(last_printed) >= CHECKS_HEARTBEAT_SECS
+        {
+            writeln!(out, "{line} ({elapsed}s elapsed)")?;
+            out.flush()?;
+            last_printed = now;
+            last_line = Some(line);
+        }
+        if elapsed >= timeout {
+            writeln!(
+                out,
+                "timed out after {elapsed}s waiting for checks on PR #{number}; not merged (rerun `tm merge {}` once they finish)",
+                prepared.key
+            )?;
+            return Ok(ChecksVerdict::TimedOut);
+        }
+        deps.sleeper.sleep(CHECKS_POLL_SECS);
+    }
+}
+
 /// The `gh pr merge` step of [`finish_merge`], retried once when GitHub
 /// rejects the merge because the base moved (GitHub issue #109; see
 /// [`GhError::is_out_of_date_base`]) — typically an earlier ticket in the
@@ -2072,7 +2352,9 @@ fn finish_merge(
 /// to be up to date" then refuses.
 ///
 /// The retry fetches, rebases the checkout onto the current
-/// `origin/<base>`, force-pushes with lease, and merges again. A rebase
+/// `origin/<base>`, verifies and force-pushes with lease
+/// ([`verify_and_push`]), waits for the checks on the new head
+/// ([`wait_for_checks`]), and merges again. A rebase
 /// that stops on conflicts goes through [`run_conflict_session`] like the
 /// first rebase did; if that session never resolves, the rebase is left
 /// in progress on disk and [`MergeFlowOutcome::ConflictsHandedBack`] is
@@ -2139,7 +2421,10 @@ fn merge_pr_with_retry(
     }
 
     let force = deps.merge_cfg.strategy != MergeStrategy::Merge;
-    push_branch(deps, dir, branch, force, out)?;
+    let pushed = verify_and_push(deps, prepared, dir, force, out)?;
+    if wait_for_checks(deps, prepared, Some(&pushed), out)? == ChecksVerdict::TimedOut {
+        return Ok(MergeFlowOutcome::ChecksPending);
+    }
     writeln!(out, "retrying merge of PR #{number}...")?;
     deps.gh.pr_merge(repo_root, *number, MERGE_TIMEOUT)?;
     Ok(MergeFlowOutcome::Merged)
@@ -2443,6 +2728,12 @@ mod tests {
         /// Every pid [`MergeDeps::kill_pid`] was asked to stop, in order.
         killed_pids: std::rc::Rc<std::cell::RefCell<Vec<u32>>>,
         kill_pid: Box<dyn Fn(u32)>,
+        /// Every `(dir, command)` [`MergeDeps::run_verify`] was asked to
+        /// run, in order.
+        verify_calls: std::rc::Rc<std::cell::RefCell<Vec<(PathBuf, String)>>>,
+        /// What the fake verify command reports: `true` passes.
+        verify_passes: std::rc::Rc<std::cell::Cell<bool>>,
+        run_verify: Box<VerifyRunner>,
     }
 
     impl Fixture {
@@ -2455,9 +2746,20 @@ mod tests {
             let sessions_dir = sessions_tmp.path().join("sessions");
             let killed_pids = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let recorder = killed_pids.clone();
+            let verify_calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let verify_passes = std::rc::Rc::new(std::cell::Cell::new(true));
+            let (verify_recorder, verify_verdict) = (verify_calls.clone(), verify_passes.clone());
             Fixture {
                 killed_pids,
                 kill_pid: Box::new(move |pid| recorder.borrow_mut().push(pid)),
+                verify_calls,
+                verify_passes,
+                run_verify: Box::new(move |dir, command| {
+                    verify_recorder
+                        .borrow_mut()
+                        .push((dir.to_path_buf(), command.to_string()));
+                    Ok(verify_verdict.get())
+                }),
                 _db_dir: db_dir,
                 store,
                 git: FakeGitOps::new()
@@ -2480,8 +2782,12 @@ mod tests {
                 // Off by default here so the post-merge memory session's
                 // window doesn't show up in every test's tmux calls; the
                 // GitHub issue #208 tests turn it back on.
+                // The checks gate is off here too, so existing tests don't
+                // need a `pr_checks` result matching every pushed head; the
+                // GitHub issue #241 tests turn it back on.
                 merge_cfg: MergeConfig {
                     consolidate_memories: false,
+                    wait_for_checks: false,
                     ..MergeConfig::default()
                 },
                 work_default_model: None,
@@ -2554,6 +2860,7 @@ mod tests {
                 sessions_dir: &self.sessions_dir,
                 kill_pid: &*self.kill_pid,
                 allow_red_base: self.allow_red_base,
+                run_verify: &*self.run_verify,
             }
         }
     }
@@ -5446,5 +5753,345 @@ mod tests {
         let (_result, out) = run(&fx.deps(), "PROJ-1");
 
         assert!(out.contains("skipping auto-merge"), "{out}");
+    }
+
+    // --- checks gate and verify_command (GitHub issue #241) ---
+
+    fn checks_on(sha: &str, checks: Vec<CheckResult>) -> Result<PrChecks, GhError> {
+        Ok(PrChecks {
+            lifecycle: crate::github::gh_cli::PrLifecycle::Open,
+            head_sha: sha.to_string(),
+            checks,
+        })
+    }
+
+    /// A ticket whose branch rebases cleanly onto `main`, then is pushed at
+    /// head `aaa` (the fake's `rev_parse` never changes), with the checks
+    /// gate on.
+    fn gated_fixture() -> Fixture {
+        let mut fx = Fixture::new();
+        fx.register_checkout("proj-1-fix");
+        fx.merge_cfg.wait_for_checks = true;
+        fx.merge_cfg.checks_timeout_secs = 600;
+        fx.gh = fx
+            .gh
+            .with_pr_list(Ok(vec![pr_info(7, "proj-1-fix", "main", "PROJ-1")]));
+        fx.git = fx
+            .git
+            .with_current_branch(Ok("main".to_string()))
+            .with_rev_parse_result("proj-1-fix", Ok("aaa".to_string()))
+            .with_rev_parse_result("origin/proj-1-fix", Ok("aaa".to_string()))
+            .with_is_ancestor_result(Ok(false))
+            .with_rebase_onto_result(Ok(RebaseOutcome::Completed))
+            .with_branch_exists_local(Ok(false));
+        fx
+    }
+
+    #[test]
+    fn pushed_head_with_passing_checks_merges() {
+        let mut fx = gated_fixture();
+        fx.gh = fx.gh.with_pr_checks_sequence(
+            7,
+            vec![
+                checks_on("old", vec![check("test", ChecksState::Passing)]),
+                checks_on("aaa", vec![check("test", ChecksState::Passing)]),
+            ],
+        );
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(fx.git.push_force_with_lease_calls().len(), 1);
+        assert_eq!(fx.gh.pr_merge_calls().len(), 1);
+        assert!(out.contains("checks passed"), "{out}");
+    }
+
+    #[test]
+    fn pending_checks_on_the_pushed_head_are_polled_until_they_pass() {
+        let mut fx = gated_fixture();
+        fx.gh = fx.gh.with_pr_checks_sequence(
+            7,
+            vec![
+                checks_on("old", vec![check("test", ChecksState::Passing)]),
+                checks_on("aaa", vec![check("test", ChecksState::Pending)]),
+                checks_on("aaa", vec![check("test", ChecksState::Pending)]),
+                checks_on("aaa", vec![check("test", ChecksState::Passing)]),
+            ],
+        );
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(fx.sleeper.calls(), vec![CHECKS_POLL_SECS; 2]);
+        assert_eq!(fx.gh.pr_merge_calls().len(), 1);
+        assert!(out.contains("waiting for checks"), "{out}");
+    }
+
+    #[test]
+    fn green_checks_on_the_old_head_do_not_count_for_the_pushed_one() {
+        // GitHub can report the pre-push head (and its green checks) for a
+        // moment after the push lands.
+        let mut fx = gated_fixture();
+        fx.gh = fx.gh.with_pr_checks_sequence(
+            7,
+            vec![
+                checks_on("old", vec![check("test", ChecksState::Passing)]),
+                checks_on("old", vec![check("test", ChecksState::Passing)]),
+                checks_on("aaa", vec![check("test", ChecksState::Passing)]),
+            ],
+        );
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(fx.sleeper.calls().len(), 1, "one wait for the new head");
+    }
+
+    #[test]
+    fn checks_that_ran_before_the_push_are_awaited_on_the_pushed_head() {
+        // The old head had checks, so an empty list on the new head means
+        // they haven't been queued yet, not that the repo has no CI.
+        let mut fx = gated_fixture();
+        fx.gh = fx.gh.with_pr_checks_sequence(
+            7,
+            vec![
+                checks_on("old", vec![check("test", ChecksState::Passing)]),
+                checks_on("aaa", Vec::new()),
+                checks_on("aaa", vec![check("test", ChecksState::Passing)]),
+            ],
+        );
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(fx.sleeper.calls().len(), 1);
+    }
+
+    #[test]
+    fn a_pr_with_no_checks_merges_without_waiting() {
+        let mut fx = gated_fixture();
+        fx.gh = fx.gh.with_pr_checks_sequence(
+            7,
+            vec![checks_on("old", Vec::new()), checks_on("aaa", Vec::new())],
+        );
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert!(fx.sleeper.calls().is_empty());
+        assert_eq!(fx.gh.pr_merge_calls().len(), 1);
+    }
+
+    #[test]
+    fn failing_checks_on_the_pushed_head_stop_the_merge_and_name_them() {
+        let mut fx = gated_fixture();
+        fx.gh = fx.gh.with_pr_checks_sequence(
+            7,
+            vec![
+                checks_on("old", vec![check("test", ChecksState::Passing)]),
+                checks_on(
+                    "aaa",
+                    vec![
+                        check("lint", ChecksState::Passing),
+                        check("test", ChecksState::Failing),
+                        check("build", ChecksState::Pending),
+                    ],
+                ),
+            ],
+        );
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        match result {
+            Err(MergeError::ChecksFailed { number, checks }) => {
+                assert_eq!(number, 7);
+                assert_eq!(checks, vec!["test".to_string()]);
+            }
+            other => panic!("expected ChecksFailed, got {other:?}: {out}"),
+        }
+        assert_eq!(
+            fx.git.push_force_with_lease_calls().len(),
+            1,
+            "the branch stays pushed"
+        );
+        assert!(fx.gh.pr_merge_calls().is_empty(), "nothing merged");
+        assert!(fx.sleeper.calls().is_empty(), "a failure stops at once");
+    }
+
+    #[test]
+    fn checks_still_pending_at_the_timeout_hand_the_ticket_back_unmerged() {
+        let mut fx = gated_fixture();
+        fx.clock = FakeClock::advancing(1_000, 200);
+        fx.gh = fx.gh.with_pr_checks_sequence(
+            7,
+            vec![
+                checks_on("old", vec![check("test", ChecksState::Passing)]),
+                checks_on("aaa", vec![check("test", ChecksState::Pending)]),
+            ],
+        );
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(
+            matches!(result, Ok(MergeFlowOutcome::ChecksPending)),
+            "{result:?}: {out}"
+        );
+        assert!(fx.gh.pr_merge_calls().is_empty(), "nothing merged");
+        assert_eq!(fx.git.push_force_with_lease_calls().len(), 1);
+        assert!(out.contains("timed out"), "{out}");
+    }
+
+    #[test]
+    fn failing_checks_stop_a_merge_that_pushed_nothing() {
+        // An up-to-date branch is never pushed, but a rerun after a
+        // checks timeout lands here: its head still has to be green.
+        let mut fx = up_to_date_fixture();
+        fx.merge_cfg.wait_for_checks = true;
+        fx.gh = fx.gh.with_pr_checks(
+            7,
+            checks_on("aaa", vec![check("test", ChecksState::Failing)]),
+        );
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(
+            matches!(result, Err(MergeError::ChecksFailed { .. })),
+            "{result:?}: {out}"
+        );
+        assert!(fx.git.push_force_with_lease_calls().is_empty());
+        assert!(fx.gh.pr_merge_calls().is_empty());
+    }
+
+    #[test]
+    fn checks_gate_off_never_reads_checks() {
+        let mut fx = gated_fixture();
+        fx.merge_cfg.wait_for_checks = false;
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert!(fx.gh.pr_checks_calls().is_empty());
+    }
+
+    #[test]
+    fn stale_base_retry_waits_for_checks_on_the_repushed_head() {
+        let mut fx = up_to_date_fixture();
+        fx.merge_cfg.wait_for_checks = true;
+        fx.gh = fx
+            .gh
+            .with_pr_merge_sequence(vec![Err(stale_base_error()), Ok(())])
+            .with_pr_checks_sequence(
+                7,
+                vec![
+                    // The up-to-date head before the first merge attempt.
+                    checks_on("aaa", vec![check("test", ChecksState::Passing)]),
+                    // Before the retry push, then pending on the new head.
+                    checks_on("aaa", vec![check("test", ChecksState::Passing)]),
+                    checks_on("aaa", vec![check("test", ChecksState::Pending)]),
+                    checks_on("aaa", vec![check("test", ChecksState::Passing)]),
+                ],
+            );
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(fx.gh.pr_checks_calls().len(), 4);
+        assert_eq!(fx.sleeper.calls(), vec![CHECKS_POLL_SECS]);
+        assert_eq!(fx.gh.pr_merge_calls().len(), 2);
+    }
+
+    #[test]
+    fn verify_command_runs_in_the_checkout_before_the_push() {
+        let mut fx = gated_fixture();
+        fx.merge_cfg.wait_for_checks = false;
+        fx.merge_cfg.verify_command = Some("cargo test".to_string());
+        let dir = fx._worktree_dirs[0].path().to_path_buf();
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(
+            fx.verify_calls.borrow().clone(),
+            vec![(dir, "cargo test".to_string())]
+        );
+        assert_eq!(fx.git.push_force_with_lease_calls().len(), 1);
+    }
+
+    #[test]
+    fn failing_verify_command_stops_the_merge_with_nothing_pushed() {
+        let mut fx = gated_fixture();
+        fx.merge_cfg.verify_command = Some("cargo test".to_string());
+        fx.verify_passes.set(false);
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(
+            matches!(result, Err(MergeError::VerifyFailed { .. })),
+            "{result:?}: {out}"
+        );
+        assert!(fx.git.push_force_with_lease_calls().is_empty());
+        assert!(fx.gh.pr_merge_calls().is_empty());
+    }
+
+    #[test]
+    fn verify_command_is_skipped_when_nothing_is_pushed() {
+        let mut fx = up_to_date_fixture();
+        fx.merge_cfg.verify_command = Some("cargo test".to_string());
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert!(fx.verify_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn batch_applies_the_checks_gate_to_each_ticket() {
+        let mut fx = batch_fixture(&[BatchTicket::Clean, BatchTicket::Clean, BatchTicket::Clean]);
+        fx.merge_cfg.wait_for_checks = true;
+        fx.merge_cfg.checks_timeout_secs = 600;
+        fx.clock = FakeClock::advancing(1_000, 200);
+        fx.gh = fx
+            .gh
+            .with_pr_checks_sequence(
+                11,
+                vec![
+                    checks_on("old-1", Vec::new()),
+                    checks_on("old-1", vec![check("test", ChecksState::Failing)]),
+                ],
+            )
+            .with_pr_checks_sequence(
+                12,
+                vec![
+                    checks_on("x", Vec::new()),
+                    checks_on("old-2", vec![check("test", ChecksState::Pending)]),
+                ],
+            )
+            .with_pr_checks_sequence(
+                13,
+                vec![
+                    checks_on("x", Vec::new()),
+                    checks_on("old-3", vec![check("test", ChecksState::Passing)]),
+                ],
+            );
+
+        let (result, out) = run_batch(&fx.deps(), &keys(3));
+
+        let report = result.expect("batch should succeed");
+        assert_eq!(report.merged, vec!["PROJ-3"], "{out}");
+        assert_eq!(report.checks_pending, vec!["PROJ-2"], "{out}");
+        assert_eq!(report.failed.len(), 1, "{out}");
+        assert_eq!(report.failed[0].0, "PROJ-1");
+        assert_eq!(report.exit_code(), 1);
+        assert_eq!(fx.gh.pr_merge_calls(), vec![(PathBuf::from("/repo"), 13)]);
+        assert!(out.contains("checks pending: PROJ-2"), "{out}");
+    }
+
+    #[test]
+    fn batch_with_only_pending_checks_exits_two() {
+        let report = BatchMergeReport {
+            checks_pending: vec!["PROJ-1".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(report.exit_code(), 2);
     }
 }
