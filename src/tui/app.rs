@@ -10385,6 +10385,7 @@ mod tests {
             auto_review_round: None,
             review_import: None,
             fix_rounds: 0,
+            awaiting_reply: false,
         }
     }
 

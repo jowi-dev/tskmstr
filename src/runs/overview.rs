@@ -58,6 +58,15 @@ pub struct OverviewRun {
     /// saw its PR merged or closed, or one `tm merge` closed out (GitHub
     /// issue #119).
     pub pr_closed: bool,
+    /// See [`super::Run::session_id`]: the agent session id, which maps the
+    /// run to its thatch chat name.
+    pub session_id: Option<String>,
+    /// Whether the run's thatch chat session sent a message its recipient
+    /// has not answered (GitHub issue #223, see
+    /// [`crate::work::thatch_chat::awaiting_reply`]). Not stored: the
+    /// overview loader fills it from thatch, and it stays `false` without
+    /// thatch.
+    pub awaiting_reply: bool,
 }
 
 /// A ticket's identity across projects: GitHub issue numbers restart per
@@ -157,6 +166,8 @@ pub struct StageSignals {
     pub in_ready_list: bool,
     /// See [`awaiting_review`].
     pub awaiting_review: bool,
+    /// See [`OverviewRun::awaiting_reply`].
+    pub awaiting_reply: bool,
 }
 
 /// The highest-ranked [`Stage`] `signals` reach, or `None` when the ticket
@@ -169,14 +180,19 @@ pub struct StageSignals {
 /// escalated and reads as [`Stage::Stuck`]; a `review` run reads as
 /// [`Stage::NeedsReview`] until a PR state says otherwise; a `queued` run
 /// reads as [`Stage::Running`]. Awaiting input outranks a stale heartbeat,
-/// since a session waiting on the operator emits no heartbeats.
+/// since a session waiting on the operator emits no heartbeats. A running
+/// run awaiting a chat reply (GitHub issue #223) also reads as
+/// [`Stage::NeedsInput`]: a lane that asked a question and waits is
+/// stalled until someone answers.
 /// [`StageSignals::awaiting_review`] reads as [`Stage::AwaitingReview`],
 /// outranking every PR state.
 pub fn derive_stage(signals: &StageSignals) -> Option<Stage> {
     use RunStatus::*;
 
     let status = signals.run_status;
-    if (status == Some(Running) && signals.awaiting_input) || status == Some(Hibernated) {
+    if (status == Some(Running) && (signals.awaiting_input || signals.awaiting_reply))
+        || status == Some(Hibernated)
+    {
         return Some(Stage::NeedsInput);
     }
     if signals.awaiting_review {
@@ -302,6 +318,10 @@ pub struct OverviewRow {
     pub review_import: Option<String>,
     /// How many `review-fix` runs the ticket has had (GitHub issue #119).
     pub fix_rounds: usize,
+    /// Whether the row's run is waiting on a chat reply (see
+    /// [`OverviewRun::awaiting_reply`]), shown as a badge so the operator
+    /// sees why the row needs input.
+    pub awaiting_reply: bool,
 }
 
 /// Joins `runs` (newest first, as [`super::RunStore::overview_runs`]
@@ -357,6 +377,7 @@ pub fn join_rows(
                 auto_review_round: None,
                 review_import: None,
                 fix_rounds: 0,
+                awaiting_reply: false,
             }),
     );
 
@@ -386,6 +407,7 @@ fn ticket_row(
                 awaiting_review,
                 run_status: Some(run.status),
                 awaiting_input: run.awaiting_input,
+                awaiting_reply: run.awaiting_reply,
                 heartbeat_stale: run.status == RunStatus::Running
                     && run
                         .heartbeat_age_secs
@@ -416,6 +438,7 @@ fn ticket_row(
             .iter()
             .filter(|run| run.kind == REVIEW_FIX_KIND)
             .count(),
+        awaiting_reply: run.awaiting_reply,
     })
 }
 
@@ -536,6 +559,8 @@ mod tests {
             auto_review_round: None,
             review_import: None,
             pr_closed: false,
+            session_id: None,
+            awaiting_reply: false,
         }
     }
 
@@ -906,6 +931,48 @@ mod tests {
     // --- join_rows ---
 
     #[test]
+    fn a_running_lane_awaiting_a_chat_reply_needs_input() {
+        let stage = derive_stage(&StageSignals {
+            awaiting_reply: true,
+            ..signals(RunStatus::Running)
+        });
+        assert_eq!(stage, Some(Stage::NeedsInput));
+    }
+
+    #[test]
+    fn an_ended_run_awaiting_a_chat_reply_is_not_needs_input() {
+        let stage = derive_stage(&StageSignals {
+            awaiting_reply: true,
+            ..signals(RunStatus::Failed)
+        });
+        assert_eq!(stage, Some(Stage::Stuck));
+    }
+
+    #[test]
+    fn a_lane_awaiting_a_chat_reply_raises_a_needs_input_row_with_the_badge() {
+        let mut lane = run(1, "GH-1", RunStatus::Running);
+        lane.awaiting_reply = true;
+
+        let rows = join_rows(&[lane], &TrackerSignals::default(), 600, &no_worktree);
+
+        assert_eq!(rows[0].stage, Stage::NeedsInput);
+        assert!(rows[0].awaiting_reply);
+    }
+
+    #[test]
+    fn an_answered_lane_is_back_to_running_with_no_badge() {
+        let rows = join_rows(
+            &[run(1, "GH-1", RunStatus::Running)],
+            &TrackerSignals::default(),
+            600,
+            &no_worktree,
+        );
+
+        assert_eq!(rows[0].stage, Stage::Running);
+        assert!(!rows[0].awaiting_reply);
+    }
+
+    #[test]
     fn collapses_a_tickets_runs_into_one_row() {
         let runs = vec![
             run(3, "GH-1", RunStatus::Running),
@@ -1185,6 +1252,7 @@ mod tests {
             auto_review_round: None,
             review_import: None,
             fix_rounds: 0,
+            awaiting_reply: false,
         }
     }
 
