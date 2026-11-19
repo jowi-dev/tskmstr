@@ -331,6 +331,8 @@ pub struct RawRunnerConfig {
     pub default_model: Option<String>,
     /// See [`RunnerModels::usage_probe_model`].
     pub usage_probe_model: Option<String>,
+    /// `"process"` or `"server"`. See [`RunnerMode`].
+    pub mode: Option<String>,
     /// See [`RunnerUsageConfig::five_hour_ceiling`].
     pub five_hour_ceiling: Option<f64>,
     /// See [`RunnerUsageConfig::seven_day_ceiling`].
@@ -437,6 +439,15 @@ impl AgentKind {
                 default_model: "venice/z-ai-glm-5-3-flash",
                 usage_probe_model: None,
             },
+        }
+    }
+
+    /// Whether this runner can run headless lanes as sessions on a shared
+    /// server (`[agent.<runner>] mode = "server"`, GitHub issue #194).
+    pub fn has_server_mode(self) -> bool {
+        match self {
+            AgentKind::Claude => false,
+            AgentKind::Opencode => true,
         }
     }
 
@@ -1217,10 +1228,11 @@ impl UsageConfig {
     }
 }
 
-/// One runner's configured models (GitHub issue #143), from
-/// `[agent.<runner>]`. Either may be unset; the built-in defaults
-/// ([`AgentKind::builtin_models`]) are applied when a launch resolves its
-/// model, not here, so `tm check` can tell configured from built-in.
+/// One runner's configured models (GitHub issue #143) and launch mode
+/// (GitHub issue #194), from `[agent.<runner>]`. Either model may be unset;
+/// the built-in defaults ([`AgentKind::builtin_models`]) are applied when a
+/// launch resolves its model, not here, so `tm check` can tell configured
+/// from built-in.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunnerModels {
     /// `[agent.<runner>] default_model`: the model a launch on this runner
@@ -1231,6 +1243,35 @@ pub struct RunnerModels {
     /// usage probe (GitHub issue #114). Only legal on a runner with a
     /// probe; see [`ConfigError::UsageProbeModelUnsupported`].
     pub usage_probe_model: Option<String>,
+    /// `[agent.<runner>] mode`: how a headless lane run launches this
+    /// runner. See [`RunnerMode`].
+    pub mode: RunnerMode,
+}
+
+/// How a headless lane run launches a runner (GitHub issue #194):
+/// `[agent.<runner>] mode`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RunnerMode {
+    /// One agent CLI process per lane. The default.
+    #[default]
+    Process,
+    /// A session on the user's shared agent server, driven by a small tm
+    /// process instead of an agent CLI process per lane. Only legal on a
+    /// runner with a server mode ([`AgentKind::has_server_mode`]); see
+    /// `docs/plans/gh-194-opencode-server-mode.md`.
+    Server,
+}
+
+impl RunnerMode {
+    /// Parses a config `mode` string. Returns `None` for unrecognized
+    /// values.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "process" => Some(RunnerMode::Process),
+            "server" => Some(RunnerMode::Server),
+            _ => None,
+        }
+    }
 }
 
 /// Configured models for every runner. See [`RunnerModels`].
@@ -1248,10 +1289,12 @@ impl ModelsConfig {
         claude: RunnerModels {
             default_model: None,
             usage_probe_model: None,
+            mode: RunnerMode::Process,
         },
         opencode: RunnerModels {
             default_model: None,
             usage_probe_model: None,
+            mode: RunnerMode::Process,
         },
     };
 
@@ -2008,6 +2051,22 @@ pub enum ConfigError {
         runner: &'static str,
     },
 
+    /// An `[agent.<runner>] mode` value was not recognized (GitHub issue
+    /// #194).
+    #[error("invalid [agent] mode `{value}`; expected \"process\" or \"server\"")]
+    InvalidRunnerMode {
+        /// The value as parsed.
+        value: String,
+    },
+
+    /// `[agent.<runner>] mode = "server"` was set for a runner that has no
+    /// server mode (GitHub issue #194).
+    #[error("[agent.{runner}] mode = \"server\" is set, but {runner} has no server mode")]
+    ServerModeUnsupported {
+        /// The runner whose table set the key.
+        runner: &'static str,
+    },
+
     /// An `[agent.<runner>] billing` value was not recognized (GitHub issue
     /// #114).
     #[error("invalid [agent] billing `{value}`; expected \"subscription\" or \"metered\"")]
@@ -2687,9 +2746,21 @@ fn merge_models(
                 runner: kind.as_str(),
             });
         }
+        let mode = match repo.mode.or(global.mode) {
+            None => RunnerMode::Process,
+            Some(value) => {
+                RunnerMode::parse(&value).ok_or(ConfigError::InvalidRunnerMode { value })?
+            }
+        };
+        if mode == RunnerMode::Server && !kind.has_server_mode() {
+            return Err(ConfigError::ServerModeUnsupported {
+                runner: kind.as_str(),
+            });
+        }
         Ok(RunnerModels {
             default_model: repo.default_model.or(global.default_model),
             usage_probe_model,
+            mode,
         })
     };
     Ok(ModelsConfig {
@@ -7811,6 +7882,52 @@ mod tests {
                 err,
                 ConfigError::UsageProbeModelUnsupported { runner: "opencode" }
             ),
+            "{err:?}"
+        );
+    }
+
+    // --- `[agent.<runner>] mode` (GitHub issue #194) ---
+
+    #[test]
+    fn runner_mode_defaults_to_process() {
+        let cfg = load_with("", None).expect("should load");
+        assert_eq!(
+            cfg.models.for_kind(AgentKind::Opencode).mode,
+            RunnerMode::Process
+        );
+        assert_eq!(
+            cfg.models.for_kind(AgentKind::Claude).mode,
+            RunnerMode::Process
+        );
+    }
+
+    #[test]
+    fn runner_mode_server_parses_and_repo_overrides_global() {
+        let cfg = load_with(
+            "[agent.opencode]\nmode = \"process\"\n",
+            Some("[agent.opencode]\nmode = \"server\"\n"),
+        )
+        .expect("should load");
+        assert_eq!(
+            cfg.models.for_kind(AgentKind::Opencode).mode,
+            RunnerMode::Server
+        );
+    }
+
+    #[test]
+    fn an_unknown_runner_mode_is_a_config_error() {
+        let err = load_with("[agent.opencode]\nmode = \"attach\"\n", None).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::InvalidRunnerMode { value } if value == "attach"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn server_mode_on_a_runner_without_one_is_a_config_error() {
+        let err = load_with("[agent.claude]\nmode = \"server\"\n", None).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ServerModeUnsupported { runner: "claude" }),
             "{err:?}"
         );
     }

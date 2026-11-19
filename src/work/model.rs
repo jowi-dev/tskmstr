@@ -222,6 +222,7 @@ mod tests {
             opencode: RunnerModels {
                 default_model: Some(model.to_string()),
                 usage_probe_model: None,
+                ..Default::default()
             },
             ..ModelsConfig::default()
         }
@@ -245,6 +246,7 @@ mod tests {
             claude: RunnerModels {
                 default_model: Some("haiku".to_string()),
                 usage_probe_model: None,
+                ..Default::default()
             },
             ..ModelsConfig::default()
         };
@@ -335,6 +337,7 @@ mod tests {
             claude: RunnerModels {
                 default_model: None,
                 usage_probe_model: Some("sonnet".to_string()),
+                ..Default::default()
             },
             ..ModelsConfig::default()
         };

@@ -6789,6 +6789,7 @@ mod tests {
             opencode: crate::config::RunnerModels {
                 default_model: Some("venice/glm-fallback".to_string()),
                 usage_probe_model: None,
+                ..Default::default()
             },
             ..crate::config::ModelsConfig::default()
         };
