@@ -617,6 +617,7 @@ mod tests {
                     error: "rate limited".to_string(),
                 },
             ],
+            auto_merges: Vec::new(),
         }
     }
 
@@ -824,6 +825,7 @@ mod tests {
                 notifier: &crate::work::notify::NoNotifier,
                 ci: None,
                 base_watch: None,
+                merge: None,
             };
             let lanes = [LaneChoice {
                 name: "backend".to_string(),
@@ -838,6 +840,7 @@ mod tests {
                 max_fix_rounds: 3,
                 stall_notify_mins: 30,
                 fix_failing_ci: false,
+                auto_merge: crate::config::AutoMerge::Off,
                 lanes: &lanes,
                 runners: &["claude"],
                 memory: &memory,

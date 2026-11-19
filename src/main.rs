@@ -504,6 +504,18 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             repo_dir,
             launcher: &ci_launcher,
         };
+        let merge_launcher = tskmstr::work::dispatch::CommandAutoMergeLauncher {
+            program: self.current_exe.clone(),
+            cwd: repo_dir.to_path_buf(),
+            log_dir: tskmstr::work::dispatch::auto_merge_log_dir(&self.home),
+            spawner: &tskmstr::work::detach::RealDetachSpawner,
+        };
+        let merge = tskmstr::work::auto_merge::SweepDeps {
+            store: self.store,
+            gh: &gh,
+            repo_dir,
+            launcher: &merge_launcher,
+        };
         let notifier = tskmstr::work::notify::DesktopNotifier::detect();
         let deps = tskmstr::work::dispatch::TickDeps {
             store: self.store,
@@ -520,6 +532,7 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
                 repo_dir,
                 bases: &bases,
             }),
+            merge: Some(&merge),
         };
         let cfg = tskmstr::work::dispatch::TickConfig {
             scope,
@@ -528,6 +541,7 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             max_fix_rounds: config.dispatch.max_fix_rounds,
             stall_notify_mins: config.dispatch.stall_notify_mins,
             fix_failing_ci: config.dispatch.fix_failing_ci,
+            auto_merge: config.dispatch.auto_merge,
             lanes: &lanes,
             runners: &runners,
             memory: &config.work.memory,
@@ -3222,6 +3236,18 @@ impl AutopilotTicker {
             repo_dir: &target.repo_root,
             launcher: &ci_launcher,
         };
+        let merge_launcher = dispatch::CommandAutoMergeLauncher {
+            program: launcher.program.clone(),
+            cwd: target.repo_root.clone(),
+            log_dir: dispatch::auto_merge_log_dir(&self.home),
+            spawner: &tskmstr::work::detach::RealDetachSpawner,
+        };
+        let merge = tskmstr::work::auto_merge::SweepDeps {
+            store: &store,
+            gh: &gh,
+            repo_dir: &target.repo_root,
+            launcher: &merge_launcher,
+        };
         let notifier = tskmstr::work::notify::DesktopNotifier::detect();
         let deps = dispatch::TickDeps {
             store: &store,
@@ -3238,6 +3264,7 @@ impl AutopilotTicker {
                 repo_dir: &target.repo_root,
                 bases: &bases,
             }),
+            merge: Some(&merge),
         };
         let cfg = dispatch::TickConfig {
             scope: &scope,
@@ -3246,6 +3273,7 @@ impl AutopilotTicker {
             max_fix_rounds: config.dispatch.max_fix_rounds,
             stall_notify_mins: config.dispatch.stall_notify_mins,
             fix_failing_ci: config.dispatch.fix_failing_ci,
+            auto_merge: config.dispatch.auto_merge,
             lanes: &lanes,
             runners: &runners,
             memory: &config.work.memory,
