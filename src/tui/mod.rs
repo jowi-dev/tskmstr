@@ -7,6 +7,7 @@ pub mod autopilot;
 pub mod event;
 pub mod keymap;
 pub mod launcher;
+pub mod merge_queue;
 pub mod overview_actions;
 pub mod theme;
 pub mod ui;

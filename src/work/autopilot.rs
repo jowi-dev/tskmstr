@@ -206,6 +206,9 @@ pub struct AutopilotStatus {
     /// The epic whose tickets the scope's ticks launch first (GitHub issue
     /// #237), or `None` when none is set.
     pub priority_epic: Option<String>,
+    /// The epic whose tickets the automerge sweep queues on its own
+    /// (GitHub issue #247), or `None` when none is set.
+    pub merge_epic: Option<String>,
 }
 
 impl AutopilotStatus {
@@ -272,6 +275,7 @@ pub fn load_status(
                 last_refusal: state.blocked.map(|b| b.detail),
                 last_launch_age_secs: state.last_launch_unix.map(|at| now - at),
                 priority_epic: store.autopilot_epic(scope)?,
+                merge_epic: store.merge_epic(scope)?,
             })
         })
         .collect()
@@ -444,6 +448,7 @@ mod tests {
                     blocked_age_secs: Some(90),
                     last_launch_age_secs: None,
                     priority_epic: None,
+                    merge_epic: None,
                 },
                 AutopilotStatus {
                     scope: "github:o/off".to_string(),
@@ -454,6 +459,7 @@ mod tests {
                     blocked_age_secs: None,
                     last_launch_age_secs: None,
                     priority_epic: None,
+                    merge_epic: None,
                 },
             ]
         );
@@ -518,6 +524,7 @@ mod tests {
             blocked_age_secs: Some(300),
             last_launch_age_secs: Some(720),
             priority_epic: None,
+            merge_epic: None,
         };
         assert_eq!(status.summary(None), "autopilot off");
 
@@ -551,6 +558,7 @@ mod tests {
             blocked_age_secs: None,
             last_launch_age_secs: None,
             priority_epic: Some("GH-176".to_string()),
+            merge_epic: None,
         };
         assert_eq!(status.summary(None), "autopilot off · epic GH-176");
 
@@ -566,10 +574,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
         store.set_autopilot_epic("s", Some("GH-176")).unwrap();
+        store.set_merge_epic("s", Some("GH-200")).unwrap();
 
         let status = load_status(&store, &["s".to_string(), "t".to_string()], 1, 0).unwrap();
 
         assert_eq!(status[0].priority_epic.as_deref(), Some("GH-176"));
+        assert_eq!(status[0].merge_epic.as_deref(), Some("GH-200"));
         assert_eq!(status[1].priority_epic, None);
+        assert_eq!(status[1].merge_epic, None);
     }
 }
