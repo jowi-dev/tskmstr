@@ -569,6 +569,14 @@ pub struct RawWorkConfig {
     /// works: it falls back to the runner's built-in walkthrough prompt and
     /// the rest of the model chain.
     pub walkthrough: Option<RawWalkthroughConfig>,
+    /// `[work.coordinator]` settings for the epic coordinator session
+    /// `tm work coordinator start` opens (GitHub issue #209). See
+    /// [`RawCoordinatorConfig`].
+    ///
+    /// When unset in both global and repo config, the coordinator still
+    /// starts: it falls back to the runner's built-in coordinator prompt and
+    /// the rest of the model chain.
+    pub coordinator: Option<RawCoordinatorConfig>,
     /// `[work.review_watch]` settings for the bugbot-follow-through watcher
     /// and cleanup session. See [`RawReviewWatchConfig`].
     pub review_watch: Option<RawReviewWatchConfig>,
@@ -794,6 +802,31 @@ pub struct RawWalkthroughConfig {
     /// [`RawMergeConfig::prompt_file`].
     pub prompt_file: Option<String>,
     /// Model the launched walkthrough session passes as `--model`. Same
+    /// precedence and fallback as [`RawAuditConfig::model`].
+    pub model: Option<String>,
+}
+
+/// Raw, partially-specified `[work.coordinator]` subsection as parsed
+/// directly from TOML (GitHub issue #209). Same shape as
+/// [`RawWalkthroughConfig`]: configures the interactive session that
+/// supervises an epic's lanes, dispatching through `tm`.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawCoordinatorConfig {
+    /// Prompt fed to the launched coordinator session. Defaults to the
+    /// runner's built-in coordinator prompt when unset. Supports `{epic}`
+    /// and `{children}` placeholders, substituted with the epic key and one
+    /// `KEY  STATUS  SUMMARY` line per child ticket.
+    pub prompt: Option<String>,
+    /// Path to a prompt file whose contents become the session's opening
+    /// prompt in place of [`RawCoordinatorConfig::prompt`], with the same
+    /// placeholders. Setting both `prompt` and `prompt_file` in the merged
+    /// section is a [`ConfigError::PromptSourceConflict`].
+    ///
+    /// A relative path is resolved at merge time against the defining repo
+    /// directory via [`resolve_repo_path`], matching
+    /// [`RawWalkthroughConfig::prompt_file`].
+    pub prompt_file: Option<String>,
+    /// Model the launched coordinator session passes as `--model`. Same
     /// precedence and fallback as [`RawAuditConfig::model`].
     pub model: Option<String>,
 }
@@ -1447,6 +1480,11 @@ pub struct WorkConfig {
     /// the model chain when the section is absent from both global and repo
     /// config.
     pub walkthrough: WalkthroughConfig,
+    /// Validated `[work.coordinator]` settings. See [`CoordinatorConfig`];
+    /// falls back to the runner's built-in coordinator prompt and the rest
+    /// of the model chain when the section is absent from both global and
+    /// repo config.
+    pub coordinator: CoordinatorConfig,
     /// Validated `[work.review_watch]` settings. See [`ReviewWatchConfig`].
     pub review_watch: ReviewWatchConfig,
     /// Validated `[work.auto_review]` settings. See [`AutoReviewConfig`].
@@ -1709,6 +1747,22 @@ pub struct WalkthroughConfig {
     /// See [`RawWalkthroughConfig::prompt_file`].
     pub prompt_file: Option<String>,
     /// See [`RawWalkthroughConfig::model`].
+    pub model: Option<String>,
+}
+
+/// Fully validated `[work.coordinator]` subsection (GitHub issue #209).
+///
+/// Every field is optional: the coordinator runs in the invoking repo's
+/// checkout, so there is no launch directory to require, and an unset
+/// prompt falls back to
+/// [`crate::agent::AgentRunner::default_coordinator_prompt_template`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoordinatorConfig {
+    /// See [`RawCoordinatorConfig::prompt`].
+    pub prompt: Option<String>,
+    /// See [`RawCoordinatorConfig::prompt_file`].
+    pub prompt_file: Option<String>,
+    /// See [`RawCoordinatorConfig::model`].
     pub model: Option<String>,
 }
 
@@ -3004,6 +3058,7 @@ fn merge_work(
     let merge = merge_merge_section(global.merge, repo.merge.clone(), repo_dir)?;
     let retro = merge_retro(global.retro, repo.retro.clone())?;
     let walkthrough = merge_walkthrough(global.walkthrough, repo.walkthrough.clone(), repo_dir)?;
+    let coordinator = merge_coordinator(global.coordinator, repo.coordinator.clone(), repo_dir)?;
     let manual = merge_manual(global.manual, repo.manual.clone(), repo_dir)?;
     let mut review_watch = merge_review_watch(global.review_watch, repo.review_watch, repo_dir)?;
     let auto_review = merge_auto_review(global.auto_review, repo.auto_review, repo_dir)?;
@@ -3075,6 +3130,7 @@ fn merge_work(
         merge,
         retro,
         walkthrough,
+        coordinator,
         review_watch,
         auto_review,
         manual,
@@ -3349,6 +3405,43 @@ fn merge_walkthrough(
     }
 
     Ok(WalkthroughConfig {
+        prompt,
+        prompt_file,
+        model: repo.model.or(global.model),
+    })
+}
+
+/// Merge a repo-local `[work.coordinator]` section on top of a global one,
+/// field by field, exactly like [`merge_walkthrough`] (GitHub issue #209).
+fn merge_coordinator(
+    global: Option<RawCoordinatorConfig>,
+    repo: Option<RawCoordinatorConfig>,
+    repo_dir: Option<&Path>,
+) -> Result<CoordinatorConfig, ConfigError> {
+    let global = global.unwrap_or_default();
+    let repo = repo.unwrap_or_default();
+
+    let (prompt_file, prompt_file_dir) = match repo.prompt_file {
+        Some(value) => (Some(value), repo_dir),
+        None => (global.prompt_file, None),
+    };
+    let prompt_file = match prompt_file {
+        Some(value) => Some(resolve_repo_path(
+            &value,
+            prompt_file_dir,
+            "work.coordinator.prompt_file",
+        )?),
+        None => None,
+    };
+
+    let prompt = repo.prompt.or(global.prompt);
+    if prompt.is_some() && prompt_file.is_some() {
+        return Err(ConfigError::PromptSourceConflict {
+            section: "work.coordinator",
+        });
+    }
+
+    Ok(CoordinatorConfig {
         prompt,
         prompt_file,
         model: repo.model.or(global.model),
@@ -6054,6 +6147,7 @@ mod tests {
             merge: None,
             retro: None,
             walkthrough: None,
+            coordinator: None,
             review_watch: None,
             auto_review: None,
             manual: None,
@@ -6078,6 +6172,7 @@ mod tests {
             merge: None,
             retro: None,
             walkthrough: None,
+            coordinator: None,
             review_watch: None,
             auto_review: None,
             manual: None,
@@ -6911,6 +7006,74 @@ mod tests {
             Some("walk me through {pr}".to_string())
         );
         assert_eq!(cfg.work.walkthrough.model, Some("sonnet".to_string()));
+    }
+
+    // --- `[work.coordinator]` (GitHub issue #209) ---
+
+    #[test]
+    fn merge_work_coordinator_absent_from_both_is_default() {
+        let cfg = merge_work(None, None, None).expect("should merge");
+        assert_eq!(cfg.coordinator, CoordinatorConfig::default());
+    }
+
+    #[test]
+    fn merge_work_repo_overrides_coordinator_field_by_field() {
+        let global = RawWorkConfig {
+            coordinator: Some(RawCoordinatorConfig {
+                prompt: Some("coordinate {epic}".to_string()),
+                prompt_file: None,
+                model: Some("opus".to_string()),
+            }),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            coordinator: Some(RawCoordinatorConfig {
+                model: Some("sonnet".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
+        assert_eq!(cfg.coordinator.model, Some("sonnet".to_string()));
+        assert_eq!(
+            cfg.coordinator.prompt,
+            Some("coordinate {epic}".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_work_coordinator_prompt_and_prompt_file_conflict() {
+        let repo = RawWorkConfig {
+            coordinator: Some(RawCoordinatorConfig {
+                prompt: Some("coordinate {epic}".to_string()),
+                prompt_file: Some("/abs/coordinator.md".to_string()),
+                model: None,
+            }),
+            ..Default::default()
+        };
+        let err = merge_work(None, Some(repo), None).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::PromptSourceConflict {
+                section: "work.coordinator"
+            }
+        ));
+    }
+
+    #[test]
+    fn merge_work_coordinator_relative_prompt_file_resolves_against_repo_dir() {
+        let repo = RawWorkConfig {
+            coordinator: Some(RawCoordinatorConfig {
+                prompt_file: Some(".tskmstr/prompts/coordinator.md".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(None, Some(repo), Some(Path::new("/repo"))).expect("should merge");
+        assert_eq!(
+            cfg.coordinator.prompt_file,
+            Some("/repo/.tskmstr/prompts/coordinator.md".to_string())
+        );
     }
 
     // --- `[work.merge]` (GitHub issue #55) ---
