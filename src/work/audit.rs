@@ -6,7 +6,10 @@
 //! [`TmuxOps::new_session_with_command`], attached on demand (the board's
 //! job, not this module's). [`launch_audit`] is the whole launch sequence:
 //! refuse to double-launch, pre-register a run row, then start the tmux
-//! session running `claude` with the audit prompt.
+//! session running `claude` with the audit prompt. The session is rooted in
+//! the ticket's lane worktree when one can be resolved, so the ticket's tmux
+//! session reports the ticket's branch (GitHub issue #252); see
+//! [`resolve_audit_placement`].
 //!
 //! **Pre-registration and adoption.** [`launch_audit`] creates the run row
 //! *before* `claude` has even started, with `pid = None` — there is no
@@ -30,9 +33,11 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::agent::AgentRunner;
-use crate::config::{AuditConfig, BackendIdentity};
+use crate::config::{AuditConfig, BackendIdentity, LaneConfig};
 use crate::runs::{RunStore, RunStoreError, StartRun};
+use crate::work::git::GitOps;
 use crate::work::naming::{expand_tilde, ticket_session_name};
+use crate::work::run::{LaneWorktree, RunLaneError, lane_base, lane_worktree};
 use crate::work::tmux::{
     TmuxError, TmuxOps, has_live_window, session_window_names, unique_window_name,
 };
@@ -97,6 +102,95 @@ pub enum AuditLaunchError {
     /// Memory admission refused the session (GitHub issue #149).
     #[error(transparent)]
     Admission(#[from] crate::work::admission::AdmissionError),
+
+    /// The ticket's lane worktree could not be provisioned (GitHub issue
+    /// #252). Raised before [`RunStore::start_run`], so no run row is left
+    /// behind.
+    #[error("failed to provision the ticket worktree {}: {source}", path.display())]
+    Provision {
+        /// The worktree path that was being provisioned.
+        path: std::path::PathBuf,
+        /// What went wrong: resolving the base, or `git worktree add`.
+        #[source]
+        source: Box<RunLaneError>,
+    },
+}
+
+/// What [`launch_audit`] needs to root an audit in the ticket's lane
+/// worktree instead of `[work.audit].dir` (GitHub issue #252).
+pub struct AuditWorktrees<'a> {
+    /// Provisions the worktree when it is not on disk yet.
+    pub git: &'a dyn GitOps,
+    /// `[work] worktree_root`, already `~`-expanded (see
+    /// [`crate::work::run::resolve_worktree_root`]).
+    pub worktree_root: std::path::PathBuf,
+    /// The lanes compatible with the invoking repo's backend (see
+    /// [`crate::config::compatible_lane_names`]), in config order.
+    pub lanes: Vec<(String, LaneConfig)>,
+}
+
+/// Where an audit for one ticket runs: see [`resolve_audit_placement`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditPlacement {
+    /// The ticket's lane worktree, the same one `tm work run <lane> <key>`
+    /// uses.
+    Worktree {
+        /// The lane whose worktree this is.
+        lane: String,
+        /// The lane's worktree for the ticket.
+        worktree: LaneWorktree,
+    },
+    /// `[work.audit].dir`, because no single lane worktree could be
+    /// resolved; `reason` says why, for the launch status.
+    Checkout {
+        /// Why the audit is not running in a ticket worktree.
+        reason: String,
+    },
+}
+
+/// Picks where `key`'s audit runs. The lane worktree is used when every lane
+/// in `lanes` puts the ticket in the same worktree (one lane, or several
+/// sharing a repo); the first lane then supplies the base. With no lanes,
+/// or lanes that disagree, there is no single worktree a later lane run is
+/// sure to reuse, so the audit falls back to the checkout and says why.
+pub fn resolve_audit_placement(
+    worktree_root: &Path,
+    lanes: &[(String, LaneConfig)],
+    key: &str,
+) -> AuditPlacement {
+    let Some((first_lane, first_config)) = lanes.first() else {
+        return AuditPlacement::Checkout {
+            reason: "no lane is configured for this repo".to_string(),
+        };
+    };
+    let worktree = match lane_worktree(worktree_root, first_lane, first_config, Some(key)) {
+        Ok(worktree) => worktree,
+        Err(err) => {
+            return AuditPlacement::Checkout {
+                reason: err.to_string(),
+            };
+        }
+    };
+    let disagreeing: Vec<&str> = lanes[1..]
+        .iter()
+        .filter(|(name, config)| {
+            lane_worktree(worktree_root, name, config, Some(key))
+                .map_or(true, |other| other.wt_path != worktree.wt_path)
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !disagreeing.is_empty() {
+        return AuditPlacement::Checkout {
+            reason: format!(
+                "lanes {first_lane}, {} keep {key} in different worktrees",
+                disagreeing.join(", ")
+            ),
+        };
+    }
+    AuditPlacement::Worktree {
+        lane: first_lane.clone(),
+        worktree,
+    }
 }
 
 /// Successful outcome of [`launch_audit`].
@@ -115,6 +209,10 @@ pub struct LaunchOutcome {
     /// Admission's warning for a launch that went ahead anyway (over a
     /// usage ceiling, or usage unknown), for the board's status line.
     pub warning: Option<String>,
+    /// Why the audit runs in `[work.audit].dir` rather than the ticket's
+    /// lane worktree, for the board's status line; `None` when it runs in
+    /// the worktree (see [`resolve_audit_placement`]).
+    pub fallback: Option<String>,
 }
 
 /// Substitutes `{key}` in `template` with `key`, producing the prompt text
@@ -139,7 +237,7 @@ pub fn audit_prompt(template: &str, key: &str) -> String {
 ///    run, so a bad path leaves no orphaned run row (same posture as
 ///    [`crate::work::run::prepare_run_lane`]'s prompt preflight), pre-
 ///    registers a run (`kind = "audit"`, `lane = "audit"`, `pid = None`,
-///    `agent`/`repo` the runner's name and the audit directory's name via
+///    `agent`/`repo` the runner's name and the lane's repo, or the audit directory's name via
 ///    [`crate::work::run::dir_repo_key`]; see the module docs) and starts `claude <prompt>` (with `--model` when
 ///    `audit_cfg.model` is set — see
 ///    [`AgentRunner::interactive_shell_command`]) in
@@ -149,6 +247,15 @@ pub fn audit_prompt(template: &str, key: &str) -> String {
 ///    tmux-hosted action, and the window appended to it otherwise; the window
 ///    takes a [`unique_window_name`] suffix if a dead predecessor still holds
 ///    the plain name.
+///
+/// **Where it runs (GitHub issue #252).** The session's directory, and the
+/// run row's `worktree`, is the ticket's lane worktree when
+/// [`resolve_audit_placement`] finds one in `worktrees`: provisioned after
+/// admission and before the run row if it is not on disk yet (a local
+/// branch only, nothing pushed), reused otherwise, so a later lane run for
+/// the ticket finds it and skips provisioning. Otherwise the session runs in
+/// `audit_cfg.dir` and [`LaunchOutcome::fallback`] says why. A failed
+/// provisioning is [`AuditLaunchError::Provision`] with no run row.
 ///
 /// `home` resolves a leading `~` in `audit_cfg.dir` via
 /// [`crate::work::naming::expand_tilde`], matching every other `~`-expanding
@@ -173,6 +280,7 @@ pub fn launch_audit(
     admission: &crate::work::admission::AdmissionDeps<'_>,
     store: &RunStore,
     tmux: &dyn TmuxOps,
+    worktrees: &AuditWorktrees<'_>,
     audit_cfg: &AuditConfig,
     home: &Path,
     identity: &BackendIdentity,
@@ -184,8 +292,7 @@ pub fn launch_audit(
         .dir
         .as_deref()
         .ok_or(AuditLaunchError::NotConfigured)?;
-    let dir = expand_tilde(raw_dir, home);
-    let dir_str = dir.to_string_lossy().into_owned();
+    let audit_dir = expand_tilde(raw_dir, home);
 
     let session_name = ticket_session_name(&identity.session_slug(), key);
     // One `list_windows` snapshot answers both questions — "is an audit
@@ -208,10 +315,22 @@ pub fn launch_audit(
         .map(|raw| crate::work::prompt::read_prompt_file(raw, home, "[work.audit].prompt_file"))
         .transpose()?;
 
+    let placement = resolve_audit_placement(&worktrees.worktree_root, &worktrees.lanes, key);
+    let (dir, repo, fallback) = match &placement {
+        AuditPlacement::Worktree { worktree, .. } => {
+            (worktree.wt_path.clone(), worktree.repo.clone(), None)
+        }
+        AuditPlacement::Checkout { reason } => (
+            audit_dir.clone(),
+            crate::work::run::dir_repo_key(&audit_dir),
+            Some(reason.clone()),
+        ),
+    };
+    let dir_str = dir.to_string_lossy().into_owned();
+
     // Admission (GitHub issue #149) before the row, so a refusal leaves
     // none. A board audit is human-started: over the memory budget it
     // refuses, over a usage ceiling it warns and launches.
-    let repo = crate::work::run::dir_repo_key(&dir);
     let mut warning = Vec::new();
     let admitted = admission.admit(
         store,
@@ -225,6 +344,10 @@ pub fn launch_audit(
         &mut warning,
     )?;
 
+    if let AuditPlacement::Worktree { lane, worktree } = &placement {
+        provision_lane_worktree(worktrees, lane, worktree)?;
+    }
+
     let run_id = store.start_run(&StartRun {
         ticket: key.to_string(),
         scope: identity.scope(),
@@ -236,7 +359,7 @@ pub fn launch_audit(
         log_path: None,
     })?;
     // Every agent row carries its estimate key (GitHub issue #156): the
-    // audit directory's name stands in for a lane's repo.
+    // lane's repo, or the audit directory's name standing in for one.
     store.update_agent_repo(run_id, runner.name(), &repo)?;
 
     let template = prompt_file_contents
@@ -270,6 +393,41 @@ pub fn launch_audit(
         session_name,
         window_name,
         warning: crate::work::admission::warning_text(&warning),
+        fallback,
+    })
+}
+
+/// Creates `worktree` the way `tm work run`'s step 4 does when it is not on
+/// disk yet: from [`lane_base`], checking out the [`LaneWorktree::wt_name`]
+/// branch locally. Nothing is pushed. An existing worktree is reused as-is,
+/// and a lane run launched afterwards sees it exists and skips provisioning.
+fn provision_lane_worktree(
+    worktrees: &AuditWorktrees<'_>,
+    lane: &str,
+    worktree: &LaneWorktree,
+) -> Result<(), AuditLaunchError> {
+    if worktree.wt_path.exists() {
+        return Ok(());
+    }
+    let provision = || -> Result<(), RunLaneError> {
+        let lane_config = worktrees
+            .lanes
+            .iter()
+            .find(|(name, _)| name == lane)
+            .map(|(_, config)| config)
+            .ok_or_else(|| RunLaneError::UnknownLane(lane.to_string()))?;
+        let base = lane_base(worktrees.git, lane, lane_config)?;
+        worktrees.git.provision_worktree(
+            &worktree.repo_root,
+            &worktree.wt_path,
+            &worktree.wt_name,
+            Some(&base),
+        )?;
+        Ok(())
+    };
+    provision().map_err(|source| AuditLaunchError::Provision {
+        path: worktree.wt_path.clone(),
+        source: Box::new(source),
     })
 }
 
@@ -314,6 +472,210 @@ mod tests {
         })
     }
 
+    /// No compatible lanes: every audit falls back to `[work.audit].dir`.
+    fn no_lanes() -> AuditWorktrees<'static> {
+        AuditWorktrees {
+            git: Box::leak(Box::new(crate::work::git::FakeGitOps::new())),
+            worktree_root: PathBuf::from("/Users/jowi/Worktrees"),
+            lanes: Vec::new(),
+        }
+    }
+
+    fn lane(repo: &str) -> crate::config::LaneConfig {
+        crate::config::LaneConfig {
+            repo: repo.to_string(),
+            prompt_file: None,
+            base_branch: Some("main".to_string()),
+            model: None,
+            max_turns: None,
+            permission_mode: None,
+            subagent: None,
+        }
+    }
+
+    fn launch_with_lanes(
+        store: &RunStore,
+        tmux: &FakeTmuxOps,
+        worktrees: &AuditWorktrees<'_>,
+    ) -> Result<LaunchOutcome, AuditLaunchError> {
+        launch_audit(
+            &crate::work::admission::AdmissionDeps::off(),
+            store,
+            tmux,
+            worktrees,
+            &configured("~/Projects/axiom"),
+            Path::new("/Users/jowi"),
+            &test_identity(),
+            &ClaudeRunner,
+            crate::work::model::ModelDefaults::none(),
+            "PROJ-1",
+        )
+    }
+
+    /// GitHub issue #252: an audit on a ticket with a resolvable lane
+    /// provisions that lane's worktree and roots the whole ticket session
+    /// there, so the session's directory reports the ticket's branch.
+    #[test]
+    fn launch_audit_provisions_the_lane_worktree_and_runs_there() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let tmux = FakeTmuxOps::new();
+        let git = crate::work::git::FakeGitOps::new();
+        let root = tmp.path().join("Worktrees");
+        let worktrees = AuditWorktrees {
+            git: &git,
+            worktree_root: root.clone(),
+            lanes: vec![("axiom".to_string(), lane("/Users/jowi/Projects/axiom"))],
+        };
+
+        let outcome = launch_with_lanes(&store, &tmux, &worktrees).unwrap();
+
+        let wt_path = root.join("axiom/proj-1");
+        let wt = wt_path.to_string_lossy().into_owned();
+        assert_eq!(
+            git.provision_worktree_calls(),
+            vec![crate::work::git::ProvisionWorktreeCall {
+                repo_dir: PathBuf::from("/Users/jowi/Projects/axiom"),
+                wt_path: wt_path.clone(),
+                branch: "proj-1".to_string(),
+                from_base: Some("main".to_string()),
+            }]
+        );
+        assert_eq!(outcome.fallback, None);
+        let run = store.run_by_id(outcome.run_id).unwrap().unwrap();
+        assert_eq!(run.worktree, wt);
+        assert_eq!(run.lane, "audit");
+        assert_eq!(run.repo.as_deref(), Some("axiom"));
+        let calls = tmux.calls();
+        assert!(
+            matches!(&calls[1], TmuxCall::NewSessionWithCommand { dir, .. } if *dir == wt),
+            "{calls:?}"
+        );
+        assert!(
+            matches!(&calls[2], TmuxCall::NewWindow { window_name, dir, .. }
+                if window_name == SHELL_WINDOW_NAME && *dir == wt),
+            "{calls:?}"
+        );
+    }
+
+    /// A worktree already on disk (an earlier audit, or a lane run) is
+    /// reused as-is, never provisioned twice.
+    #[test]
+    fn launch_audit_reuses_an_existing_lane_worktree() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let tmux = FakeTmuxOps::new();
+        let git = crate::work::git::FakeGitOps::new();
+        let root = tmp.path().join("Worktrees");
+        let wt_path = root.join("axiom/proj-1");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        let worktrees = AuditWorktrees {
+            git: &git,
+            worktree_root: root,
+            lanes: vec![("axiom".to_string(), lane("/Users/jowi/Projects/axiom"))],
+        };
+
+        let outcome = launch_with_lanes(&store, &tmux, &worktrees).unwrap();
+
+        assert!(git.provision_worktree_calls().is_empty());
+        let run = store.run_by_id(outcome.run_id).unwrap().unwrap();
+        assert_eq!(run.worktree, wt_path.to_string_lossy());
+    }
+
+    #[test]
+    fn launch_audit_without_a_lane_falls_back_to_the_audit_dir_and_says_why() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let tmux = FakeTmuxOps::new();
+
+        let outcome = launch_with_lanes(&store, &tmux, &no_lanes()).unwrap();
+
+        let reason = outcome.fallback.expect("a fallback reason");
+        assert!(reason.contains("no lane"), "{reason}");
+        let run = store.run_by_id(outcome.run_id).unwrap().unwrap();
+        assert_eq!(run.worktree, "/Users/jowi/Projects/axiom");
+    }
+
+    /// Two compatible lanes that would put the ticket in different
+    /// worktrees leave no single answer, so the audit stays in the checkout
+    /// rather than guessing which lane the operator will launch.
+    #[test]
+    fn launch_audit_falls_back_when_lanes_disagree_on_the_worktree() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let tmux = FakeTmuxOps::new();
+        let git = crate::work::git::FakeGitOps::new();
+        let worktrees = AuditWorktrees {
+            git: &git,
+            worktree_root: tmp.path().join("Worktrees"),
+            lanes: vec![
+                ("axiom".to_string(), lane("/Users/jowi/Projects/axiom")),
+                ("other".to_string(), lane("/Users/jowi/Projects/other")),
+            ],
+        };
+
+        let outcome = launch_with_lanes(&store, &tmux, &worktrees).unwrap();
+
+        let reason = outcome.fallback.expect("a fallback reason");
+        assert!(
+            reason.contains("axiom") && reason.contains("other"),
+            "{reason}"
+        );
+        assert!(git.provision_worktree_calls().is_empty());
+    }
+
+    /// Lanes sharing a repo agree on the worktree, so the first one wins.
+    #[test]
+    fn launch_audit_provisions_when_every_lane_agrees_on_the_worktree() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let tmux = FakeTmuxOps::new();
+        let git = crate::work::git::FakeGitOps::new();
+        let worktrees = AuditWorktrees {
+            git: &git,
+            worktree_root: tmp.path().join("Worktrees"),
+            lanes: vec![
+                ("axiom".to_string(), lane("/Users/jowi/Projects/axiom")),
+                ("partner".to_string(), lane("/Users/jowi/Projects/axiom")),
+            ],
+        };
+
+        let outcome = launch_with_lanes(&store, &tmux, &worktrees).unwrap();
+
+        assert_eq!(outcome.fallback, None);
+        assert_eq!(git.provision_worktree_calls().len(), 1);
+    }
+
+    #[test]
+    fn launch_audit_errors_and_creates_no_run_when_provisioning_fails() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let tmux = FakeTmuxOps::new();
+        let git = crate::work::git::FakeGitOps::new().with_provision_worktree_result(Err(
+            crate::work::git::GitError::Command {
+                command: "git worktree add".to_string(),
+                exit_code: Some(128),
+                stderr: "fatal: boom".to_string(),
+            },
+        ));
+        let worktrees = AuditWorktrees {
+            git: &git,
+            worktree_root: tmp.path().join("Worktrees"),
+            lanes: vec![("axiom".to_string(), lane("/Users/jowi/Projects/axiom"))],
+        };
+
+        let err = launch_with_lanes(&store, &tmux, &worktrees).unwrap_err();
+
+        assert!(matches!(err, AuditLaunchError::Provision { .. }), "{err:?}");
+        assert!(err.to_string().contains("proj-1"), "{err}");
+        assert!(store.list_runs().unwrap().is_empty());
+        assert!(
+            !tmux
+                .calls()
+                .iter()
+                .any(|c| matches!(c, TmuxCall::NewSessionWithCommand { .. })),
+        );
+    }
     #[test]
     fn audit_prompt_defaults_to_ticket_audit_template() {
         assert_eq!(
@@ -342,6 +704,7 @@ mod tests {
             &crate::work::admission::AdmissionDeps::with_budget(1),
             &store,
             &tmux,
+            &no_lanes(),
             &audit_cfg,
             &home,
             &test_identity(),
@@ -377,6 +740,7 @@ mod tests {
             &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
+            &no_lanes(),
             &audit_cfg,
             &home,
             &test_identity(),
@@ -439,6 +803,7 @@ mod tests {
             &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
+            &no_lanes(),
             &audit_cfg,
             &home,
             &test_identity(),
@@ -478,6 +843,7 @@ mod tests {
             &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
+            &no_lanes(),
             &audit_cfg,
             &home,
             &test_identity(),
@@ -518,6 +884,7 @@ mod tests {
             &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
+            &no_lanes(),
             &audit_cfg,
             &home,
             &test_identity(),
@@ -557,6 +924,7 @@ mod tests {
             &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
+            &no_lanes(),
             &audit_cfg,
             &home,
             &test_identity(),
@@ -582,6 +950,7 @@ mod tests {
             &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
+            &no_lanes(),
             &audit_cfg,
             &home,
             &test_identity(),
@@ -617,6 +986,7 @@ mod tests {
             &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
+            &no_lanes(),
             &audit_cfg,
             &home,
             &test_identity(),
@@ -649,6 +1019,7 @@ mod tests {
             &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
+            &no_lanes(),
             &audit_cfg,
             &home,
             &test_identity(),
@@ -689,6 +1060,7 @@ mod tests {
                 &crate::work::admission::AdmissionDeps::off(),
                 &store,
                 &tmux,
+                &no_lanes(),
                 &audit_cfg,
                 Path::new("/Users/jowi"),
                 &test_identity(),
@@ -727,6 +1099,7 @@ mod tests {
             &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
+            &no_lanes(),
             &audit_cfg,
             &home,
             &test_identity(),
@@ -761,6 +1134,7 @@ mod tests {
             &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
+            &no_lanes(),
             &audit_cfg,
             &home,
             &test_identity(),

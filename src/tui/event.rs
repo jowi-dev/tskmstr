@@ -260,6 +260,16 @@ pub struct TuiDeps {
     /// construction. See GitHub issue #5 phase 2:
     /// `docs/plans/issue-5-lane-backend-routing.md`.
     pub hidden_lane_count: usize,
+    /// The `lane_names` lanes' configs, in the same order, so an audit can
+    /// root itself in the ticket's lane worktree (GitHub issue #252; see
+    /// [`crate::work::audit::resolve_audit_placement`]).
+    pub audit_lanes: Vec<(String, crate::config::LaneConfig)>,
+    /// `[work] worktree_root`, `~`-expanded, where those lane worktrees live.
+    pub worktree_root: std::path::PathBuf,
+    /// `git` operations an audit launch uses to provision the ticket's lane
+    /// worktree. Local-only (`git worktree add`, `git rev-parse`), so it
+    /// runs on the event loop rather than through [`NetDeps`].
+    pub git: Box<dyn crate::work::git::GitOps>,
     /// Whether `audit.dir` above was already redirected from
     /// `[work.audit].dir`'s configured value to the current repo (`cwd`)
     /// because the configured dir's resolved backend identity didn't match
@@ -2466,10 +2476,16 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         return vec![Msg::AuditActionResult("runs db unavailable".to_string())];
     };
 
+    let worktrees = crate::work::audit::AuditWorktrees {
+        git: deps.git.as_ref(),
+        worktree_root: deps.worktree_root.clone(),
+        lanes: deps.audit_lanes.clone(),
+    };
     let message = match crate::work::audit::launch_audit(
         &deps.admission.deps(),
         store,
         deps.tmux.as_ref(),
+        &worktrees,
         &deps.audit,
         &deps.home,
         &deps.backend_identity,
@@ -2477,12 +2493,24 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         model_defaults(deps),
         key,
     ) {
-        Ok(outcome) if deps.audit_dir_fallback => with_warning(
+        Ok(crate::work::audit::LaunchOutcome {
+            fallback: Some(reason),
+            warning,
+            ..
+        }) if deps.audit_dir_fallback => with_warning(
             format!(
                 "launched audit for {key} in the current repo (configured audit dir is \
-                 backend-incompatible) -- press a to attach"
+                 backend-incompatible; {reason}) -- press a to attach"
             ),
-            outcome.warning,
+            warning,
+        ),
+        Ok(crate::work::audit::LaunchOutcome {
+            fallback: Some(reason),
+            warning,
+            ..
+        }) => with_warning(
+            format!("launched audit for {key} in [work.audit].dir ({reason}) -- press a to attach"),
+            warning,
         ),
         Ok(outcome) => with_warning(
             format!("launched audit for {key} -- press a to attach"),
@@ -3304,6 +3332,9 @@ mod tests {
             launcher: Box::new(crate::tui::launcher::FakeLaneLauncher::new()),
             lane_names: Vec::new(),
             hidden_lane_count: 0,
+            audit_lanes: Vec::new(),
+            worktree_root: std::path::PathBuf::from("/home/test/Worktrees"),
+            git: Box::new(crate::work::git::FakeGitOps::new()),
             audit_dir_fallback: false,
             create_dir_fallback: false,
             backend_identity: crate::config::BackendIdentity::Jira {
@@ -6373,6 +6404,46 @@ mod tests {
             prompt_file: None,
             model: None,
         };
+
+        let msgs = launch_audit_cmd(&deps, "PROJ-1");
+        assert_eq!(
+            msgs,
+            vec![Msg::AuditActionResult(
+                "launched audit for PROJ-1 in [work.audit].dir (no lane is configured for this \
+                 repo) -- press a to attach"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// GitHub issue #252: with a lane to resolve, the audit runs in the
+    /// ticket's worktree and the status line has no fallback note.
+    #[test]
+    fn launch_audit_cmd_in_the_lane_worktree_reports_plain_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+
+        let mut deps = deps();
+        deps.store = Some(store);
+        deps.audit = crate::config::AuditConfig {
+            dir: Some("/repo/axiom".to_string()),
+            prompt: None,
+            prompt_file: None,
+            model: None,
+        };
+        deps.worktree_root = dir.path().join("Worktrees");
+        deps.audit_lanes = vec![(
+            "axiom".to_string(),
+            crate::config::LaneConfig {
+                repo: "/repo/axiom".to_string(),
+                prompt_file: None,
+                base_branch: Some("main".to_string()),
+                model: None,
+                max_turns: None,
+                permission_mode: None,
+                subagent: None,
+            },
+        )];
 
         let msgs = launch_audit_cmd(&deps, "PROJ-1");
         assert_eq!(

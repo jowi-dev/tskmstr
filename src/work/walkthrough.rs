@@ -275,6 +275,7 @@ pub fn launch_walkthrough(
         session_name,
         window_name,
         warning: crate::work::admission::warning_text(&warning),
+        fallback: None,
     })
 }
 
