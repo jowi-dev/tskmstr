@@ -169,12 +169,13 @@ pub fn collect(
 /// each repo's own `.tskmstr.toml`. Scopes come out in order of their
 /// newest lane run, and each list newest first and deduplicated, so a
 /// caller can resolve a project's repo root from its first worktree still
-/// on disk. Legacy unscoped rows (`""`) and non-lane runs are skipped.
+/// on disk. Unscoped rows ([`crate::runs::is_unscoped`]) and non-lane runs
+/// are skipped.
 pub fn project_worktrees(runs: &[Run]) -> Vec<Vec<String>> {
     let mut scopes: Vec<(&str, Vec<String>)> = Vec::new();
     for run in runs
         .iter()
-        .filter(|run| run.kind == "lane" && !run.scope.is_empty())
+        .filter(|run| run.kind == "lane" && !crate::runs::is_unscoped(&run.scope))
     {
         let index = match scopes.iter().position(|(scope, _)| *scope == run.scope) {
             Some(index) => index,
@@ -544,7 +545,7 @@ mod tests {
         start("GH-3", "github:a/one", "/wt/one/gh-3", "lane");
         start("GH-3", "github:a/one", "/wt/one/gh-3", "lane");
         start("GH-4", "github:a/one", "/wt/one/audit", "audit");
-        start("GH-5", "", "/wt/legacy", "lane");
+        start("GH-5", crate::runs::LEGACY_UNSCOPED, "/wt/legacy", "lane");
         // Same-second starts tie on started_at; ids break the tie.
         let runs = store.all_runs().unwrap();
 

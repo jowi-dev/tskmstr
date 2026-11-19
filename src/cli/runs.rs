@@ -5074,7 +5074,7 @@ mod tests {
 
         register(
             &store,
-            None,
+            Some(crate::runs::TEST_SCOPE),
             markers_dir.path(),
             &env,
             "bugbot-cleanup",
@@ -5093,7 +5093,7 @@ mod tests {
 
         register(
             &store,
-            None,
+            Some(crate::runs::TEST_SCOPE),
             markers_dir.path(),
             &env,
             "bugbot-cleanup",
@@ -5135,7 +5135,7 @@ mod tests {
 
         register(
             &store,
-            None,
+            Some(crate::runs::TEST_SCOPE),
             markers_dir.path(),
             &env,
             "bugbot-cleanup",

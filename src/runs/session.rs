@@ -405,6 +405,9 @@ fn audit_claim(
 /// Returns:
 /// - `Ok(None)` — no-op: `env.session_id` is absent, or `env.lane_run_id` is
 ///   present (a lane run already owns telemetry).
+/// - `Ok(None)` — `scope` is `None` (no loadable config) and no existing
+///   run could be reused or adopted: a fresh run needs a scope, so nothing
+///   is recorded and no marker is written (GitHub issue #263).
 /// - `Ok(None)` — `kind` is `audit` and `ticket` is not this session's to
 ///   register: `env.session_run_id` names an audit run for another ticket,
 ///   the session already has audit runs only for other tickets (a context
@@ -527,6 +530,12 @@ pub fn register_session(
         )?;
     }
 
+    // No config means no scope, and a row without one would belong to no
+    // project (GitHub issue #263): record nothing rather than guess.
+    let Some(scope) = scope else {
+        return Ok(None);
+    };
+
     std::fs::create_dir_all(dir).map_err(|source| SessionError::CreateDir {
         path: dir.to_path_buf(),
         source,
@@ -534,10 +543,7 @@ pub fn register_session(
 
     let new_id = store.start_run(&StartRun {
         ticket: ticket.to_string(),
-        // A fresh session-started row is scoped like any other run; `None`
-        // (no loadable config) degrades to a legacy-unscoped row rather
-        // than refusing to register.
-        scope: scope.unwrap_or_default().to_string(),
+        scope: scope.to_string(),
         lane: kind.to_string(),
         worktree: env.cwd.display().to_string(),
         branch: None,
@@ -769,8 +775,15 @@ mod tests {
             cwd: PathBuf::from("/tmp/wt"),
         };
 
-        let result = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .expect("should not error");
+        let result = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .expect("should not error");
 
         assert_eq!(result, None);
         assert!(store.list_runs().unwrap().is_empty());
@@ -784,8 +797,15 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.lane_run_id = Some("77".to_string());
 
-        let result = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .expect("should not error");
+        let result = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .expect("should not error");
 
         assert_eq!(result, None);
         assert!(store.list_runs().unwrap().is_empty());
@@ -798,9 +818,16 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .expect("should not error")
-            .expect("expected a new run id");
+        let id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .expect("should not error")
+        .expect("expected a new run id");
 
         let run = store.run_by_id(id).unwrap().expect("expected a run row");
         assert_eq!(run.ticket, "PROJ-1");
@@ -815,6 +842,29 @@ mod tests {
         assert!(marker.exists());
         let contents = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(contents, id.to_string());
+    }
+
+    /// GitHub issue #263: with no config there is no scope, and a row
+    /// without one would belong to no project, so nothing is recorded.
+    #[test]
+    fn register_session_without_a_scope_records_nothing() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+
+        let id = register_session(
+            &store,
+            None,
+            markers_dir.path(),
+            &env_with_session("sess-1"),
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap();
+
+        assert_eq!(id, None);
+        assert!(store.list_runs().unwrap().is_empty());
+        assert!(!markers_dir.path().join("sess-1").exists());
     }
 
     // --- adoption of a pre-registered (board-launched) run ---
@@ -841,9 +891,16 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .expect("should not error")
-            .expect("expected the adopted run id");
+        let id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .expect("should not error")
+        .expect("expected the adopted run id");
 
         assert_eq!(id, pre_id);
         assert_eq!(store.list_runs().unwrap().len(), 1, "no new run created");
@@ -888,9 +945,16 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        let id = register_session(&store, None, markers_dir.path(), &env, "lane", "PROJ-1")
-            .unwrap()
-            .expect("expected the adopted run id");
+        let id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "lane",
+            "PROJ-1",
+        )
+        .unwrap()
+        .expect("expected the adopted run id");
 
         assert_eq!(id, pre_id);
         assert_eq!(store.list_runs().unwrap().len(), 1, "no new run created");
@@ -924,9 +988,16 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        let id = register_session(&store, None, markers_dir.path(), &env, "create", "GH-1")
-            .unwrap()
-            .expect("expected the adopted run id");
+        let id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "create",
+            "GH-1",
+        )
+        .unwrap()
+        .expect("expected the adopted run id");
 
         assert_eq!(id, pre_id);
         let run = store.run_by_id(pre_id).unwrap().unwrap();
@@ -948,12 +1019,26 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        let first = register_session(&store, None, markers_dir.path(), &env, "create", "GH-1")
-            .unwrap()
-            .unwrap();
-        let second = register_session(&store, None, markers_dir.path(), &env, "create", "GH-2")
-            .unwrap()
-            .unwrap();
+        let first = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "create",
+            "GH-1",
+        )
+        .unwrap()
+        .unwrap();
+        let second = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "create",
+            "GH-2",
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(first, pre_id);
         assert_eq!(second, pre_id);
@@ -970,12 +1055,26 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let first = register_session(&store, None, markers_dir.path(), &env, "create", "GH-1")
-            .unwrap()
-            .unwrap();
-        let second = register_session(&store, None, markers_dir.path(), &env, "create", "GH-2")
-            .unwrap()
-            .unwrap();
+        let first = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "create",
+            "GH-1",
+        )
+        .unwrap()
+        .unwrap();
+        let second = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "create",
+            "GH-2",
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(first, second);
         assert_eq!(store.list_runs().unwrap().len(), 1);
@@ -991,9 +1090,16 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "GH-1")
-            .unwrap()
-            .unwrap();
+        let id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "GH-1",
+        )
+        .unwrap()
+        .unwrap();
 
         assert_ne!(id, pre_id);
         let pre = store.run_by_id(pre_id).unwrap().unwrap();
@@ -1023,9 +1129,16 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .expect("should fall through to a fresh run");
+        let id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .expect("should fall through to a fresh run");
 
         assert_ne!(id, pre_id, "must not adopt a run of the wrong kind");
         assert_eq!(
@@ -1060,9 +1173,16 @@ mod tests {
 
         // Non-audit kinds only; an audit session reading another ticket is a
         // context read (see the board-launched audit tests below).
-        let id = register_session(&store, None, markers_dir.path(), &env, "create", "PROJ-1")
-            .unwrap()
-            .expect("should fall through to a fresh run");
+        let id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "create",
+            "PROJ-1",
+        )
+        .unwrap()
+        .expect("should fall through to a fresh run");
 
         assert_ne!(id, pre_id, "must not adopt a run for a different ticket");
         assert_eq!(store.run_by_id(id).unwrap().unwrap().ticket, "PROJ-1");
@@ -1077,9 +1197,16 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(999_999);
 
-        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .expect("should fall through to a fresh run");
+        let id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .expect("should fall through to a fresh run");
 
         let run = store.run_by_id(id).unwrap().unwrap();
         assert_eq!(run.ticket, "PROJ-1");
@@ -1109,9 +1236,16 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .expect("should fall through to a fresh run");
+        let id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .expect("should fall through to a fresh run");
 
         assert_ne!(id, pre_id, "must not adopt a run that already finished");
         assert_eq!(
@@ -1127,12 +1261,26 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let first = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
-        let second = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
+        let first = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
+        let second = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(first, second);
         assert_eq!(store.list_runs().unwrap().len(), 1);
@@ -1148,12 +1296,26 @@ mod tests {
         // `setup` keeps the marker-follows-latest-registration behavior;
         // `audit` does not (one audit run per ticket, below) and `create`
         // does not either (one create session is one agent, below).
-        let first = register_session(&store, None, markers_dir.path(), &env, "setup", "PROJ-1")
-            .unwrap()
-            .unwrap();
-        let second = register_session(&store, None, markers_dir.path(), &env, "setup", "PROJ-2")
-            .unwrap()
-            .unwrap();
+        let first = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "setup",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
+        let second = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "setup",
+            "PROJ-2",
+        )
+        .unwrap()
+        .unwrap();
 
         assert_ne!(first, second);
 
@@ -1176,12 +1338,26 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let first = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
-        let second = register_session(&store, None, markers_dir.path(), &env, "create", "PROJ-1")
-            .unwrap()
-            .unwrap();
+        let first = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
+        let second = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "create",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
 
         assert_ne!(first, second);
         assert_eq!(
@@ -1198,14 +1374,28 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let first = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
+        let first = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
         store.finish_run(first, &FinishRun::default()).unwrap();
 
-        let second = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
+        let second = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
 
         assert_ne!(first, second);
         assert_eq!(
@@ -1224,7 +1414,7 @@ mod tests {
         let stale_env = env_with_session("sess-stale");
         let stale_id = register_session(
             &store,
-            None,
+            Some(crate::runs::TEST_SCOPE),
             markers_dir.path(),
             &stale_env,
             "audit",
@@ -1241,7 +1431,7 @@ mod tests {
         let fresh_env = env_with_session("sess-fresh");
         let fresh_id = register_session(
             &store,
-            None,
+            Some(crate::runs::TEST_SCOPE),
             markers_dir.path(),
             &fresh_env,
             "audit",
@@ -1269,7 +1459,7 @@ mod tests {
         let other_env = env_with_session("sess-other");
         register_session(
             &store,
-            None,
+            Some(crate::runs::TEST_SCOPE),
             markers_dir.path(),
             &other_env,
             "audit",
@@ -1281,7 +1471,7 @@ mod tests {
         let fresh_env = env_with_session("sess-fresh");
         register_session(
             &store,
-            None,
+            Some(crate::runs::TEST_SCOPE),
             markers_dir.path(),
             &fresh_env,
             "audit",
@@ -1300,9 +1490,16 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
+        let id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
 
         let finished = finish_session(
             &store,
@@ -1330,9 +1527,16 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
+        let id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
         store
             .add_event(
                 id,
@@ -1371,9 +1575,16 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
+        let id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
 
         finish_session(
             &store,
@@ -1402,12 +1613,26 @@ mod tests {
         // points at PROJ-2's run, and finishing PROJ-1 must not finish
         // PROJ-2's run or delete its marker. (`setup` still marker-follows;
         // `create` keeps its session's row and `audit` reuses by ticket.)
-        register_session(&store, None, markers_dir.path(), &env, "setup", "PROJ-1")
-            .unwrap()
-            .unwrap();
-        let b_id = register_session(&store, None, markers_dir.path(), &env, "setup", "PROJ-2")
-            .unwrap()
-            .unwrap();
+        register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "setup",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
+        let b_id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "setup",
+            "PROJ-2",
+        )
+        .unwrap()
+        .unwrap();
 
         let finished = finish_session(
             &store,
@@ -1435,9 +1660,16 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let id = register_session(&store, None, markers_dir.path(), &env, "create", "PROJ-1")
-            .unwrap()
-            .unwrap();
+        let id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "create",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
 
         let finished = finish_session(
             &store,
@@ -1512,9 +1744,16 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
+        register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
 
         let mut lane_env = env.clone();
         lane_env.lane_run_id = Some("77".to_string());
@@ -1609,13 +1848,27 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
+        register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
         finish_audit(&store, markers_dir.path(), &env, "PROJ-1").unwrap();
 
-        let again =
-            register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1").unwrap();
+        let again = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap();
 
         assert_eq!(again, None);
         assert_eq!(running_audit_rows(&store, "PROJ-1"), 0);
@@ -1629,11 +1882,25 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let a_id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
-        let b =
-            register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-2").unwrap();
+        let a_id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
+        let b = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-2",
+        )
+        .unwrap();
 
         assert_eq!(b, None);
         assert!(
@@ -1668,13 +1935,35 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let first = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
-        register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-2").unwrap();
-        let again = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
+        let first = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
+        register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-2",
+        )
+        .unwrap();
+        let again = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(again, first);
         assert_eq!(store.list_runs().unwrap().len(), 1);
@@ -1693,14 +1982,28 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        let b =
-            register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-2").unwrap();
+        let b = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-2",
+        )
+        .unwrap();
         assert_eq!(b, None);
         assert_eq!(store.list_runs().unwrap().len(), 1, "no PROJ-2 row");
 
-        let a = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
+        let a = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(a, pre_id);
 
         assert_eq!(
@@ -1722,13 +2025,27 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
+        register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
         finish_audit(&store, markers_dir.path(), &env, "PROJ-1").unwrap();
 
-        let b =
-            register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-2").unwrap();
+        let b = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-2",
+        )
+        .unwrap();
 
         assert_eq!(b, None);
         assert_eq!(store.list_runs().unwrap().len(), 1, "no PROJ-2 row");
@@ -1741,9 +2058,16 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
-            .unwrap()
-            .unwrap();
+        let id = register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+        )
+        .unwrap()
+        .unwrap();
         std::fs::remove_file(markers_dir.path().join("sess-1")).unwrap();
 
         assert_eq!(
@@ -1874,7 +2198,15 @@ mod tests {
             &lookup,
             PathBuf::from("/tmp/wt"),
         );
-        register_session(&store, None, markers_dir.path(), &env, "lane", "GH-1").unwrap();
+        register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "lane",
+            "GH-1",
+        )
+        .unwrap();
         store.backdate_heartbeat_for_tests(id, 60);
         let reaped = store.reap(10, &|pid| pid == 4242, &|_| true).unwrap();
 

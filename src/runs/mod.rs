@@ -363,6 +363,12 @@ const MIGRATIONS: &[&str] = &[
 /// rather than shared by every repo that reuses the ticket key.
 pub const LEGACY_UNSCOPED: &str = "legacy:unscoped";
 
+/// Whether `scope` names no project: empty, or [`LEGACY_UNSCOPED`]. Such a
+/// row can't be routed to a repo, filtered on, or ticked.
+pub fn is_unscoped(scope: &str) -> bool {
+    scope.is_empty() || scope == LEGACY_UNSCOPED
+}
+
 /// The scope test fixtures record under: the
 /// [`crate::config::BackendIdentity::scope`] of the `PROJ` Jira identity
 /// most tests build their deps from.
@@ -402,6 +408,12 @@ pub struct RunStore {
 /// Errors returned by [`RunStore`] operations.
 #[derive(Debug, Error)]
 pub enum RunStoreError {
+    /// A write named no scope (GitHub issue #263). Ticket keys are only
+    /// unique within a scope, so a row without one would belong to no
+    /// project, or, as it once did, to every project.
+    #[error("refusing to record a ticket row with an empty scope")]
+    EmptyScope,
+
     /// The parent directory of the database file could not be created.
     #[error("failed to create run db directory {path}: {source}")]
     CreateDir {
@@ -552,16 +564,26 @@ pub const REVIEW_FLAG_EVENT: &str = "review_flag";
 /// [`RunStatus::has_ended`]'s statuses, as an SQL list for `status IN (...)`.
 const ENDED_STATUSES_SQL: &str = "('blocked', 'review', 'done', 'failed', 'interrupted')";
 
+/// Refuses an empty `scope` with [`RunStoreError::EmptyScope`]: every row
+/// in a ticket-keyed table records the project its key belongs to (GitHub
+/// issue #263).
+fn require_scope(scope: &str) -> Result<(), RunStoreError> {
+    if scope.is_empty() {
+        Err(RunStoreError::EmptyScope)
+    } else {
+        Ok(())
+    }
+}
+
 /// Parameters for starting a new run.
 #[derive(Debug, Clone)]
 pub struct StartRun {
     /// Jira ticket key the run is working, e.g. `PROJ-123`.
     pub ticket: String,
-    /// The ticket namespace `ticket` is unique within — the invoking repo's
-    /// [`crate::config::BackendIdentity::scope`] — or `""` when the caller
-    /// has no loadable config to derive one from (GitHub issue #10). An
-    /// empty scope stores a legacy-style unscoped row, visible to lookups
-    /// from every scope.
+    /// The ticket namespace `ticket` is unique within: the invoking repo's
+    /// [`crate::config::BackendIdentity::scope`] (GitHub issue #10). Never
+    /// empty; [`RunStore::start_run`] refuses `""` with
+    /// [`RunStoreError::EmptyScope`] (GitHub issue #263).
     pub scope: String,
     /// Lane name the run executed in.
     pub lane: String,
@@ -1859,6 +1881,7 @@ impl RunStore {
     /// Inserts a new run row with status `running` and `started_at` set to
     /// the database's current time, returning the new row id.
     pub fn start_run(&self, params: &StartRun) -> Result<i64, RunStoreError> {
+        require_scope(&params.scope)?;
         self.conn.execute(
             &format!(
                 "INSERT INTO runs (ticket, scope, lane, status, worktree, branch, pid, kind, log_path, started_at)
@@ -3348,6 +3371,8 @@ impl RunStore {
     /// row, so [`RunStore::latest_audit_for_ticket`] can report the most
     /// recent verdict while earlier ones remain queryable directly against
     /// the `ticket_audits` table.
+    ///
+    /// Refuses an empty `scope` with [`RunStoreError::EmptyScope`].
     pub fn record_audit(
         &self,
         scope: &str,
@@ -3355,6 +3380,7 @@ impl RunStore {
         verdict: &str,
         notes: Option<&str>,
     ) -> Result<(), RunStoreError> {
+        require_scope(scope)?;
         self.conn.execute(
             &format!(
                 "INSERT INTO ticket_audits (ticket_key, scope, verdict, notes, audited_at)
@@ -3399,10 +3425,13 @@ impl RunStore {
     /// Records one archived window of a ticket session (GitHub issue #78),
     /// with `captured_at` set to the database's current time. Returns the
     /// new row id. Append-only: re-archiving a session adds rows.
+    ///
+    /// Refuses an empty `scope` with [`RunStoreError::EmptyScope`].
     pub fn record_session_archive(
         &self,
         archive: &NewSessionArchive,
     ) -> Result<i64, RunStoreError> {
+        require_scope(&archive.scope)?;
         self.conn.execute(
             &format!(
                 "INSERT INTO session_archives (scope, ticket, session, window, path, captured_at)
@@ -3466,6 +3495,8 @@ impl RunStore {
     /// ([`RunStoreError::RetroSeverityNotAllowedForClean`]) rather than
     /// silently dropping it -- a caller that thought it was recording a
     /// severity should be told it didn't, not have it vanish.
+    ///
+    /// Refuses an empty `scope` with [`RunStoreError::EmptyScope`].
     pub fn record_retro(
         &self,
         scope: &str,
@@ -3474,6 +3505,7 @@ impl RunStore {
         severity: Option<RetroSeverity>,
         notes: Option<&str>,
     ) -> Result<(), RunStoreError> {
+        require_scope(scope)?;
         match (verdict, severity) {
             (RetroVerdict::Defect, None) => return Err(RunStoreError::RetroSeverityRequired),
             (RetroVerdict::Clean, Some(_)) => {
@@ -3588,12 +3620,15 @@ impl RunStore {
     ///
     /// See the module doc comment for why this table exists and is
     /// authoritative rather than a mirror.
+    ///
+    /// Refuses an empty `scope` with [`RunStoreError::EmptyScope`].
     pub fn set_ticket_rank(
         &self,
         scope: &str,
         ticket_key: &str,
         rank: f64,
     ) -> Result<(), RunStoreError> {
+        require_scope(scope)?;
         self.conn.execute(
             "INSERT INTO ticket_rank (scope, ticket_key, rank) VALUES (?1, ?2, ?3)
              ON CONFLICT(scope, ticket_key) DO UPDATE SET rank = excluded.rank",
@@ -5678,7 +5713,7 @@ mod tests {
         end_days_ago(recent, 3);
         let stale = start("github:o/stale", "GH-9", "/wt/stale");
         end_days_ago(stale, 10);
-        start("", "GH-7", "/wt/unscoped");
+        start(LEGACY_UNSCOPED, "GH-7", "/wt/unscoped");
 
         let activity = store.recent_scope_activity(7).unwrap();
 
@@ -10384,6 +10419,45 @@ mod tests {
             store.running_lane_tickets("jira:AX").unwrap(),
             vec!["AX-809"]
         );
+    }
+
+    #[test]
+    fn is_unscoped_covers_empty_and_the_legacy_sentinel_only() {
+        assert!(is_unscoped(""));
+        assert!(is_unscoped(LEGACY_UNSCOPED));
+        assert!(!is_unscoped("github:o/r"));
+    }
+
+    /// GitHub issue #263: an empty scope would read as "some project, no
+    /// telling which", so the store refuses to write one.
+    #[test]
+    fn writes_with_an_empty_scope_are_refused() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let empty = |result: Result<(), RunStoreError>| {
+            assert!(
+                matches!(result, Err(RunStoreError::EmptyScope)),
+                "{result:?}"
+            );
+        };
+
+        empty(
+            store
+                .start_run(&StartRun {
+                    scope: String::new(),
+                    ..start_params("GH-3")
+                })
+                .map(|_| ()),
+        );
+        empty(store.record_audit("", "GH-3", "ready", None));
+        empty(store.record_retro("", "GH-3", RetroVerdict::Clean, None, None));
+        empty(store.set_ticket_rank("", "GH-3", 1.0));
+        empty(
+            store
+                .record_session_archive(&archive("", "GH-3", "w", "/p"))
+                .map(|_| ()),
+        );
+        assert!(store.all_runs().unwrap().is_empty());
     }
 
     /// GitHub issue #263: an empty scope is not a wildcard. No code path

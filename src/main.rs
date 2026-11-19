@@ -2905,9 +2905,12 @@ fn run_runs(
             pid,
             kind,
         }) => {
+            // A run row must name its project (GitHub issue #263); with no
+            // config there is none to name.
+            let scope = scope.ok_or("tm runs start needs a loadable tm config to scope the run")?;
             let params = tskmstr::runs::StartRun {
                 ticket,
-                scope: scope.unwrap_or_default().to_string(),
+                scope: scope.to_string(),
                 lane,
                 worktree,
                 branch,

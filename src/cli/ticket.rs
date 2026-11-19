@@ -3241,7 +3241,7 @@ mod tests {
 
         audit_record(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             "ready",
             Some("looks good"),
@@ -3271,7 +3271,7 @@ mod tests {
 
         let err = audit_record(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "not-a-key!",
             "ready",
             None,
@@ -3295,7 +3295,7 @@ mod tests {
 
         retro(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             crate::runs::RetroVerdict::Clean,
             None,
@@ -3323,7 +3323,7 @@ mod tests {
 
         retro(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             crate::runs::RetroVerdict::Defect,
             Some(crate::runs::RetroSeverity::Major),
@@ -3352,7 +3352,7 @@ mod tests {
 
         let err = retro(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "not-a-key!",
             crate::runs::RetroVerdict::Clean,
             None,
@@ -3374,7 +3374,7 @@ mod tests {
 
         let err = retro(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "PROJ-372",
             crate::runs::RetroVerdict::Clean,
             None,
@@ -3400,7 +3400,7 @@ mod tests {
 
         let err = retro(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "PROJ-372",
             crate::runs::RetroVerdict::Defect,
             None,
@@ -3566,7 +3566,7 @@ mod tests {
 
         retro(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "PROJ-372",
             crate::runs::RetroVerdict::Defect,
             Some(crate::runs::RetroSeverity::Major),
@@ -3761,14 +3761,22 @@ mod tests {
 
         // Simulate the read-mode registration that would have happened
         // earlier in the same Claude Code session.
-        register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-372").unwrap();
+        register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-372",
+        )
+        .unwrap();
         let marker = markers_dir.path().join("sess-1");
         assert!(marker.exists());
 
         let mut out = Vec::new();
         audit_record(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             "ready",
             None,
@@ -3814,7 +3822,7 @@ mod tests {
         read(&mut out);
         audit_record(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             "ready",
             None,
