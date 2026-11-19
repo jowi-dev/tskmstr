@@ -18,7 +18,8 @@
 //! - **idle**: running, and its latest event is the `await` the session
 //!   hooks write when the agent stops and waits for input
 //!   ([`crate::runs::is_awaiting_input`]). A run mid-turn is never typed
-//!   into.
+//!   into, and neither is one whose `await` came from a permission prompt
+//!   or other `Notification` dialog: Enter would answer the dialog.
 //! - **a session that reads mail at its next prompt**: thatch's `mcp` rows
 //!   ([`Mailbox::reads_at_next_prompt`]). thatch's opencode plugin wakes
 //!   opencode sessions itself.
@@ -82,11 +83,18 @@ pub fn sweep(
     runs: &[OverviewRun],
     scope: &str,
 ) -> Result<Vec<ChatWake>, RunStoreError> {
-    let idle: Vec<(&OverviewRun, &str)> = runs
-        .iter()
-        .filter(|run| run.scope == scope && run.status == RunStatus::Running && run.awaiting_input)
-        .filter_map(|run| Some((run, run.session_id.as_deref()?)))
-        .collect();
+    let mut idle: Vec<(&OverviewRun, &str)> = Vec::new();
+    for run in runs {
+        if run.scope != scope || run.status != RunStatus::Running || !run.awaiting_input {
+            continue;
+        }
+        let Some(session_id) = run.session_id.as_deref() else {
+            continue;
+        };
+        if waits_at_its_prompt(store, run.id)? {
+            idle.push((run, session_id));
+        }
+    }
     if idle.is_empty() {
         return Ok(Vec::new());
     }
@@ -132,6 +140,33 @@ pub fn sweep(
         });
     }
     Ok(woken)
+}
+
+/// The `Notification` message Claude Code sends when a stopped session has
+/// sat at its prompt for a while.
+const IDLE_NAG: &str = "waiting for your input";
+
+/// Whether the run's latest `await` means the agent sits at its input box.
+///
+/// The session hooks write `await` on `Stop` (no detail) and on
+/// `Notification` (detail `{"message": ...}`). A `Notification` also fires
+/// for a permission prompt, where pressing Enter would pick the dialog's
+/// highlighted answer for the human. Only a `Stop` await, or the idle nag
+/// that follows one, counts.
+fn waits_at_its_prompt(store: &RunStore, run_id: i64) -> Result<bool, RunStoreError> {
+    let Some(event) = store.events_for_run(run_id)?.pop() else {
+        return Ok(false);
+    };
+    if event.kind != "await" {
+        return Ok(false);
+    }
+    Ok(match event.detail.as_deref() {
+        None => true,
+        Some(detail) => serde_json::from_str::<serde_json::Value>(detail)
+            .ok()
+            .and_then(|value| value["message"].as_str().map(|m| m.contains(IDLE_NAG)))
+            .unwrap_or(false),
+    })
 }
 
 /// The message id the run's latest [`WAKE_EVENT`] was for, if it has one.
@@ -281,6 +316,59 @@ mod tests {
             runner.calls.borrow().is_empty(),
             "no idle lane, so thatch is not asked"
         );
+    }
+
+    #[test]
+    fn a_lane_at_a_permission_prompt_is_not_typed_into() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = lane(&store, SCOPE, "tool");
+        store
+            .add_event(
+                id,
+                "await",
+                Some(r#"{"message":"Claude needs your permission to use Bash"}"#),
+            )
+            .unwrap();
+        let tmux = FakeTmuxOps::new();
+
+        let woken = sweep(
+            &store,
+            &tmux,
+            &thatch("mcp", &[7]),
+            &store.overview_runs().unwrap(),
+            SCOPE,
+        )
+        .unwrap();
+
+        assert!(woken.is_empty());
+        assert!(sent_keys(&tmux).is_empty());
+    }
+
+    #[test]
+    fn a_lane_nagged_for_input_after_it_stopped_is_still_idle() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = lane(&store, SCOPE, "await");
+        store
+            .add_event(
+                id,
+                "await",
+                Some(r#"{"message":"Claude is waiting for your input"}"#),
+            )
+            .unwrap();
+        let tmux = FakeTmuxOps::new();
+
+        let woken = sweep(
+            &store,
+            &tmux,
+            &thatch("mcp", &[7]),
+            &store.overview_runs().unwrap(),
+            SCOPE,
+        )
+        .unwrap();
+
+        assert_eq!(woken.len(), 1);
     }
 
     #[test]
