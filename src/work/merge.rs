@@ -1767,7 +1767,7 @@ fn integrate_base(
         }
         MergeStrategy::Rebase | MergeStrategy::Squash => {
             if strategy == MergeStrategy::Squash {
-                squash_branch(deps, dir, branch, base, squash_message, out)?;
+                squash_branch(deps, dir, branch, base, squash_message, &tip, out)?;
                 pre_rebase_rev = deps.git.rev_parse(dir, branch)?;
                 restore_rev = Some(tip);
             }
@@ -1789,12 +1789,18 @@ fn integrate_base(
 }
 
 /// The squash half of [`integrate_base`] under [`MergeStrategy::Squash`].
+///
+/// Logs `squashed <branch> (was <tip>)` as soon as the squash lands, so the
+/// pre-squash sha is in the output whatever goes wrong afterwards: an error
+/// after this point leaves the branch squashed and diverged from its
+/// remote, and only that sha (or the reflog) restores it.
 fn squash_branch(
     deps: &MergeDeps<'_>,
     dir: &Path,
     branch: &str,
     base: &str,
     message: &str,
+    tip: &str,
     out: &mut dyn Write,
 ) -> Result<(), MergeError> {
     if let Ok(Some(RepoMergeMethod::MergeCommit)) = deps.gh.repo_merge_method(dir, MERGE_TIMEOUT) {
@@ -1808,6 +1814,7 @@ fn squash_branch(
         .merge_base(dir, branch, &format!("origin/{base}"))?;
     writeln!(out, "squashing {branch} into one commit...")?;
     deps.git.squash_since(dir, &since, message)?;
+    writeln!(out, "squashed {branch} (was {tip})")?;
     Ok(())
 }
 
@@ -5093,6 +5100,27 @@ mod tests {
         assert!(matches!(result, Ok(MergeFlowOutcome::ConflictsHandedBack)));
         assert!(out.contains("rebase was aborted"), "{out}");
         assert!(out.contains("reset --hard aaa"), "{out}");
+    }
+
+    #[test]
+    fn squash_strategy_logs_the_unsquashed_tip_before_a_later_error() {
+        let mut fx = strategy_fixture(MergeStrategy::Squash);
+        fx.git = fx
+            .git
+            .with_rev_parse_sequence(
+                "proj-1-fix",
+                vec![Ok("aaa".to_string()), Ok("squashed".to_string())],
+            )
+            .with_rebase_onto_result(Err(GitError::Command {
+                command: "git rebase".to_string(),
+                exit_code: Some(128),
+                stderr: "fatal: something broke".to_string(),
+            }));
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(result.is_err(), "{out}");
+        assert!(out.contains("squashed proj-1-fix (was aaa)"), "{out}");
     }
 
     #[test]

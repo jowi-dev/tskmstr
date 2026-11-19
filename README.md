@@ -2776,9 +2776,11 @@ touches a file the base restructured can need several conflict passes.
   commit, titled with the PR's title, then rebase that commit. Every
   conflict comes up in one pass. The squash only happens when a rebase is
   needed. If the repo merges PRs with a merge commit, tm warns that the
-  branch's commit history won't reach the base, but squashes anyway. A
-  conflict session that is handed back prints the branch's original tip,
-  so `git reset --hard <tip>` restores the unsquashed commits.
+  branch's commit history won't reach the base, but squashes anyway. tm
+  logs `squashed <branch> (was <tip>)` right after the squash, and a
+  conflict session that is handed back repeats the original tip, so if the
+  flow stops for any reason, `git reset --hard <tip>` restores the
+  unsquashed commits.
 - **`merge`**: merge `origin/<base>` into the branch (`git merge --no-ff`).
   One conflict pass and no rewritten history, at the cost of a merge
   commit on the branch, which is pushed without force.
