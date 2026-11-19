@@ -429,10 +429,6 @@ fn drain(
         let ticket = entry.ticket.as_str();
         let runs = by_ticket.get(ticket).map(Vec::as_slice).unwrap_or_default();
         let wait = |reason: &str| deps.store.set_merge_waiting(scope, ticket, Some(reason));
-        if runs.iter().any(|run| run.pr_closed) {
-            drop_row(deps, scope, ticket, "PR closed", actions)?;
-            continue;
-        }
         if runs.iter().any(|run| is_live(run.status)) {
             wait("a run is active")?;
             continue;
@@ -442,8 +438,15 @@ fn drain(
             Some((_, number)) => Some(number),
             None => find_pr_for_ticket(&prs, ticket, &|_| true).map(|pr| pr.number),
         };
+        // A resolved PR's own lifecycle decides whether it closed, below. A
+        // `pr_closed` event may belong to an older PR for this ticket, so it
+        // only counts when no PR resolves at all.
         let Some(number) = number else {
-            wait("no open PR")?;
+            if runs.iter().any(|run| run.pr_closed) {
+                drop_row(deps, scope, ticket, "PR closed", actions)?;
+            } else {
+                wait("no open PR")?;
+            }
             continue;
         };
         let state = open.iter().find(|state| state.pr.number == number);
@@ -1289,6 +1292,44 @@ mod tests {
 
         assert!(
             matches!(&actions[..], [AutoMergeAction::Dropped { ticket, .. }] if ticket == "GH-1"),
+            "{actions:?}"
+        );
+        assert!(fx.queued().is_empty());
+    }
+
+    #[test]
+    fn an_older_closed_pr_does_not_drop_a_row_with_a_new_open_pr() {
+        let fx = Fixture::new();
+        fx.lane("GH-1", 7);
+        let watch = fx.start("GH-1", "review-watch");
+        fx.store.add_event(watch, "pr_closed", None).unwrap();
+        fx.end(watch, RunStatus::Done, None);
+        fx.lane("GH-1", 9);
+        fx.enqueue("GH-1");
+        let gh = FakeGhCli::new()
+            .with_pr_list_review_state(Ok(vec![approved(9)]))
+            .with_pr_checks(9, Ok(head("abc")));
+        let launcher = FakeLauncher::new();
+
+        let actions = fx.sweep(&gh, &launcher, AutoMerge::Off);
+
+        assert_eq!(started(&actions), vec!["GH-1"], "{actions:?}");
+    }
+
+    #[test]
+    fn a_manual_row_whose_only_pr_closed_is_dropped() {
+        let fx = Fixture::new();
+        let merge = fx.start("GH-3", "merge");
+        fx.store.add_event(merge, "pr_closed", None).unwrap();
+        fx.end(merge, RunStatus::Done, None);
+        fx.enqueue("GH-3");
+        let gh = FakeGhCli::new().with_pr_list_review_state(Ok(Vec::new()));
+        let launcher = FakeLauncher::new();
+
+        let actions = fx.sweep(&gh, &launcher, AutoMerge::Off);
+
+        assert!(
+            matches!(&actions[..], [AutoMergeAction::Dropped { ticket, .. }] if ticket == "GH-3"),
             "{actions:?}"
         );
         assert!(fx.queued().is_empty());
