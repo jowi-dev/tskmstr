@@ -823,6 +823,7 @@ mod tests {
                 now: 1_000_000,
                 notifier: &crate::work::notify::NoNotifier,
                 ci: None,
+                base_watch: None,
             };
             let lanes = [LaneChoice {
                 name: "backend".to_string(),

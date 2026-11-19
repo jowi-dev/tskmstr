@@ -268,7 +268,7 @@ tm auth status
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
-| `tm merge <KEY>...` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, finishing the ticket's live runs, archive-then-kill of the `tm-<scope>-<key>` tmux session, `status_on_merge`, stale `tm:status/*` label sweep on a closed GitHub issue, then the same for stacked PRs already merged into its branch, then a short headless agent session that archives the merged branch's thatch memories). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
+| `tm merge <KEY>... [--allow-red-base]` | Rebase, merge, and locally sync `<KEY>`'s open PR (refuses while the base branch's head commit has a failed check unless `--allow-red-base`, fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, finishing the ticket's live runs, archive-then-kill of the `tm-<scope>-<key>` tmux session, `status_on_merge`, stale `tm:status/*` label sweep on a closed GitHub issue, then the same for stacked PRs already merged into its branch, then a short headless agent session that archives the merged branch's thatch memories). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
 | `tm drift [KEY...] [--fix] [--stall-hours <N>]` | List tickets whose tracker status has drifted from what their lane runs and PRs did, across every project the run store has lane runs for: finished work still in To Do, merged PRs whose ticket isn't done, running lanes on a To Do ticket, and in-progress tickets with no live run or open PR for more than `N` hours (default 24). Read-only by default; `--fix` applies each finding's `status_on_*` transition (stalled tickets are never moved), and `KEY...` restricts listing and fixing to those tickets. See "Ticket/run status drift" below |
 | `tm usage` | Print the stored usage snapshots (5-hour / 7-day utilization per agent) with their source, age and reset time — what the usage gate sees. See "Usage snapshots" below |
 | `tm usage statusline [-- <command...>]` | Claude Code statusline shim: save the stdin payload's `rate_limits` as usage snapshots (at most every 30s), then run `<command...>` with the same stdin and print its output unchanged. Recording errors never change the output or exit code (`TM_DEBUG=1` prints them on stderr). See "Usage snapshots" below |
@@ -1304,7 +1304,12 @@ it. A tick:
    - a ticket hits the fix-round cap: auto-review stopped at its round cap,
      or the ticket has `max_fix_rounds` fix passes;
    - the dispatcher has refused for the same reason code for longer than
-     `stall_notify_mins`.
+     `stall_notify_mins`;
+   - a lane base branch (each lane's `base_branch`, or the repo's
+     `origin/HEAD`) has a failed check on its head commit, so `tm merge`
+     will refuse to merge onto it (GitHub issue #242). This one fires once
+     per red commit: a new red commit on the same base notifies again.
+     Lane launches are not stopped by a red base.
 
    Each of these fires once per transition, not once per tick. runs.db's
    `notifications` table remembers, per ticket and reason, the transition
@@ -2543,6 +2548,16 @@ board" above) and works standalone from any shell the same way. It
 resolves `<KEY>`'s open PR (the same lookup `M`/`o` use), then runs through
 these stages:
 
+0. **Refuse a red base.** Before fetching or rebasing, `tm merge` reads
+   the checks on the head commit of the PR's base branch. When any of
+   them failed, it stops with exit `1` and names the base, the commit and
+   the failing checks: a rebase onto a broken base can't tell its own
+   failures from the base's, and every merge on top buries the breakage
+   deeper. Pending checks don't block, and a failure to read the checks
+   only warns. Pass `--allow-red-base` to merge anyway, e.g. when the PR
+   is the fix for the broken base. In a batch, a ticket refused this way
+   is recorded as failed and the batch moves on.
+
 1. **Fetch and catch up.** `git fetch origin` in the ticket's local
    checkout (found the same way `tm work session` locates one: the newest
    run row for `<KEY>` checked out on the PR's branch, falling back to
@@ -2652,7 +2667,7 @@ these stages:
 Exit codes: `0` merged (steps 4-10 all attempted; cleanup/base-sync
 warnings don't change this), `2` a conflict session never resolved (step
 3, or the step 4 retry), `1` any other error (no open PR, a diverged branch, a dirty worktree,
-a `gh`/`git` failure).
+a `gh`/`git` failure, a red base without `--allow-red-base`).
 
 V1 boundaries, matched to the board's `M` key and worth knowing before you
 rely on this:

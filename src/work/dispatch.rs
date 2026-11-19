@@ -39,8 +39,9 @@
 //!    `tm review ci-fix` applies admission itself.
 //! 8. Sends the desktop notifications the scope owes
 //!    ([`crate::work::notify`]): tickets that entered awaiting review or hit
-//!    the fix-round cap, and a refusal streak older than
-//!    `stall_notify_mins`. Each transition notifies once.
+//!    the fix-round cap, a refusal streak older than
+//!    `stall_notify_mins`, and a lane base branch whose head commit has a
+//!    failed check (GitHub issue #242). Each transition notifies once.
 //!
 //! Every dependency is injected, so tests drive [`tick`] with a real
 //! [`RunStore`] in a temp dir and fake candidates and launchers.
@@ -327,6 +328,9 @@ pub struct TickDeps<'a> {
     /// What the CI-fix sweep reads PR checks with and launches through.
     /// `None` runs no sweep, whatever [`TickConfig::fix_failing_ci`] says.
     pub ci: Option<&'a ci_fix::SweepDeps<'a>>,
+    /// What the red-base watch reads the lane base branches' checks with
+    /// (GitHub issue #242). `None` watches nothing.
+    pub base_watch: Option<&'a notify::BaseWatch<'a>>,
 }
 
 /// Why a tick did nothing at all.
@@ -596,6 +600,9 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
         deps.now,
         i64::try_from(cfg.stall_notify_mins.saturating_mul(60)).unwrap_or(i64::MAX),
     ));
+    if let Some(watch) = deps.base_watch {
+        notices.extend(notify::base_red_notices(watch, cfg.scope));
+    }
     report.notified = notify::send(deps.store, deps.notifier, cfg.scope, &notices)?;
     Ok(report)
 }
@@ -870,6 +877,10 @@ mod tests {
         stall_notify_mins: u64,
         fix_failing_ci: bool,
         notifier: Recorder,
+        /// Answers the red-base watch's check reads.
+        gh: crate::github::gh_cli::FakeGhCli,
+        /// The bases the red-base watch reads; empty runs no watch.
+        bases: Vec<String>,
     }
 
     impl Fixture {
@@ -895,6 +906,8 @@ mod tests {
                 stall_notify_mins: 30,
                 fix_failing_ci: false,
                 notifier: Recorder::default(),
+                gh: crate::github::gh_cli::FakeGhCli::new(),
+                bases: Vec::new(),
             }
         }
 
@@ -940,6 +953,11 @@ mod tests {
             let source = FakeCandidates(candidates.to_vec(), Cell::new(None));
             let pressure = self.pressure;
             let pressure_fn = move || pressure;
+            let watch = notify::BaseWatch {
+                gh: &self.gh,
+                repo_dir: Path::new("/repo"),
+                bases: &self.bases,
+            };
             let deps = TickDeps {
                 store: &self.store,
                 lock: &lock,
@@ -950,6 +968,7 @@ mod tests {
                 now: self.now,
                 notifier: &self.notifier,
                 ci,
+                base_watch: (!self.bases.is_empty()).then_some(&watch),
             };
             let cfg = TickConfig {
                 scope: SCOPE,
@@ -1365,6 +1384,52 @@ mod tests {
         assert_eq!(first.notified, vec!["tm: GH-9 is awaiting your review"]);
         assert!(second.notified.is_empty());
         assert_eq!(*fx.notifier.0.borrow(), first.notified);
+    }
+
+    fn red(sha: &str) -> crate::github::gh_cli::CommitChecks {
+        crate::github::gh_cli::CommitChecks {
+            sha: sha.to_string(),
+            checks: vec![crate::github::gh_cli::CheckResult {
+                name: "test".to_string(),
+                state: crate::github::gh_cli::ChecksState::Failing,
+                run_id: None,
+                job_id: None,
+                details_url: None,
+                conclusion: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_red_base_notifies_once_per_commit() {
+        let mut fx = Fixture::new();
+        fx.bases = vec!["main".to_string()];
+        fx.gh = crate::github::gh_cli::FakeGhCli::new().with_commit_checks("main", Ok(red("aaa")));
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let first = fx.tick(&[], &launcher);
+        let second = fx.tick(&[], &launcher);
+        fx.gh = crate::github::gh_cli::FakeGhCli::new().with_commit_checks("main", Ok(red("bbb")));
+        let third = fx.tick(&[], &launcher);
+
+        let title = format!("tm: main is red ({SCOPE})");
+        assert_eq!(first.notified, vec![title.clone()]);
+        assert!(second.notified.is_empty());
+        assert_eq!(third.notified, vec![title]);
+    }
+
+    #[test]
+    fn a_disabled_scope_reads_no_base_checks() {
+        let mut fx = Fixture::new();
+        fx.store.set_autopilot(SCOPE, false).unwrap();
+        fx.bases = vec!["main".to_string()];
+        fx.gh = crate::github::gh_cli::FakeGhCli::new().with_commit_checks("main", Ok(red("aaa")));
+        let launcher = FakeLauncher::new(&fx.store);
+
+        fx.tick(&[], &launcher);
+
+        assert!(fx.gh.commit_checks_calls().is_empty());
+        assert!(fx.notifier.0.borrow().is_empty());
     }
 
     #[test]

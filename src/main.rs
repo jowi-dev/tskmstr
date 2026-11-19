@@ -63,8 +63,12 @@ fn main() -> ExitCode {
     // exit code (0 merged, 2 a conflict-resolution session never resolved,
     // 1 any other error) rather than dispatch's uniform 0/1 — see
     // `MERGE_EXIT_CONFLICTS`'s doc comment.
-    if let Command::Merge { keys } = command {
-        return run_merge_cmd(keys);
+    if let Command::Merge {
+        keys,
+        allow_red_base,
+    } = command
+    {
+        return run_merge_cmd(keys, allow_red_base);
     }
 
     // `tm review fix <KEY>` is special-cased the same way: it needs a
@@ -457,11 +461,9 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             .map_err(|err| err.to_string())?;
         let gh = ShellGhCli::new();
         let git = ShellGitOps::new();
-        let containment = tskmstr::blocker_stacking::BaseContainment::new(
-            &git,
-            repo_dir,
-            ready_lane_bases(&config, &git, repo_dir),
-        );
+        let bases = ready_lane_bases(&config, &git, repo_dir);
+        let containment =
+            tskmstr::blocker_stacking::BaseContainment::new(&git, repo_dir, bases.clone());
         let audit_store = open_ready_audit_store(&config);
         let candidates = tskmstr::cli::ready::ReadyContext {
             jira: provider.as_ref(),
@@ -513,6 +515,11 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             now: unix_now(),
             notifier: &notifier,
             ci: Some(&ci),
+            base_watch: Some(&tskmstr::work::notify::BaseWatch {
+                gh: &gh,
+                repo_dir,
+                bases: &bases,
+            }),
         };
         let cfg = tskmstr::work::dispatch::TickConfig {
             scope,
@@ -2446,7 +2453,7 @@ const MERGE_EXIT_CONFLICTS: u8 = 2;
 /// [`tskmstr::work::merge::BatchMergeReport::exit_code`] (same three
 /// codes; a failure outranks a hand-back). A single key always takes the
 /// unchanged `run_merge` path.
-fn run_merge_cmd(keys: Vec<String>) -> ExitCode {
+fn run_merge_cmd(keys: Vec<String>, allow_red_base: bool) -> ExitCode {
     let paths = default_config_paths();
     let env_token = std::env::var("JIRA_API_TOKEN").ok();
     let keychain = MacosKeychain::new();
@@ -2508,6 +2515,7 @@ fn run_merge_cmd(keys: Vec<String>) -> ExitCode {
             state_dir: &state_dir,
             sessions_dir: &sessions_dir,
             kill_pid: &tskmstr::runs::pid::kill_pid,
+            allow_red_base,
         };
         let mut stdout = std::io::stdout();
 
@@ -3112,11 +3120,9 @@ impl AutopilotTicker {
             };
         let gh = ShellGhCli::new();
         let git = ShellGitOps::new();
-        let containment = tskmstr::blocker_stacking::BaseContainment::new(
-            &git,
-            &target.repo_root,
-            ready_lane_bases(&config, &git, &target.repo_root),
-        );
+        let bases = ready_lane_bases(&config, &git, &target.repo_root);
+        let containment =
+            tskmstr::blocker_stacking::BaseContainment::new(&git, &target.repo_root, bases.clone());
         let audit_store = open_ready_audit_store(&config);
         let candidates = tskmstr::cli::ready::ReadyContext {
             jira: jira.as_ref(),
@@ -3187,6 +3193,11 @@ impl AutopilotTicker {
             now: unix_now(),
             notifier: &notifier,
             ci: Some(&ci),
+            base_watch: Some(&tskmstr::work::notify::BaseWatch {
+                gh: &gh,
+                repo_dir: &target.repo_root,
+                bases: &bases,
+            }),
         };
         let cfg = dispatch::TickConfig {
             scope: &scope,

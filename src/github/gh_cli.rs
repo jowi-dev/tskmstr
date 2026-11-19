@@ -391,6 +391,13 @@ pub trait GhCli {
     /// [`GhCli::pr_review_threads`]'s doc comment.
     fn pr_checks(&self, dir: &Path, number: u64) -> Result<PrChecks, GhError>;
 
+    /// The commit `git_ref` (a branch name such as a PR's base) points at on
+    /// GitHub, with its check results (`gh api graphql` over
+    /// [`COMMIT_CHECKS_QUERY`]). `dir` picks the repository: `gh` fills the
+    /// `{owner}`/`{repo}` placeholders from it, same rationale as
+    /// [`GhCli::pr_review_threads`]'s doc comment.
+    fn commit_checks(&self, dir: &Path, git_ref: &str) -> Result<CommitChecks, GhError>;
+
     /// The logs of the failed steps of GitHub Actions run `run_id` (`gh run
     /// view <run_id> --log-failed`), returned as `gh` prints them.
     ///
@@ -873,6 +880,27 @@ impl PrChecks {
     }
 }
 
+/// A commit's check results, as returned by [`GhCli::commit_checks`]: the
+/// checks GitHub ran on whatever commit a ref (such as a base branch) points
+/// at (GitHub issue #242).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitChecks {
+    /// The full SHA of the commit the ref resolved to.
+    pub sha: String,
+    /// One entry per `statusCheckRollup` context, in GitHub's order. Empty
+    /// when the commit has no checks.
+    pub checks: Vec<CheckResult>,
+}
+
+impl CommitChecks {
+    /// The checks whose verdict is [`ChecksState::Failing`].
+    pub fn failing(&self) -> impl Iterator<Item = &CheckResult> {
+        self.checks
+            .iter()
+            .filter(|check| check.state == ChecksState::Failing)
+    }
+}
+
 /// One `statusCheckRollup` entry on a pull request: a GitHub `CheckRun` or a
 /// commit `StatusContext`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1122,6 +1150,29 @@ const PR_STATE_JSON_FIELDS: &str = "state";
 /// [`GhCli::pr_checks`]; shared so the flag and [`RawPrChecks`]
 /// deserialization stay in lockstep.
 const PR_CHECKS_JSON_FIELDS: &str = "state,headRefOid,statusCheckRollup";
+
+/// [`GhCli::commit_checks`]'s query: the commit a ref expression resolves
+/// to and its check rollup, selecting the same `CheckRun`/`StatusContext`
+/// fields `gh pr view --json statusCheckRollup` reports, so [`RawCheck`]
+/// reads both.
+const COMMIT_CHECKS_QUERY: &str = "query($owner: String!, $name: String!, $ref: String!) {
+  repository(owner: $owner, name: $name) {
+    object(expression: $ref) {
+      ... on Commit {
+        oid
+        statusCheckRollup {
+          contexts(first: 100) {
+            nodes {
+              __typename
+              ... on CheckRun { name status conclusion detailsUrl }
+              ... on StatusContext { context state targetUrl }
+            }
+          }
+        }
+      }
+    }
+  }
+}";
 
 /// Fields requested from `gh pr list --state all --json` in
 /// [`GhCli::pr_list_all`]; shared so the flag and [`RawPrListAllEntry`]
@@ -1775,6 +1826,34 @@ impl GhCli for ShellGhCli {
             })?;
 
         interpret_pr_checks_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn commit_checks(&self, dir: &Path, git_ref: &str) -> Result<CommitChecks, GhError> {
+        let output = Command::new("gh")
+            .args([
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={COMMIT_CHECKS_QUERY}"),
+                "-F",
+                "owner={owner}",
+                "-F",
+                "name={repo}",
+                "-f",
+                &format!("ref={git_ref}"),
+            ])
+            .current_dir(dir)
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh api graphql".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_commit_checks_output(
             output.status.code(),
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
@@ -2923,6 +3002,87 @@ fn interpret_pr_checks_output(
         }
         code => Err(GhError::Command {
             command: "gh pr view".to_string(),
+            exit_code: code,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
+/// Raw shape of [`COMMIT_CHECKS_QUERY`]'s response, for deserialization
+/// only; [`CommitChecks`] is the shape callers use.
+#[derive(Debug, Deserialize)]
+struct RawCommitChecksResponse {
+    data: RawCommitChecksData,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCommitChecksData {
+    repository: RawCommitChecksRepository,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCommitChecksRepository {
+    object: Option<RawCommitChecksObject>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawCommitChecksObject {
+    oid: String,
+    #[serde(default)]
+    status_check_rollup: Option<RawCommitRollup>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCommitRollup {
+    contexts: RawCommitRollupContexts,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCommitRollupContexts {
+    #[serde(default)]
+    nodes: Vec<RawCheck>,
+}
+
+/// Interpret the result of a `gh api graphql` [`COMMIT_CHECKS_QUERY`]
+/// invocation.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`]. A `null` rollup (a
+/// commit with no checks) reads as an empty [`CommitChecks::checks`]; a
+/// `null` object (the ref does not resolve to a commit) is a
+/// [`GhError::Parse`].
+fn interpret_commit_checks_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<CommitChecks, GhError> {
+    const COMMAND: &str = "gh api graphql (commit checks)";
+    match exit_code {
+        Some(0) => {
+            let raw = serde_json::from_str::<RawCommitChecksResponse>(stdout).map_err(|err| {
+                GhError::Parse {
+                    command: COMMAND.to_string(),
+                    message: err.to_string(),
+                }
+            })?;
+            let object = raw.data.repository.object.ok_or_else(|| GhError::Parse {
+                command: COMMAND.to_string(),
+                message: "ref did not resolve to a commit".to_string(),
+            })?;
+            Ok(CommitChecks {
+                sha: object.oid,
+                checks: object
+                    .status_check_rollup
+                    .map(|rollup| rollup.contexts.nodes)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(RawCheck::into_result)
+                    .collect(),
+            })
+        }
+        code => Err(GhError::Command {
+            command: COMMAND.to_string(),
             exit_code: code,
             stderr: stderr.trim().to_string(),
         }),
@@ -4228,6 +4388,8 @@ pub struct FakeGhCli {
     pr_state_calls: RefCell<Vec<u64>>,
     pr_checks_results: RefCell<HashMap<u64, Result<PrChecks, GhError>>>,
     pr_checks_calls: RefCell<Vec<u64>>,
+    commit_checks_results: RefCell<HashMap<String, Result<CommitChecks, GhError>>>,
+    commit_checks_calls: RefCell<Vec<String>>,
     run_failed_log_results: RefCell<HashMap<u64, Result<String, GhError>>>,
     job_failed_log_results: RefCell<HashMap<u64, Result<String, GhError>>>,
     job_failed_log_calls: RefCell<Vec<u64>>,
@@ -4331,6 +4493,8 @@ impl Default for FakeGhCli {
             pr_state_calls: RefCell::new(Vec::new()),
             pr_checks_results: RefCell::new(HashMap::new()),
             pr_checks_calls: RefCell::new(Vec::new()),
+            commit_checks_results: RefCell::new(HashMap::new()),
+            commit_checks_calls: RefCell::new(Vec::new()),
             run_failed_log_results: RefCell::new(HashMap::new()),
             run_failed_log_calls: RefCell::new(Vec::new()),
             job_failed_log_results: RefCell::new(HashMap::new()),
@@ -4520,6 +4684,22 @@ impl FakeGhCli {
     /// The pull request numbers passed to `pr_checks`, in call order.
     pub fn pr_checks_calls(&self) -> Vec<u64> {
         self.pr_checks_calls.borrow().clone()
+    }
+
+    /// Set the result `commit_checks` will return for `git_ref`.
+    ///
+    /// A ref with no configured result returns a commit with an empty SHA
+    /// and no checks, which reads as green.
+    pub fn with_commit_checks(self, git_ref: &str, result: Result<CommitChecks, GhError>) -> Self {
+        self.commit_checks_results
+            .borrow_mut()
+            .insert(git_ref.to_string(), result);
+        self
+    }
+
+    /// The refs passed to `commit_checks`, in call order.
+    pub fn commit_checks_calls(&self) -> Vec<String> {
+        self.commit_checks_calls.borrow().clone()
     }
 
     /// Set the result `run_failed_log` will return for Actions run `run_id`.
@@ -5024,6 +5204,19 @@ impl GhCli for FakeGhCli {
             None => Ok(PrChecks {
                 lifecycle: PrLifecycle::Open,
                 head_sha: String::new(),
+                checks: Vec::new(),
+            }),
+        }
+    }
+
+    fn commit_checks(&self, _dir: &Path, git_ref: &str) -> Result<CommitChecks, GhError> {
+        self.commit_checks_calls
+            .borrow_mut()
+            .push(git_ref.to_string());
+        match self.commit_checks_results.borrow().get(git_ref) {
+            Some(result) => result.clone(),
+            None => Ok(CommitChecks {
+                sha: String::new(),
                 checks: Vec::new(),
             }),
         }
@@ -5570,6 +5763,93 @@ mod tests {
         let err = interpret_run_failed_log_output(Some(1), "", "run not found").unwrap_err();
 
         assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    // --- commit_checks parsing (GitHub issue #242) ---
+
+    fn commit_checks_json(oid: &str, rollup: &str) -> String {
+        format!(
+            r#"{{"data":{{"repository":{{"object":{{"oid":"{oid}","statusCheckRollup":{rollup}}}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn commit_checks_query_selects_the_rollup_of_the_ref_expression() {
+        assert!(COMMIT_CHECKS_QUERY.contains("object(expression: $ref)"));
+        assert!(COMMIT_CHECKS_QUERY.contains("statusCheckRollup"));
+        assert!(COMMIT_CHECKS_QUERY.contains("... on CheckRun"));
+        assert!(COMMIT_CHECKS_QUERY.contains("... on StatusContext"));
+    }
+
+    #[test]
+    fn commit_checks_output_parses_the_commit_and_its_failing_checks() {
+        let rollup = r#"{"contexts":{"nodes":[
+            {"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"FAILURE",
+             "detailsUrl":"https://github.com/o/r/actions/runs/5/job/6"},
+            {"__typename":"StatusContext","context":"ci/lint","state":"SUCCESS",
+             "targetUrl":"https://ci.example/1"},
+            {"__typename":"CheckRun","name":"build","status":"IN_PROGRESS","conclusion":null}
+        ]}}"#;
+
+        let checks =
+            interpret_commit_checks_output(Some(0), &commit_checks_json("deadbeef", rollup), "")
+                .unwrap();
+
+        assert_eq!(checks.sha, "deadbeef");
+        assert_eq!(checks.checks.len(), 3);
+        let failing: Vec<&str> = checks.failing().map(|c| c.name.as_str()).collect();
+        assert_eq!(failing, vec!["test"]);
+        assert_eq!(checks.checks[1].state, ChecksState::Passing);
+        assert_eq!(checks.checks[2].state, ChecksState::Pending);
+    }
+
+    #[test]
+    fn commit_checks_output_reads_a_null_rollup_as_no_checks() {
+        let checks =
+            interpret_commit_checks_output(Some(0), &commit_checks_json("abc", "null"), "")
+                .unwrap();
+
+        assert_eq!(checks.sha, "abc");
+        assert!(checks.checks.is_empty());
+    }
+
+    #[test]
+    fn commit_checks_output_reads_an_unknown_ref_as_a_parse_error() {
+        let stdout = r#"{"data":{"repository":{"object":null}}}"#;
+
+        let err = interpret_commit_checks_output(Some(0), stdout, "").unwrap_err();
+
+        assert!(matches!(err, GhError::Parse { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn commit_checks_output_surfaces_a_nonzero_exit_as_a_command_error() {
+        let err = interpret_commit_checks_output(Some(1), "", "HTTP 401").unwrap_err();
+
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn fake_commit_checks_returns_configured_results_or_an_empty_green_commit() {
+        let red = CommitChecks {
+            sha: "abc".to_string(),
+            checks: Vec::new(),
+        };
+        let fake = FakeGhCli::new().with_commit_checks("main", Ok(red.clone()));
+        let dir = Path::new(".");
+
+        assert_eq!(fake.commit_checks(dir, "main").unwrap(), red);
+        assert_eq!(
+            fake.commit_checks(dir, "develop").unwrap(),
+            CommitChecks {
+                sha: String::new(),
+                checks: Vec::new(),
+            }
+        );
+        assert_eq!(
+            fake.commit_checks_calls(),
+            vec!["main".to_string(), "develop".to_string()]
+        );
     }
 
     #[test]
