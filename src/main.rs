@@ -333,6 +333,7 @@ fn run_dispatch(
         DispatchCmd::Tick { scope, json } => {
             let targets = tskmstr::cli::dispatch::tick_targets(
                 &store.autopilot_scopes()?,
+                &store.merge_queue_scopes()?,
                 &selector(scope),
                 current.as_ref(),
             )?;
