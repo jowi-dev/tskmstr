@@ -2610,6 +2610,7 @@ mod tests {
             tmux_windows: vec![],
             tmux_primary_window: None,
             idle_hibernate_mins: 0,
+            wake_on_chat_mail: true,
             lanes,
             audit: crate::config::AuditConfig::default(),
             create: crate::config::CreateConfig::default(),

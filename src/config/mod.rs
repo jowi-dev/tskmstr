@@ -507,6 +507,11 @@ pub struct RawWorkConfig {
     /// hibernation off. Defaults to [`DEFAULT_IDLE_HIBERNATE_MINS`] when
     /// unset in both global and repo config.
     pub idle_hibernate_mins: Option<u64>,
+    /// Whether the dispatch tick types a short prompt into an idle Claude
+    /// Code lane that has unread thatch chat mail, so the agent reads it
+    /// (GitHub issue #224). `false` turns waking off. Defaults to on when
+    /// unset in both global and repo config.
+    pub wake_on_chat_mail: Option<bool>,
     /// Per-lane definitions, keyed by lane name.
     ///
     /// Merge precedence: a repo-local lane entry replaces the corresponding
@@ -1293,6 +1298,8 @@ pub struct WorkConfig {
     /// See [`RawWorkConfig::idle_hibernate_mins`]; already defaulted, so `0`
     /// here always means "off".
     pub idle_hibernate_mins: u64,
+    /// See [`RawWorkConfig::wake_on_chat_mail`]; already defaulted.
+    pub wake_on_chat_mail: bool,
     /// Validated per-lane definitions, keyed by lane name.
     pub lanes: BTreeMap<String, LaneConfig>,
     /// Validated `[work.audit]` settings. See [`AuditConfig`]; empty (no
@@ -2736,6 +2743,10 @@ fn merge_work(
         .idle_hibernate_mins
         .or(global.idle_hibernate_mins)
         .unwrap_or(DEFAULT_IDLE_HIBERNATE_MINS);
+    let wake_on_chat_mail = repo
+        .wake_on_chat_mail
+        .or(global.wake_on_chat_mail)
+        .unwrap_or(true);
     let audit = merge_audit(global.audit, repo.audit.clone(), repo_dir)?;
     let create = merge_create(global.create, repo.create.clone(), repo_dir)?;
     let merge = merge_merge_section(global.merge, repo.merge.clone(), repo_dir)?;
@@ -2805,6 +2816,7 @@ fn merge_work(
         tmux_windows,
         tmux_primary_window,
         idle_hibernate_mins,
+        wake_on_chat_mail,
         lanes,
         audit,
         create,
@@ -5333,6 +5345,23 @@ mod tests {
     }
 
     #[test]
+    fn wake_on_chat_mail_defaults_on_and_repo_can_turn_it_off() {
+        let cfg = merge_work(None, None, None).expect("should merge");
+        assert!(cfg.wake_on_chat_mail, "waking is on unless opted out");
+
+        let global = RawWorkConfig {
+            wake_on_chat_mail: Some(true),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            wake_on_chat_mail: Some(false),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
+        assert!(!cfg.wake_on_chat_mail);
+    }
+
+    #[test]
     fn load_parses_idle_hibernate_mins_from_the_work_section() {
         let dir = tempdir().unwrap();
         let global_path = dir.path().join("config.toml");
@@ -5750,6 +5779,7 @@ mod tests {
             tmux_windows: Some(vec!["shell".to_string()]),
             tmux_primary_window: Some("code".to_string()),
             idle_hibernate_mins: None,
+            wake_on_chat_mail: None,
             lanes: BTreeMap::new(),
             audit: None,
             create: None,
@@ -5772,6 +5802,7 @@ mod tests {
             tmux_windows: None,
             tmux_primary_window: None,
             idle_hibernate_mins: None,
+            wake_on_chat_mail: None,
             lanes: BTreeMap::new(),
             audit: None,
             create: None,
