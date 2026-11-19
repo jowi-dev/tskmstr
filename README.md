@@ -1810,7 +1810,9 @@ A lane is woken only when all of these hold:
 
 - it is running in the ticked repo and **idle at its prompt**: its latest
   event is the `await` the session hooks write when the agent stops. **A
-  lane mid-turn is never typed into.**
+  lane mid-turn is never typed into**, and neither is a lane sitting at a
+  permission prompt: the hooks write `await` for that too, and Enter would
+  answer it.
 - thatch lists its session as an `mcp` (Claude Code) session with unread
   mail. thatch's opencode plugin wakes opencode sessions itself, so tm
   leaves those alone.
