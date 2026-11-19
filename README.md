@@ -1765,7 +1765,7 @@ input.
 ### Lane chat
 
 When a run's agent session has joined thatch's cross-session chat, the run
-detail window (`v` in `tm runs watch`, the overview, and the board) shows a
+detail window (`Enter` in `tm runs watch`, `v` on the overview and the board) shows a
 **Chat** panel under the usage and checklist panels. It lists the session's
 latest sent and received messages, oldest first:
 
