@@ -12,9 +12,11 @@
 //!
 //! Every command takes a scope selector: the current repo by default,
 //! `--scope S`, or `--all` (every scope with an `autopilot` row). `tick
-//! --all` only visits scopes that are on, and each tick re-reads the flag
-//! under the scope lock, so `off --all` stops the next tick from launching
-//! anything. The lock is the one the TUI host takes too.
+//! --all` visits scopes that are on, plus scopes with queued merges (GitHub
+//! issue #247), and each tick re-reads the flag under the scope lock, so
+//! `off --all` stops the next tick from launching anything; a scope that is
+//! off only drains the merges queued by hand. The lock is the one the TUI
+//! host takes too.
 //!
 //! `src/main.rs` builds the real per-scope dependencies behind
 //! [`ScopeTicker`]; this module only selects scopes and prints results.
