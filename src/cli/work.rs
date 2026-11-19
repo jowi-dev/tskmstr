@@ -1137,6 +1137,136 @@ fn removable_worktree(
     })
 }
 
+/// What [`sweep`] did with each marked ticket, in plan order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepSummary {
+    /// Tickets whose [`clean`] succeeded.
+    pub cleaned: Vec<String>,
+    /// Tickets skipped before anything ran, with the reason.
+    pub skipped: Vec<(String, String)>,
+    /// Tickets whose [`clean`] failed, with the error.
+    pub failed: Vec<(String, String)>,
+}
+
+/// `tm work sweep [KEYS...] [--merged] [--closed] [--yes]`: clean many
+/// tickets in one pass (GitHub issue #253).
+///
+/// Plans the sweep with [`crate::work::sweep::plan_sweep`], prints one line
+/// per marked ticket (kill-safety tier, then `clean` or `skip: <reason>`),
+/// and asks once on `input` before touching anything, unless `assume_yes`.
+/// Anything but `y`/`yes` declines. Each unskipped ticket then goes through
+/// [`clean`] itself, so every guard single cleanup has (archive before kill,
+/// the worktree-root check, no `--force` removal) holds here too. One
+/// ticket failing is recorded and the sweep moves on to the next.
+///
+/// Returns the [`SweepSummary`], also printed; the caller decides the exit
+/// code from its `failed` list.
+#[allow(clippy::too_many_arguments)]
+pub fn sweep(
+    ctx: &WorkContext<'_>,
+    store: &RunStore,
+    gh: &dyn GhCli,
+    identity: &crate::config::BackendIdentity,
+    selection: &crate::work::sweep::SweepSelection,
+    assume_yes: bool,
+    input: &mut dyn io::BufRead,
+    out: &mut dyn Write,
+) -> Result<SweepSummary, WorkCliError> {
+    let removable = |runs: &[crate::runs::Run]| removable_worktree(ctx, runs);
+    let deps = crate::work::sweep::SweepPlanDeps {
+        store,
+        tmux: ctx.tmux,
+        gh,
+        git: ctx.git,
+        pid_alive: &crate::runs::pid::pid_alive,
+        identity,
+        removable: &removable,
+    };
+    let plan = crate::work::sweep::plan_sweep(&deps, selection)?;
+
+    let mut summary = SweepSummary::default();
+    if plan.is_empty() {
+        writeln!(out, "Nothing marked for sweeping.")?;
+        return Ok(summary);
+    }
+
+    writeln!(out, "Sweep plan ({} tickets):", plan.len())?;
+    for candidate in &plan {
+        let action = match &candidate.skip {
+            Some(reason) => format!("skip: {reason}"),
+            None => "clean".to_string(),
+        };
+        let worktree = candidate.worktree.as_ref().map_or_else(
+            || "(no worktree)".to_string(),
+            |wt| wt.display().to_string(),
+        );
+        let pr = candidate.pr.map_or_else(String::new, |pr| {
+            format!("  PR #{} {}", pr.number, pr_lifecycle_word(pr.lifecycle))
+        });
+        writeln!(
+            out,
+            "  {:<12} {:<12} {:<32} {worktree}{pr}",
+            candidate.ticket,
+            candidate.verdict.tier.as_str(),
+            action
+        )?;
+    }
+
+    let to_clean = plan.iter().filter(|c| c.skip.is_none()).count();
+    if to_clean > 0 && !assume_yes {
+        write!(out, "Clean {to_clean} tickets? [y/N] ")?;
+        out.flush()?;
+        let mut answer = String::new();
+        input.read_line(&mut answer)?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            writeln!(out, "Sweep cancelled; nothing removed.")?;
+            return Ok(summary);
+        }
+    }
+
+    for candidate in plan {
+        if let Some(reason) = candidate.skip {
+            summary.skipped.push((candidate.ticket, reason.to_string()));
+            continue;
+        }
+        writeln!(out, "== {}", candidate.ticket)?;
+        match clean(ctx, store, identity, &candidate.ticket, out) {
+            Ok(()) => summary.cleaned.push(candidate.ticket),
+            Err(err) => {
+                writeln!(out, "error: {err}")?;
+                summary.failed.push((candidate.ticket, err.to_string()));
+            }
+        }
+    }
+
+    writeln!(
+        out,
+        "Sweep summary: {} cleaned, {} skipped, {} failed",
+        summary.cleaned.len(),
+        summary.skipped.len(),
+        summary.failed.len()
+    )?;
+    for ticket in &summary.cleaned {
+        writeln!(out, "  cleaned  {ticket}")?;
+    }
+    for (ticket, reason) in &summary.skipped {
+        writeln!(out, "  skipped  {ticket}  {reason}")?;
+    }
+    for (ticket, err) in &summary.failed {
+        writeln!(out, "  failed   {ticket}  {err}")?;
+    }
+    Ok(summary)
+}
+
+/// The lowercase word for a PR state in the sweep plan.
+fn pr_lifecycle_word(lifecycle: crate::github::gh_cli::PrLifecycle) -> &'static str {
+    match lifecycle {
+        crate::github::gh_cli::PrLifecycle::Open => "open",
+        crate::github::gh_cli::PrLifecycle::Merged => "merged",
+        crate::github::gh_cli::PrLifecycle::Closed => "closed",
+    }
+}
+
 /// `tm work start [<dir>]`: attach to (or create) the tmux session for
 /// `dir`, defaulting to `cwd` when `dir` is `None`. Joe's main tmux entry
 /// point; see the module docs.
@@ -2731,6 +2861,181 @@ mod tests {
         assert!(git.remove_worktree_calls().is_empty());
         let printed = out_string(&out);
         assert!(printed.contains("already gone"), "{printed}");
+    }
+
+    // --- sweep (mark-and-sweep cleanup, GitHub issue #253) ---
+
+    /// Record a finished lane run for `ticket` with its worktree on disk
+    /// under `clean_config`'s worktree root, and return that worktree.
+    fn sweep_lane_run(tmp: &TempDir, store: &RunStore, ticket: &str) -> PathBuf {
+        let worktree = tmp
+            .path()
+            .join("Worktrees/repo")
+            .join(ticket.to_lowercase());
+        std::fs::create_dir_all(&worktree).unwrap();
+        let id = store
+            .start_run(&crate::runs::StartRun {
+                scope: compatible_test_identity().scope(),
+                ticket: ticket.to_string(),
+                lane: "mylane".to_string(),
+                worktree: worktree.to_string_lossy().into_owned(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store
+            .finish_run(id, &crate::runs::FinishRun::default())
+            .unwrap();
+        worktree
+    }
+
+    fn sweep_keys(keys: &[&str]) -> crate::work::sweep::SweepSelection {
+        crate::work::sweep::SweepSelection {
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sweep_cleans_each_ticket_and_reports_skips_and_failures_without_stopping() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let config = clean_config(&tmp, &repo);
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let wt1 = sweep_lane_run(&tmp, &store, "PROJ-1");
+        let wt2 = sweep_lane_run(&tmp, &store, "PROJ-2");
+        let wt3 = sweep_lane_run(&tmp, &store, "PROJ-3");
+        let wt4 = sweep_lane_run(&tmp, &store, "PROJ-4");
+
+        let git = FakeGitOps::new()
+            .with_status_is_clean(Ok(true))
+            .with_status_is_clean_for(&wt2, Ok(false))
+            .with_remove_worktree_result_for(
+                &wt3,
+                Err(GitError::Command {
+                    command: "git worktree remove".to_string(),
+                    exit_code: Some(128),
+                    stderr: "locked".to_string(),
+                }),
+            );
+        let tmux = FakeTmuxOps::new().with_has_session(Ok(false));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let mut input: &[u8] = b"y\n";
+        let mut out = Vec::new();
+
+        let summary = sweep(
+            &ctx,
+            &store,
+            &FakeGhCli::new(),
+            compatible_test_identity(),
+            &sweep_keys(&["PROJ-1", "PROJ-2", "PROJ-3", "PROJ-4"]),
+            false,
+            &mut input,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(summary.cleaned, vec!["PROJ-1", "PROJ-4"]);
+        assert_eq!(
+            summary.skipped,
+            vec![("PROJ-2".to_string(), "uncommitted changes".to_string())]
+        );
+        assert_eq!(summary.failed.len(), 1, "{summary:?}");
+        assert_eq!(summary.failed[0].0, "PROJ-3");
+        assert_eq!(
+            git.remove_worktree_calls(),
+            vec![(repo.clone(), wt1), (repo.clone(), wt3), (repo, wt4)],
+            "the dirty worktree is never handed to git; the failure does not stop PROJ-4"
+        );
+        let printed = out_string(&out);
+        assert!(printed.contains("PROJ-2"), "{printed}");
+        assert!(printed.contains("1 failed"), "{printed}");
+    }
+
+    #[test]
+    fn sweep_removes_nothing_when_the_confirmation_is_declined() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let config = clean_config(&tmp, &repo);
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        sweep_lane_run(&tmp, &store, "PROJ-1");
+        let git = FakeGitOps::new().with_status_is_clean(Ok(true));
+        let tmux = FakeTmuxOps::new().with_has_session(Ok(true));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let mut input: &[u8] = b"\n";
+        let mut out = Vec::new();
+
+        let summary = sweep(
+            &ctx,
+            &store,
+            &FakeGhCli::new(),
+            compatible_test_identity(),
+            &sweep_keys(&["PROJ-1"]),
+            false,
+            &mut input,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(summary.cleaned.is_empty(), "{summary:?}");
+        assert!(git.remove_worktree_calls().is_empty());
+        assert!(
+            !tmux
+                .calls()
+                .iter()
+                .any(|c| matches!(c, TmuxCall::KillSession(_)))
+        );
+        assert!(out_string(&out).contains("[y/N]"));
+    }
+
+    #[test]
+    fn sweep_with_yes_does_not_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let config = clean_config(&tmp, &repo);
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let wt = sweep_lane_run(&tmp, &store, "PROJ-1");
+        let git = FakeGitOps::new().with_status_is_clean(Ok(true));
+        let tmux = FakeTmuxOps::new().with_has_session(Ok(false));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let mut input: &[u8] = b"";
+        let mut out = Vec::new();
+
+        let summary = sweep(
+            &ctx,
+            &store,
+            &FakeGhCli::new(),
+            compatible_test_identity(),
+            &sweep_keys(&["PROJ-1"]),
+            true,
+            &mut input,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(summary.cleaned, vec!["PROJ-1"]);
+        assert_eq!(git.remove_worktree_calls(), vec![(repo, wt)]);
+        assert!(!out_string(&out).contains("[y/N]"));
     }
 
     // --- run (detached) / supervise ---
