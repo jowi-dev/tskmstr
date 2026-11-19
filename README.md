@@ -2833,9 +2833,12 @@ upstream commits that touched the conflicted files: the commits in
 `<branch tip before the rebase>..origin/<base>` touching those paths,
 each mapped to its PR with `gh api repos/{owner}/{repo}/commits/<sha>/pulls`.
 Each PR appears once, as `- PR #N: title` with its body indented below,
-and the bodies are trimmed to share a 12,000-byte cap. If the `git` or `gh`
-lookup fails, the placeholder says the context is unavailable and why,
-and the session still opens. A template without the placeholder skips
+and the bodies are trimmed to share a 12,000-byte cap. Only the newest 25
+matching commits are looked up; the placeholder notes how many older ones
+were skipped. If a single commit's `gh` lookup fails, the PRs already found
+are kept and the placeholder notes the gap. If the `git` lookup fails, or
+every `gh` lookup fails, the placeholder says the context is unavailable
+and why. Either way the session still opens. A template without the placeholder skips
 the lookup and renders exactly as before. In `batch_conflict_prompt` it
 becomes one `<KEY> upstream context:` section per conflicting ticket.
 

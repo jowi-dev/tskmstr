@@ -468,6 +468,12 @@ pub fn conflict_prompt(
 /// caps failure logs. Titles, headers and trim markers come on top of it.
 pub const UPSTREAM_CONTEXT_LIMIT_BYTES: usize = 12_000;
 
+/// The most upstream commits [`upstream_pulls`] looks up, newest first. Each
+/// lookup is one `gh api` call made before the conflict session opens, and a
+/// hot file (`Cargo.lock`, a README) can be touched by hundreds of upstream
+/// commits, most of which map back to a pull request already listed.
+pub const UPSTREAM_COMMIT_LOOKUP_LIMIT: usize = 25;
+
 /// The `{upstream_context}` text when no upstream pull request touched the
 /// conflicted files.
 const NO_UPSTREAM_PRS: &str =
@@ -481,8 +487,10 @@ const NO_UPSTREAM_PRS: &str =
 /// `conflicted` ([`GitOps::commits_touching`]), so only work that landed on
 /// the base after the branch was cut. Each maps to its pull requests through
 /// [`GhCli::commit_pulls`]; a PR reached by several commits is listed once.
-/// A lookup failure is not fatal: the text then says the context is
-/// unavailable and why, and the session opens anyway.
+/// Only the newest [`UPSTREAM_COMMIT_LOOKUP_LIMIT`] commits are looked up. A
+/// lookup failure is not fatal: a failed commit is noted and the PRs already
+/// found are kept, and when nothing was found the text says the context is
+/// unavailable and why. The session opens either way.
 fn upstream_context(
     deps: &MergeDeps<'_>,
     dir: &Path,
@@ -492,7 +500,14 @@ fn upstream_context(
     limit: usize,
 ) -> String {
     match upstream_pulls(deps, dir, pre_rebase_rev, base, conflicted) {
-        Ok(pulls) => render_upstream_context(&pulls, limit),
+        Ok(found) => {
+            let mut text = render_upstream_context(&found.pulls, limit);
+            for gap in found.gaps {
+                text.push_str("\n\n");
+                text.push_str(&gap);
+            }
+            text
+        }
         Err(err) => format!(
             "Upstream pull request context is unavailable ({err}); work out the intent of \
              the base's changes from the diff."
@@ -500,32 +515,67 @@ fn upstream_context(
     }
 }
 
+/// What [`upstream_pulls`] found: the pull requests, plus one sentence per
+/// gap in the lookup (commits skipped past the cap, commits whose lookup
+/// failed) for the prompt to state after the list.
+struct UpstreamPulls {
+    pulls: Vec<CommitPull>,
+    gaps: Vec<String>,
+}
+
 /// The deduplicated pull requests behind [`upstream_context`]'s commits, in
-/// commit order (newest first).
+/// commit order (newest first). Errors only when the commit list itself
+/// cannot be read, or when every commit lookup failed and none found a PR.
 fn upstream_pulls(
     deps: &MergeDeps<'_>,
     dir: &Path,
     pre_rebase_rev: &str,
     base: &str,
     conflicted: &[String],
-) -> Result<Vec<CommitPull>, String> {
+) -> Result<UpstreamPulls, String> {
     let shas = deps
         .git
         .commits_touching(dir, pre_rebase_rev, &format!("origin/{base}"), conflicted)
         .map_err(|err| err.to_string())?;
+    let skipped = shas.len().saturating_sub(UPSTREAM_COMMIT_LOOKUP_LIMIT);
     let mut pulls: Vec<CommitPull> = Vec::new();
-    for sha in shas {
-        for pull in deps
-            .gh
-            .commit_pulls(dir, &sha)
-            .map_err(|err| err.to_string())?
-        {
-            if !pulls.iter().any(|seen| seen.number == pull.number) {
-                pulls.push(pull);
+    let mut failures: Vec<String> = Vec::new();
+    for sha in shas.iter().take(UPSTREAM_COMMIT_LOOKUP_LIMIT) {
+        match deps.gh.commit_pulls(dir, sha) {
+            Ok(found) => {
+                for pull in found {
+                    if !pulls.iter().any(|seen| seen.number == pull.number) {
+                        pulls.push(pull);
+                    }
+                }
             }
+            Err(err) => failures.push(err.to_string()),
         }
     }
-    Ok(pulls)
+    if pulls.is_empty() && !failures.is_empty() {
+        return Err(failures.swap_remove(0));
+    }
+    let mut gaps = Vec::new();
+    if !failures.is_empty() {
+        let noun = if failures.len() == 1 {
+            "commit"
+        } else {
+            "commits"
+        };
+        gaps.push(format!(
+            "The pull request lookup failed for {} {noun}, so this list may be incomplete \
+             (first error: {}).",
+            failures.len(),
+            failures[0]
+        ));
+    }
+    if skipped > 0 {
+        gaps.push(format!(
+            "{skipped} older commits that touched the conflicted files were not looked up; \
+             run `git log` on those files to see them."
+        ));
+    }
+    Ok(UpstreamPulls { pulls, gaps })
 }
 
 /// Formats `pulls` as one `- PR #N: title` entry each, with the body
@@ -3321,6 +3371,59 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("HTTP 502"), "{prompt}");
+    }
+
+    #[test]
+    fn upstream_lookup_keeps_found_prs_when_one_commit_lookup_fails() {
+        let mut fx = resolving_conflict_fixture();
+        fx.merge_cfg.prompt = Some("CONTEXT\n{upstream_context}".to_string());
+        fx.git = std::mem::take(&mut fx.git)
+            .with_commits_touching_result(Ok(vec!["s1".to_string(), "s2".to_string()]));
+        fx.gh = std::mem::take(&mut fx.gh)
+            .with_commit_pulls("s1", Ok(vec![commit_pull(12, "Split config", "Why")]))
+            .with_commit_pulls(
+                "s2",
+                Err(GhError::Command {
+                    command: "gh api commits/pulls".to_string(),
+                    exit_code: Some(1),
+                    stderr: "HTTP 502".to_string(),
+                }),
+            );
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        let prompt = conflict_prompt_file(&fx, "PROJ-1");
+        assert!(prompt.contains("PR #12: Split config"), "{prompt}");
+        assert!(
+            !prompt.contains("Upstream pull request context is unavailable"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("1 commit"), "{prompt}");
+        assert!(prompt.contains("HTTP 502"), "{prompt}");
+    }
+
+    #[test]
+    fn upstream_lookup_stops_after_the_commit_cap() {
+        let mut fx = resolving_conflict_fixture();
+        fx.merge_cfg.prompt = Some("CONTEXT\n{upstream_context}".to_string());
+        let shas: Vec<String> = (0..UPSTREAM_COMMIT_LOOKUP_LIMIT + 5)
+            .map(|i| format!("s{i}"))
+            .collect();
+        fx.git = std::mem::take(&mut fx.git).with_commits_touching_result(Ok(shas.clone()));
+        fx.gh = std::mem::take(&mut fx.gh)
+            .with_commit_pulls("s0", Ok(vec![commit_pull(12, "Split config", "Why")]));
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert_eq!(
+            fx.gh.commit_pulls_calls(),
+            shas[..UPSTREAM_COMMIT_LOOKUP_LIMIT].to_vec()
+        );
+        let prompt = conflict_prompt_file(&fx, "PROJ-1");
+        assert!(prompt.contains("PR #12: Split config"), "{prompt}");
+        assert!(prompt.contains("5 older commits"), "{prompt}");
     }
 
     // --- happy path, no rebase needed ---
