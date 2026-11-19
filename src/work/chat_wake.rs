@@ -68,9 +68,9 @@ pub struct ChatWake {
 /// module docs for the rule. `runs` is the tick's
 /// [`RunStore::overview_runs`] snapshot.
 ///
-/// thatch is asked at most twice per sweep (one roster lookup for every
-/// idle lane, one tail snapshot when any has mail), and not at all when no
-/// lane is idle. A missing `thatch` or a failing tmux call wakes nothing
+/// thatch is asked once for the roster of every idle lane, then once per
+/// idle lane with mail for a tail of the mail sent to it, and not at all
+/// when no lane is idle. A missing `thatch` or a failing tmux call wakes nothing
 /// and is not an error.
 ///
 /// # Errors
@@ -112,12 +112,14 @@ pub fn sweep(
         return Ok(Vec::new());
     }
 
-    let messages = tail(thatch, None);
     let mut woken = Vec::new();
     for (run, name) in with_mail {
-        // Mail older than the tail snapshot has no id to tell batches
-        // apart; 0 still wakes the lane once for it.
-        let batch = newest_unread_to(name, &messages).unwrap_or(0);
+        // One tail per lane, narrowed to mail sent to it: an unfiltered
+        // tail holds only the last TAIL_LIMIT messages across every
+        // session, and busy chat would push this lane's mail out of it.
+        // 0 stands in for an id only if thatch reports unread mail but the
+        // tail shows none.
+        let batch = newest_unread_to(name, &tail(thatch, Some(("--to", name)))).unwrap_or(0);
         if last_woken_batch(store, run.id)? == Some(batch) {
             continue;
         }
@@ -369,6 +371,32 @@ mod tests {
         .unwrap();
 
         assert_eq!(woken.len(), 1);
+    }
+
+    #[test]
+    fn the_batch_id_comes_from_a_tail_of_mail_to_that_lane() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        lane(&store, SCOPE, "await");
+        let runner = thatch("mcp", &[7]);
+
+        sweep(
+            &store,
+            &FakeTmuxOps::new(),
+            &runner,
+            &store.overview_runs().unwrap(),
+            SCOPE,
+        )
+        .unwrap();
+
+        // An unfiltered tail holds only the last TAIL_LIMIT messages across
+        // every session, so a busy chat can push the lane's mail out of it.
+        assert_eq!(
+            runner.calls.borrow().last(),
+            Some(&crate::work::thatch_chat::tail_args(Some((
+                "--to", "npc-1"
+            ))))
+        );
     }
 
     #[test]
