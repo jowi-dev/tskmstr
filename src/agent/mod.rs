@@ -867,8 +867,10 @@ pub trait AgentRunner: Sync {
     /// Default prompt template used when `[work.merge].prompt`/`prompt_file`
     /// are both unset, handed to the interactive agent session `tm merge`
     /// opens when a rebase stops on conflicts. Placeholders `{key}` (the
-    /// ticket key), `{branch}` (the branch being rebased), and `{base}` (the
-    /// branch it's being rebased onto) are substituted by the caller
+    /// ticket key), `{branch}` (the branch being rebased), `{base}` (the
+    /// branch it's being rebased onto), and `{upstream_context}` (the pull
+    /// requests merged into the base that changed the conflicted files,
+    /// GitHub issue #246) are substituted by the caller
     /// (`crate::work::merge`), not here.
     ///
     /// Provided with a runner-neutral default rather than required per
@@ -879,10 +881,15 @@ pub trait AgentRunner: Sync {
     /// needs to.
     fn default_merge_conflict_prompt_template(&self) -> &'static str {
         "A git rebase of branch {branch} onto origin/{base} for ticket {key} has stopped on \
-         conflicts in this worktree. Your job is bounded: resolve only the merge conflicts. \
-         Inspect the conflicted files, resolve each conflict preserving the intent of both \
-         sides, `git add` the resolved files, and run `git rebase --continue` until the rebase \
-         completes. Do not push. Do not make unrelated changes. If a conflict cannot be \
+         conflicts in this worktree. Your job is bounded: resolve only the merge conflicts.\n\n\
+         {upstream_context}\n\n\
+         Before resolving, learn why the base changed: for each pull request above, call \
+         thatch's memory_recall with includeArchived: true, querying its number and title, to \
+         find the archived memories of the branch that pull request merged. Then inspect the \
+         conflicted files, resolve each conflict preserving the intent of both sides, `git add` \
+         the resolved files, and run `git rebase --continue` until the rebase completes. \
+         Between commits, run only the tests scoped to the conflicted area, then run the full \
+         suite once after the rebase completes. Do not push. Do not make unrelated changes. If a conflict cannot be \
          resolved safely, run `git rebase --abort` and explain why."
     }
 
@@ -905,10 +912,12 @@ pub trait AgentRunner: Sync {
     /// Default prompt template used when `[work.merge].batch_conflict_prompt`
     /// is unset, handed to the single interactive agent session a batch
     /// `tm merge KEY1 KEY2 ...` opens when two or more of its tickets stop on
-    /// rebase conflicts. The one placeholder, `{ticket_list}`, is substituted
-    /// by the caller (`crate::work::merge`) with a pre-rendered,
-    /// newline-separated list of each conflicting ticket's key, branch,
-    /// base, and checkout directory.
+    /// rebase conflicts. The caller (`crate::work::merge`) substitutes
+    /// `{ticket_list}` with a pre-rendered, newline-separated list of each
+    /// conflicting ticket's key, branch, base, and checkout directory, and
+    /// `{upstream_context}` with one section per ticket listing the pull
+    /// requests merged into its base that changed its conflicted files
+    /// (GitHub issue #246).
     ///
     /// Runner-neutral for the same reason as
     /// [`AgentRunner::default_merge_conflict_prompt_template`].
@@ -917,11 +926,16 @@ pub trait AgentRunner: Sync {
          the ticket key, the branch being rebased, the base it is being rebased onto \
          (origin/<base>), and the checkout directory the rebase is in progress in:\n\n\
          {ticket_list}\n\n\
+         {upstream_context}\n\n\
          Your job is bounded: resolve only the merge conflicts, one ticket at a time, in the \
-         order listed. For each ticket, work in its checkout directory: inspect the conflicted \
-         files, resolve each conflict preserving the intent of both sides, `git add` the \
-         resolved files, and run `git rebase --continue` until that rebase completes, then move \
-         on to the next ticket. Do not push. Do not make unrelated changes. If a ticket's \
+         order listed. Before resolving a ticket, learn why its base changed: for each pull \
+         request listed for it, call thatch's memory_recall with includeArchived: true, \
+         querying its number and title, to find the archived memories of the branch that pull \
+         request merged. Between commits, run only the tests scoped to the conflicted area, then \
+         run the full suite once after that rebase completes. For each ticket, work in its checkout directory: \
+         inspect the conflicted files, resolve each conflict preserving the intent of both \
+         sides, `git add` the resolved files, and run `git rebase --continue` until that \
+         rebase completes, then move on to the next ticket. Do not push. Do not make unrelated changes. If a ticket's \
          conflicts cannot be resolved safely, run `git rebase --abort` in its directory, \
          explain why, and continue with the next ticket."
     }
@@ -1138,11 +1152,26 @@ mod tests {
         let claude = ClaudeRunner.default_merge_conflict_prompt_template();
         let opencode = OpencodeRunner.default_merge_conflict_prompt_template();
         assert_eq!(claude, opencode);
-        for placeholder in ["{key}", "{branch}", "{base}"] {
+        for placeholder in ["{key}", "{branch}", "{base}", "{upstream_context}"] {
             assert!(
                 claude.contains(placeholder),
                 "expected {placeholder} in the default merge conflict prompt template, got: {claude:?}"
             );
+        }
+    }
+
+    /// GitHub issue #246: both default conflict templates have the agent
+    /// recall the upstream PRs' archived branch memories before resolving,
+    /// and run only tests scoped to the conflicted area while rebasing.
+    #[test]
+    fn default_conflict_prompt_templates_recall_archived_memories_and_scope_tests() {
+        for template in [
+            ClaudeRunner.default_merge_conflict_prompt_template(),
+            ClaudeRunner.default_batch_merge_conflict_prompt_template(),
+        ] {
+            assert!(template.contains("includeArchived: true"), "{template}");
+            assert!(template.contains("memory_recall"), "{template}");
+            assert!(template.contains("conflicted area"), "{template}");
         }
     }
 
@@ -1155,10 +1184,12 @@ mod tests {
         let claude = ClaudeRunner.default_batch_merge_conflict_prompt_template();
         let opencode = OpencodeRunner.default_batch_merge_conflict_prompt_template();
         assert_eq!(claude, opencode);
-        assert!(
-            claude.contains("{ticket_list}"),
-            "expected {{ticket_list}} in the default batch merge conflict prompt template, got: {claude:?}"
-        );
+        for placeholder in ["{ticket_list}", "{upstream_context}"] {
+            assert!(
+                claude.contains(placeholder),
+                "expected {placeholder} in the default batch merge conflict prompt template, got: {claude:?}"
+            );
+        }
     }
 
     /// Both adapters inherit the `merge` strategy's conflict templates

@@ -2611,7 +2611,12 @@ these stages:
    conflict-resolution prompt — on your *current* tmux session's window
    when `tm merge` is itself run inside tmux, or a standalone
    `tm-<scope>-<key>` ticket session otherwise (same session-targeting
-   `tm work session` uses). `tm merge` then polls until the rebase
+   `tm work session` uses). The default prompt lists the pull requests
+   merged into the base since the branch was cut that changed the
+   conflicted files (number, title, trimmed body; see `{upstream_context}`
+   below), and tells the agent to recall those branches' archived thatch
+   memories and to run only tests scoped to the conflicted area until the
+   rebase finishes. `tm merge` then polls until the rebase
    completes, the window dies, or 15 minutes pass with no resolution. A
    session that never resolves isn't a failure: the rebase is left
    in-progress on disk, `tm merge` exits `2`, and it prints exactly how to
@@ -2820,15 +2825,33 @@ Leave both unset and tm ships a sensible default prompt itself,
 `{key}`/`{branch}`/`{base}`-substituted the same way `prompt`/`prompt_file`
 are — no config is required to get a working conflict-resolution session.
 `{key}` is the ticket key, `{branch}` is the PR's branch, and `{base}` is
-the PR's base branch (e.g. `main`). `model` takes precedence over `[work]
+the PR's base branch (e.g. `main`).
+
+`{upstream_context}` (in `prompt`, `prompt_file`, and
+`batch_conflict_prompt`) is replaced with the pull requests behind the
+upstream commits that touched the conflicted files: the commits in
+`<branch tip before the rebase>..origin/<base>` touching those paths,
+each mapped to its PR with `gh api repos/{owner}/{repo}/commits/<sha>/pulls`.
+Each PR appears once, as `- PR #N: title` with its body indented below,
+and the bodies are trimmed to share a 12,000-byte cap. Only the newest 25
+matching commits are looked up; the placeholder notes how many older ones
+were skipped. If a single commit's `gh` lookup fails, the PRs already found
+are kept and the placeholder notes the gap. If the `git` lookup fails, or
+every `gh` lookup fails, the placeholder says the context is unavailable
+and why. Either way the session still opens. A template without the placeholder skips
+the lookup and renders exactly as before. In `batch_conflict_prompt` it
+becomes one `<KEY> upstream context:` section per conflicting ticket.
+
+`model` takes precedence over `[work]
 default_model` for conflict sessions, the same way `[work.audit].model`
 does for audits.
 
 `batch_conflict_prompt` is the template for the single combined session a
 multi-key `tm merge` opens when its tickets stop on conflicts (see
-"Merging several tickets at once" above). Its one placeholder,
-`{ticket_list}`, is replaced with one line per conflicting ticket giving
-its key, branch, base, and checkout directory. Leave it unset and tm ships
+"Merging several tickets at once" above). Its `{ticket_list}`
+placeholder is replaced with one line per conflicting ticket giving its
+key, branch, base, and checkout directory; `{upstream_context}` works as
+described above. Leave it unset and tm ships
 a built-in batch prompt. It is independent of `prompt`/`prompt_file`,
 which stay single-ticket only, so setting it alongside either is fine.
 

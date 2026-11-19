@@ -229,6 +229,18 @@ pub trait GitOps {
     /// trimmed. Empty output is an empty vec, not an error.
     fn conflicted_files(&self, dir: &Path) -> Result<Vec<String>, GitError>;
 
+    /// The commits reachable from `include` but not from `exclude` that
+    /// touch any of `paths` (`git log --format=%H <exclude>..<include> --
+    /// <paths>`), newest first. Empty `paths` returns an empty vec without
+    /// running git, since an empty pathspec would match every commit.
+    fn commits_touching(
+        &self,
+        dir: &Path,
+        exclude: &str,
+        include: &str,
+        paths: &[String],
+    ) -> Result<Vec<String>, GitError>;
+
     /// Force-push `branch` to `origin` with lease protection
     /// (`git push --force-with-lease origin <branch>`), used after a
     /// successful rebase to update the remote branch's history.
@@ -720,6 +732,38 @@ impl GitOps for ShellGitOps {
             ))),
             code => Err(GitError::Command {
                 command: "git diff --name-only --diff-filter=U".to_string(),
+                exit_code: code,
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
+    }
+
+    fn commits_touching(
+        &self,
+        dir: &Path,
+        exclude: &str,
+        include: &str,
+        paths: &[String],
+    ) -> Result<Vec<String>, GitError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = vec![
+            "log".to_string(),
+            "--format=%H".to_string(),
+            format!("{exclude}..{include}"),
+            "--".to_string(),
+        ];
+        args.extend(paths.iter().cloned());
+        let output = run_git(dir, &args, "git log --format=%H")?;
+
+        // One sha per line: the same shape `parse_conflicted_files` parses.
+        match output.status.code() {
+            Some(0) => Ok(parse_conflicted_files(&String::from_utf8_lossy(
+                &output.stdout,
+            ))),
+            code => Err(GitError::Command {
+                command: "git log --format=%H".to_string(),
                 exit_code: code,
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             }),
@@ -1295,6 +1339,8 @@ pub struct FakeGitOps {
     /// [`Self::with_conflicted_files_sequence`].
     conflicted_files_sequence: std::cell::RefCell<Vec<Result<Vec<String>, GitError>>>,
     conflicted_files_index: std::cell::RefCell<usize>,
+    commits_touching_result: std::cell::RefCell<Result<Vec<String>, GitError>>,
+    commits_touching_calls: std::cell::RefCell<Vec<(String, String, Vec<String>)>>,
     push_force_with_lease_result: std::cell::RefCell<Result<(), GitError>>,
     merge_ff_only_result: std::cell::RefCell<Result<(), GitError>>,
     fetch_branch_to_local_result: std::cell::RefCell<Result<(), GitError>>,
@@ -1370,6 +1416,8 @@ impl Default for FakeGitOps {
             rebase_in_progress_index: std::cell::RefCell::new(0),
             conflicted_files_sequence: std::cell::RefCell::new(vec![Ok(Vec::new())]),
             conflicted_files_index: std::cell::RefCell::new(0),
+            commits_touching_result: std::cell::RefCell::new(Ok(Vec::new())),
+            commits_touching_calls: std::cell::RefCell::new(Vec::new()),
             push_force_with_lease_result: std::cell::RefCell::new(Ok(())),
             merge_ff_only_result: std::cell::RefCell::new(Ok(())),
             fetch_branch_to_local_result: std::cell::RefCell::new(Ok(())),
@@ -1735,6 +1783,18 @@ impl FakeGitOps {
         self
     }
 
+    /// Set the result `commits_touching` will return (default: `Ok(vec![])`).
+    pub fn with_commits_touching_result(self, result: Result<Vec<String>, GitError>) -> Self {
+        *self.commits_touching_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `(exclude, include, paths)` passed to `commits_touching`, in call
+    /// order.
+    pub fn commits_touching_calls(&self) -> Vec<(String, String, Vec<String>)> {
+        self.commits_touching_calls.borrow().clone()
+    }
+
     /// Set the result `push_force_with_lease` will return.
     pub fn with_push_force_with_lease_result(self, result: Result<(), GitError>) -> Self {
         *self.push_force_with_lease_result.borrow_mut() = result;
@@ -2023,6 +2083,21 @@ impl GitOps for FakeGitOps {
             &self.conflicted_files_sequence,
             &self.conflicted_files_index,
         )
+    }
+
+    fn commits_touching(
+        &self,
+        _dir: &Path,
+        exclude: &str,
+        include: &str,
+        paths: &[String],
+    ) -> Result<Vec<String>, GitError> {
+        self.commits_touching_calls.borrow_mut().push((
+            exclude.to_string(),
+            include.to_string(),
+            paths.to_vec(),
+        ));
+        self.commits_touching_result.borrow().clone()
     }
 
     fn push_force_with_lease(&self, dir: &Path, branch: &str) -> Result<(), GitError> {
@@ -2741,6 +2816,36 @@ mod tests {
         assert_eq!(fake.call_log(), vec!["delete_branch"]);
     }
 
+    #[test]
+    fn fake_git_ops_commits_touching_returns_configured_result_and_records_calls() {
+        let fake = FakeGitOps::new().with_commits_touching_result(Ok(vec!["abc".to_string()]));
+
+        let shas = fake
+            .commits_touching(
+                Path::new("/wt"),
+                "pre",
+                "origin/main",
+                &["a.rs".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(shas, vec!["abc"]);
+        assert_eq!(
+            fake.commits_touching_calls(),
+            vec![(
+                "pre".to_string(),
+                "origin/main".to_string(),
+                vec!["a.rs".to_string()]
+            )]
+        );
+        assert!(
+            FakeGitOps::new()
+                .commits_touching(Path::new("/wt"), "a", "b", &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     // --- ShellGitOps integration tests against a real temp git repo ---
 
     fn git_init(dir: &Path) {
@@ -2776,6 +2881,45 @@ mod tests {
             .args(["commit", "-q", "-m", "init"])
             .status()
             .unwrap();
+    }
+
+    #[test]
+    fn shell_git_ops_commits_touching_lists_upstream_commits_on_the_given_paths() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        git_init(dir);
+        let git = |args: &[&str]| {
+            let status = StdCommand::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        let commit = |file: &str, msg: &str| {
+            std::fs::write(dir.join(file), msg).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", msg]);
+        };
+        git(&["branch", "lane"]);
+        commit("a.rs", "touch a");
+        commit("b.rs", "touch b");
+        commit("a.rs", "touch a again");
+        let ops = ShellGitOps::new();
+        let tip = ops.rev_parse(dir, "main").unwrap();
+        let first_a = ops.rev_parse(dir, "main~2").unwrap();
+
+        let shas = ops
+            .commits_touching(dir, "lane", "main", &["a.rs".to_string()])
+            .unwrap();
+
+        assert_eq!(shas, vec![tip, first_a]);
+        assert!(
+            ops.commits_touching(dir, "lane", "main", &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
