@@ -779,7 +779,11 @@ impl GitOps for ShellGitOps {
             &squash_commit_tree_args(since, message),
             "git commit-tree",
         )?;
-        interpret_success_or_command_error("git commit-tree", output.status.code(), &output.stderr)?;
+        interpret_success_or_command_error(
+            "git commit-tree",
+            output.status.code(),
+            &output.stderr,
+        )?;
         let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let args = vec!["reset".to_string(), "--soft".to_string(), commit];
         let output = run_git(dir, &args, "git reset --soft")?;
@@ -3518,7 +3522,11 @@ mod tests {
 
     fn head_parents(dir: &Path) -> usize {
         let out = git_cmd(dir, &["rev-list", "--parents", "-n", "1", "HEAD"]);
-        String::from_utf8(out.stdout).unwrap().split_whitespace().count() - 1
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .split_whitespace()
+            .count()
+            - 1
     }
 
     /// A repo whose `feature-branch` has three commits that each conflict
@@ -3564,7 +3572,9 @@ mod tests {
         three_conflicting_commits(tmp.path());
         let ops = ShellGitOps::new();
 
-        let since = ops.merge_base(tmp.path(), "feature-branch", "main").unwrap();
+        let since = ops
+            .merge_base(tmp.path(), "feature-branch", "main")
+            .unwrap();
         ops.squash_since(tmp.path(), &since, "squashed feature")
             .unwrap();
         assert_eq!(
@@ -3583,7 +3593,10 @@ mod tests {
         );
         assert!(!resolve_and_continue(&ops, tmp.path(), "resolved\n"));
         assert_eq!(ops.current_branch(tmp.path()).unwrap(), "feature-branch");
-        assert!(ops.is_ancestor(tmp.path(), "main", "feature-branch").unwrap());
+        assert!(
+            ops.is_ancestor(tmp.path(), "main", "feature-branch")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -3645,7 +3658,10 @@ mod tests {
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
         git_init(&work);
-        git_cmd(&work, &["remote", "add", "origin", origin_bare.to_str().unwrap()]);
+        git_cmd(
+            &work,
+            &["remote", "add", "origin", origin_bare.to_str().unwrap()],
+        );
         git_cmd(&work, &["push", "-q", "-u", "origin", "main"]);
         commit_file(&work, "more.txt", "more\n", "add more");
 
@@ -3666,7 +3682,10 @@ mod tests {
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
         git_init(&work);
-        git_cmd(&work, &["remote", "add", "origin", origin_bare.to_str().unwrap()]);
+        git_cmd(
+            &work,
+            &["remote", "add", "origin", origin_bare.to_str().unwrap()],
+        );
         commit_file(&work, "more.txt", "more\n", "add more");
         git_cmd(&work, &["push", "-q", "-u", "origin", "main"]);
         git_cmd(&work, &["reset", "-q", "--hard", "HEAD~1"]);
