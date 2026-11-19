@@ -2522,11 +2522,7 @@ const MERGE_EXIT_CONFLICTS: u8 = 2;
 /// [`tskmstr::work::merge::BatchMergeReport::exit_code`] (same three
 /// codes; a failure outranks a hand-back). A single key always takes the
 /// unchanged `run_merge` path.
-fn run_merge_cmd(
-    keys: Vec<String>,
-    allow_red_base: bool,
-    auto_merge_run: Option<i64>,
-) -> ExitCode {
+fn run_merge_cmd(keys: Vec<String>, allow_red_base: bool, auto_merge_run: Option<i64>) -> ExitCode {
     if auto_merge_run.is_some() && keys.len() != 1 {
         eprintln!("--auto-merge-run takes exactly one ticket key");
         return ExitCode::FAILURE;
