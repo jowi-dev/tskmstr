@@ -89,6 +89,12 @@ pub enum WorkCliError {
     #[error("directory does not exist: {}", .0.display())]
     DirectoryNotFound(PathBuf),
 
+    /// `tm work deps unshare` ran outside a linked worktree (in the main
+    /// checkout, or outside any git checkout), where there is no shared
+    /// link to replace.
+    #[error("not inside a linked worktree: {}", .0.display())]
+    NotInLinkedWorktree(PathBuf),
+
     /// `tm work remove <name>` named a worktree that hasn't been
     /// provisioned. Mirrors `work.ml`'s `worktree_remove` existence check.
     #[error("worktree does not exist: {}", .0.display())]
@@ -1193,6 +1199,40 @@ pub fn new(
     start_in_dir(ctx, &wt_path, out)
 }
 
+/// `tm work deps unshare`: replace every `[work] shared_deps` link in the
+/// worktree enclosing `cwd` with a private copy, whatever the lock files
+/// say (GitHub issue #255). An agent runs this before changing
+/// dependencies, so the change lands in the worktree's own copy instead of
+/// the main checkout's.
+///
+/// The worktree root is the nearest ancestor of `cwd` holding a `.git`
+/// *file* (a linked worktree's marker); the main checkout, whose `.git` is
+/// a directory, is refused with [`WorkCliError::NotInLinkedWorktree`].
+pub fn deps_unshare(
+    ctx: &WorkContext<'_>,
+    cwd: &Path,
+    out: &mut dyn Write,
+) -> Result<(), WorkCliError> {
+    let wt_path = cwd
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .filter(|dir| dir.join(".git").is_file())
+        .ok_or_else(|| WorkCliError::NotInLinkedWorktree(cwd.to_path_buf()))?;
+    let repo_root = ctx.git.repo_root(wt_path)?;
+    let unshared = crate::work::shared_deps::unshare(
+        &repo_root,
+        wt_path,
+        &ctx.config.shared_deps,
+        crate::work::shared_deps::UnshareMode::Always,
+    )?;
+    if unshared.is_empty() {
+        writeln!(out, "No shared deps linked here.")?;
+    } else {
+        writeln!(out, "Unshared deps: {}", unshared.join(", "))?;
+    }
+    Ok(())
+}
+
 /// `tm work remove <name>`: kill the worktree's tmux session (if any) and
 /// remove the worktree. Mirrors `work.ml`'s `worktree_remove`.
 pub fn remove(
@@ -1456,6 +1496,102 @@ mod tests {
 
         let repo = resolve_repo_root(&ctx, "not-a-lane", Path::new("/somewhere")).unwrap();
         assert_eq!(repo, PathBuf::from("/repo"));
+    }
+
+    // --- deps unshare ---
+
+    fn shared_deps_config() -> WorkConfig {
+        WorkConfig {
+            shared_deps: vec![crate::config::SharedDep {
+                path: "deps".to_string(),
+                lock_file: "mix.lock".to_string(),
+            }],
+            ..default_config()
+        }
+    }
+
+    /// A main checkout with `deps/` and a worktree (marked by a `.git`
+    /// file) whose `deps` links to it, both with the same `mix.lock`.
+    fn linked_worktree() -> (TempDir, PathBuf, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(repo.join("deps/pkg")).unwrap();
+        std::fs::write(repo.join("mix.lock"), "lock-v1").unwrap();
+        std::fs::create_dir_all(wt.join("lib")).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: elsewhere").unwrap();
+        std::fs::write(wt.join("mix.lock"), "lock-v1").unwrap();
+        std::os::unix::fs::symlink(repo.join("deps"), wt.join("deps")).unwrap();
+        (tmp, repo, wt)
+    }
+
+    #[test]
+    fn deps_unshare_copies_linked_paths_of_the_enclosing_worktree() {
+        let (_tmp, repo, wt) = linked_worktree();
+        let config = shared_deps_config();
+        let git = FakeGitOps::new().with_repo_root(Ok(repo.clone()));
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let mut out = Vec::new();
+
+        deps_unshare(&ctx, &wt.join("lib"), &mut out).unwrap();
+
+        let meta = wt.join("deps").symlink_metadata().unwrap();
+        assert!(!meta.file_type().is_symlink());
+        assert!(wt.join("deps/pkg").is_dir());
+        assert_eq!(out_string(&out), "Unshared deps: deps\n");
+    }
+
+    #[test]
+    fn deps_unshare_reports_when_nothing_is_linked() {
+        let (_tmp, repo, wt) = linked_worktree();
+        std::fs::remove_file(wt.join("deps")).unwrap();
+        let config = shared_deps_config();
+        let git = FakeGitOps::new().with_repo_root(Ok(repo));
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let mut out = Vec::new();
+
+        deps_unshare(&ctx, &wt, &mut out).unwrap();
+
+        assert_eq!(out_string(&out), "No shared deps linked here.\n");
+    }
+
+    #[test]
+    fn deps_unshare_refuses_the_main_checkout() {
+        let (_tmp, repo, _wt) = linked_worktree();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let config = shared_deps_config();
+        let git = FakeGitOps::new().with_repo_root(Ok(repo.clone()));
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let mut out = Vec::new();
+
+        let err = deps_unshare(&ctx, &repo, &mut out).unwrap_err();
+
+        assert!(
+            matches!(err, WorkCliError::NotInLinkedWorktree(_)),
+            "{err:?}"
+        );
+        assert!(repo.join("deps/pkg").is_dir());
     }
 
     // --- new: provisioning ---

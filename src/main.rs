@@ -797,6 +797,11 @@ fn run_work(
         WorkCmd::Remove { name } => {
             tskmstr::cli::work::remove(&ctx, &name, &cwd, &mut stdout)?;
         }
+        WorkCmd::Deps {
+            cmd: tskmstr::cli::DepsCmd::Unshare,
+        } => {
+            tskmstr::cli::work::deps_unshare(&ctx, &cwd, &mut stdout)?;
+        }
         WorkCmd::List => {
             tskmstr::cli::work::list(&ctx, &mut stdout)?;
         }

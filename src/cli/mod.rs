@@ -631,6 +631,23 @@ pub enum WorkCmd {
         #[command(subcommand)]
         cmd: HooksCmd,
     },
+    /// Manage dependency directories shared with the main checkout
+    /// (`[work] shared_deps`, see `tskmstr::work::shared_deps`).
+    Deps {
+        /// Which deps action to perform.
+        #[command(subcommand)]
+        cmd: DepsCmd,
+    },
+}
+
+/// `tm work deps` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum DepsCmd {
+    /// Replace this worktree's shared dependency links with private copies.
+    /// Run it before changing dependencies (editing a lock file, running
+    /// `mix deps.get` or `npm install`), so the change doesn't rewrite the
+    /// main checkout's copy that every other worktree also links to.
+    Unshare,
 }
 
 /// `tm work hooks` subcommands.
