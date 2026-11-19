@@ -715,7 +715,24 @@ pub struct RawMergeConfig {
     /// `"merge"` merges the base into the branch instead of rewriting it.
     /// Any other value is a [`ConfigError::InvalidMergeStrategy`].
     pub strategy: Option<String>,
+    /// Whether `tm merge` waits for the PR's checks to pass on the head
+    /// commit before merging it (GitHub issue #241). After a rebase and
+    /// push, the checks must run on the new head; a failing check stops
+    /// the merge. Defaults to `true` when unset.
+    pub wait_for_checks: Option<bool>,
+    /// Seconds `tm merge` waits for pending checks before handing the
+    /// ticket back unmerged (see [`RawMergeConfig::wait_for_checks`]).
+    /// Defaults to [`DEFAULT_CHECKS_TIMEOUT_SECS`] when unset.
+    pub checks_timeout_secs: Option<u64>,
+    /// Shell command (run with `sh -c`) `tm merge` runs in the branch's
+    /// checkout after a rebase and before pushing, such as `cargo test`. A
+    /// non-zero exit stops the merge with nothing pushed. Unset runs
+    /// nothing.
+    pub verify_command: Option<String>,
 }
+
+/// Default for [`RawMergeConfig::checks_timeout_secs`]: 30 minutes.
+pub const DEFAULT_CHECKS_TIMEOUT_SECS: u64 = 1800;
 
 /// Raw, partially-specified `[work.retro]` subsection as parsed directly
 /// from TOML (GitHub issue #227): configures the short headless session
@@ -1466,9 +1483,12 @@ pub struct CreateConfig {
 /// session a multi-key `tm merge` opens (its one placeholder is
 /// `{ticket_list}`). `consolidate_memories` turns the post-merge
 /// memory-consolidation session on or off. `strategy` picks how the branch
-/// catches up with its base (see [`MergeStrategy`]). All fields are
-/// optional: an absent section falls back to the built-in prompts, the rest
-/// of the model chain, consolidation on, and the rebase strategy.
+/// catches up with its base (see [`MergeStrategy`]). `wait_for_checks`,
+/// `checks_timeout_secs`, and `verify_command` gate the merge on the PR's
+/// checks and a local command (GitHub issue #241). All fields are optional:
+/// an absent section falls back to the built-in prompts, the rest of the
+/// model chain, consolidation on, the rebase strategy, and waiting for
+/// checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeConfig {
     /// See [`RawMergeConfig::prompt`].
@@ -1484,6 +1504,13 @@ pub struct MergeConfig {
     /// See [`RawMergeConfig::strategy`]; [`MergeStrategy::Rebase`] when
     /// unset.
     pub strategy: MergeStrategy,
+    /// See [`RawMergeConfig::wait_for_checks`]; `true` when unset.
+    pub wait_for_checks: bool,
+    /// See [`RawMergeConfig::checks_timeout_secs`];
+    /// [`DEFAULT_CHECKS_TIMEOUT_SECS`] when unset.
+    pub checks_timeout_secs: u64,
+    /// See [`RawMergeConfig::verify_command`].
+    pub verify_command: Option<String>,
 }
 
 /// How `tm merge` brings a branch up to date with its base before merging
@@ -1523,6 +1550,9 @@ impl Default for MergeConfig {
             batch_conflict_prompt: None,
             consolidate_memories: true,
             strategy: MergeStrategy::Rebase,
+            wait_for_checks: true,
+            checks_timeout_secs: DEFAULT_CHECKS_TIMEOUT_SECS,
+            verify_command: None,
         }
     }
 }
@@ -3094,6 +3124,15 @@ fn merge_merge_section(
             }
             None => MergeStrategy::default(),
         },
+        wait_for_checks: repo
+            .wait_for_checks
+            .or(global.wait_for_checks)
+            .unwrap_or(true),
+        checks_timeout_secs: repo
+            .checks_timeout_secs
+            .or(global.checks_timeout_secs)
+            .unwrap_or(DEFAULT_CHECKS_TIMEOUT_SECS),
+        verify_command: repo.verify_command.or(global.verify_command),
     })
 }
 
@@ -6784,6 +6823,71 @@ mod tests {
     }
 
     #[test]
+    fn merge_work_checks_gate_defaults_to_waiting_with_a_timeout_and_no_verify_command() {
+        let cfg = merge_work(None, None, None).expect("should merge");
+        assert!(cfg.merge.wait_for_checks);
+        assert_eq!(cfg.merge.checks_timeout_secs, DEFAULT_CHECKS_TIMEOUT_SECS);
+        assert_eq!(cfg.merge.verify_command, None);
+    }
+
+    #[test]
+    fn merge_work_checks_gate_keys_repo_override_global() {
+        let global = RawWorkConfig {
+            merge: Some(RawMergeConfig {
+                wait_for_checks: Some(true),
+                checks_timeout_secs: Some(600),
+                verify_command: Some("make test".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            merge: Some(RawMergeConfig {
+                wait_for_checks: Some(false),
+                verify_command: Some("cargo test".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
+        assert!(!cfg.merge.wait_for_checks);
+        assert_eq!(cfg.merge.checks_timeout_secs, 600);
+        assert_eq!(cfg.merge.verify_command, Some("cargo test".to_string()));
+    }
+
+    #[test]
+    fn load_work_merge_section_parses_the_checks_gate_keys() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+
+            [work.merge]
+            wait_for_checks = false
+            checks_timeout_secs = 120
+            verify_command = "cargo test"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert!(!cfg.work.merge.wait_for_checks);
+        assert_eq!(cfg.work.merge.checks_timeout_secs, 120);
+        assert_eq!(
+            cfg.work.merge.verify_command,
+            Some("cargo test".to_string())
+        );
+    }
+
+    #[test]
     fn merge_work_batch_conflict_prompt_repo_overrides_global() {
         let global = RawWorkConfig {
             merge: Some(RawMergeConfig {
@@ -6874,6 +6978,7 @@ mod tests {
                 batch_conflict_prompt: None,
                 consolidate_memories: None,
                 strategy: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -6885,6 +6990,7 @@ mod tests {
                 batch_conflict_prompt: None,
                 consolidate_memories: None,
                 strategy: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
