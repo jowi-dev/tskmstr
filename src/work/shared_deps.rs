@@ -128,11 +128,7 @@ pub fn unshare(
     let mut unshared = Vec::new();
     for entry in entries {
         let dest = wt_path.join(&entry.path);
-        let is_link = dest
-            .symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false);
-        if !is_link {
+        if !is_symlink(&dest) {
             continue;
         }
         if mode == UnshareMode::WhenLockDiffers
@@ -156,6 +152,35 @@ pub fn unshare(
         unshared.push(entry.path.clone());
     }
     Ok(unshared)
+}
+
+/// A paragraph for the agent's prompt naming the paths in `wt_path` that
+/// are currently linked to the main checkout and telling it to run
+/// `tm work deps unshare` before changing dependencies, or `None` when
+/// nothing is linked.
+pub fn prompt_note(wt_path: &Path, entries: &[SharedDep]) -> Option<String> {
+    let linked: Vec<String> = entries
+        .iter()
+        .filter(|entry| is_symlink(&wt_path.join(&entry.path)))
+        .map(|entry| format!("`{}`", entry.path))
+        .collect();
+    if linked.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "This worktree shares {} with the main checkout through a symlink. \
+         Before changing dependencies (editing a lock file or running a \
+         dependency install or update), run `tm work deps unshare` so the \
+         change lands in a private copy instead of the main checkout's.",
+        linked.join(", ")
+    ))
+}
+
+/// Whether `path` is itself a symlink (not followed).
+fn is_symlink(path: &Path) -> bool {
+    path.symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 /// Whether `lock_file` exists in both checkouts with identical contents.
@@ -266,12 +291,6 @@ mod tests {
             fs::write(wt.join("mix.lock"), lock).unwrap();
         }
         (root, repo, wt)
-    }
-
-    fn is_symlink(p: &Path) -> bool {
-        p.symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
     }
 
     #[test]
@@ -530,6 +549,18 @@ mod tests {
 
         assert!(messages.is_empty());
         assert_eq!(fake.provision_worktree_calls().len(), 1);
+    }
+
+    #[test]
+    fn prompt_note_names_linked_paths() {
+        let (_root, repo, wt) = setup(Some("lock-v1"));
+        assert_eq!(prompt_note(&wt, &mix_deps()), None);
+
+        link_shared_deps(&repo, &wt, &mix_deps()).unwrap();
+
+        let note = prompt_note(&wt, &mix_deps()).unwrap();
+        assert!(note.contains("`deps`"), "{note}");
+        assert!(note.contains("run `tm work deps unshare`"), "{note}");
     }
 
     #[test]

@@ -34,7 +34,9 @@
 //!    `wt_name` as the initial branch from the resolved base. If
 //!    `<repo_root>/.env.local` exists, [`GitOps::provision_worktree`]
 //!    symlinks it into the new worktree and this prints `work.ml`'s
-//!    "Linked .env.local from main repo" message.
+//!    "Linked .env.local from main repo" message. Paths listed in
+//!    `[work] shared_deps` are linked to the main checkout's copy when the
+//!    lock files match (see [`crate::work::shared_deps`]).
 //! 5. Fetch `origin` in the worktree ([`GitOps::fetch_origin`]), so the base
 //!    ref this run's branch is about to be cut from (step 6) is current —
 //!    `work.ml` does this immediately after provisioning-if-missing, before
@@ -57,8 +59,12 @@
 //!    way, the candidate branch name is resolved against
 //!    [`naming::resolve_branch_collision`] first, since (unlike the
 //!    timestamp) a slug does not guarantee uniqueness across re-runs.
-//! 7. Read the prompt file and append `"\n\nWork ticket: <ticket>."` when a
-//!    ticket was given.
+//!    Then replace any shared deps link whose lock file now differs from
+//!    the main checkout's with a private copy.
+//! 7. Read the prompt file, append a note telling the agent to run
+//!    `tm work deps unshare` before changing dependencies when any shared
+//!    deps path is still linked, and append `"\n\nWork ticket: <ticket>."`
+//!    when a ticket was given.
 //! 8. Deploy the configured runner's telemetry
 //!    ([`crate::agent::AgentRunner::deploy_telemetry`]), which for `claude`
 //!    writes the generated `--settings` JSON to
@@ -1345,6 +1351,10 @@ pub fn prepare_run_lane(
 
     // Step 7: build the prompt.
     let prompt_text = std::fs::read_to_string(&prompt_path)?;
+    let prompt_text = match crate::work::shared_deps::prompt_note(&wt_path, &config.shared_deps) {
+        Some(note) => format!("{prompt_text}\n\n{note}"),
+        None => prompt_text,
+    };
     let prompt = match request.ticket.as_deref() {
         Some(ticket) => format!("{prompt_text}\n\nWork ticket: {ticket}."),
         None => prompt_text,
@@ -4245,6 +4255,84 @@ mod tests {
         assert!(
             printed.contains("Unshared deps (lock file differs from main repo): deps"),
             "{printed}"
+        );
+    }
+
+    #[test]
+    fn run_lane_fg_tells_the_agent_to_unshare_while_deps_are_linked() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let mut config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+        config.shared_deps = vec![crate::config::SharedDep {
+            path: "deps".to_string(),
+            lock_file: "mix.lock".to_string(),
+        }];
+        std::fs::create_dir_all(repo_root.join("deps/pkg")).unwrap();
+        std::fs::write(repo_root.join("deps/pkg/lib.ex"), "main").unwrap();
+        std::fs::write(repo_root.join("mix.lock"), "lock-v1").unwrap();
+        let wt_path = worktree_root
+            .join(repo_root.file_name().unwrap())
+            .join("mylane");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        std::fs::write(wt_path.join("mix.lock"), "lock-v1").unwrap();
+        std::os::unix::fs::symlink(repo_root.join("deps"), wt_path.join("deps")).unwrap();
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+
+            status_on_run_start: None,
+            status_on_pr: None,
+            ticket_provider_error: None,
+            fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        run_lane_fg(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            &mut out,
+        )
+        .unwrap();
+
+        let deps_meta = wt_path.join("deps").symlink_metadata().unwrap();
+        assert!(deps_meta.file_type().is_symlink());
+        let recorded = spawner.recorded.lock().unwrap();
+        assert!(
+            recorded[0]
+                .args
+                .iter()
+                .any(|arg| arg.contains("run `tm work deps unshare`")),
+            "{:?}",
+            recorded[0].args
         );
     }
 
