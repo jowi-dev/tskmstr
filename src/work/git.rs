@@ -1235,9 +1235,19 @@ pub struct FakeGitOps {
     branch_exists_remote_result: std::cell::RefCell<Result<bool, GitError>>,
     provision_worktree_result: std::cell::RefCell<Result<(), GitError>>,
     status_is_clean_result: std::cell::RefCell<Result<bool, GitError>>,
+    /// Per-`dir` overrides for `status_is_clean`, consulted before the
+    /// blanket [`Self::status_is_clean_result`]. See
+    /// [`Self::with_status_is_clean_for`].
+    status_is_clean_by_path:
+        std::cell::RefCell<std::collections::HashMap<PathBuf, Result<bool, GitError>>>,
     switch_new_branch_result: std::cell::RefCell<Result<(), GitError>>,
     default_base_result: std::cell::RefCell<Result<String, GitError>>,
     remove_worktree_result: std::cell::RefCell<Result<(), GitError>>,
+    /// Per-`wt_path` overrides for `remove_worktree`, consulted before the
+    /// blanket [`Self::remove_worktree_result`]. See
+    /// [`Self::with_remove_worktree_result_for`].
+    remove_worktree_by_path:
+        std::cell::RefCell<std::collections::HashMap<PathBuf, Result<(), GitError>>>,
     fetch_origin_result: std::cell::RefCell<Result<(), GitError>>,
     current_branch_result: std::cell::RefCell<Result<String, GitError>>,
     /// Per-`dir` overrides for `current_branch`, consulted before
@@ -1341,9 +1351,11 @@ impl Default for FakeGitOps {
             branch_exists_remote_result: std::cell::RefCell::new(Ok(false)),
             provision_worktree_result: std::cell::RefCell::new(Ok(())),
             status_is_clean_result: std::cell::RefCell::new(Ok(true)),
+            status_is_clean_by_path: std::cell::RefCell::new(std::collections::HashMap::new()),
             switch_new_branch_result: std::cell::RefCell::new(Ok(())),
             default_base_result: std::cell::RefCell::new(Ok("origin/main".to_string())),
             remove_worktree_result: std::cell::RefCell::new(Ok(())),
+            remove_worktree_by_path: std::cell::RefCell::new(std::collections::HashMap::new()),
             fetch_origin_result: std::cell::RefCell::new(Ok(())),
             current_branch_result: std::cell::RefCell::new(Ok("main".to_string())),
             current_branch_by_path: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1469,6 +1481,16 @@ impl FakeGitOps {
         self
     }
 
+    /// Set the result `status_is_clean` returns for `dir` alone, leaving
+    /// every other path on the blanket [`Self::with_status_is_clean`]
+    /// answer — for tests mixing clean and dirty worktrees.
+    pub fn with_status_is_clean_for(self, dir: &Path, result: Result<bool, GitError>) -> Self {
+        self.status_is_clean_by_path
+            .borrow_mut()
+            .insert(dir.to_path_buf(), result);
+        self
+    }
+
     /// Set the result `switch_new_branch` will return.
     pub fn with_switch_new_branch_result(self, result: Result<(), GitError>) -> Self {
         *self.switch_new_branch_result.borrow_mut() = result;
@@ -1484,6 +1506,20 @@ impl FakeGitOps {
     /// Set the result `remove_worktree` will return.
     pub fn with_remove_worktree_result(self, result: Result<(), GitError>) -> Self {
         *self.remove_worktree_result.borrow_mut() = result;
+        self
+    }
+
+    /// Set the result `remove_worktree` returns for `wt_path` alone, leaving
+    /// every other path on the blanket [`Self::with_remove_worktree_result`]
+    /// answer — for tests where one removal of many fails.
+    pub fn with_remove_worktree_result_for(
+        self,
+        wt_path: &Path,
+        result: Result<(), GitError>,
+    ) -> Self {
+        self.remove_worktree_by_path
+            .borrow_mut()
+            .insert(wt_path.to_path_buf(), result);
         self
     }
 
@@ -1869,7 +1905,10 @@ impl GitOps for FakeGitOps {
         }
     }
 
-    fn status_is_clean(&self, _dir: &Path) -> Result<bool, GitError> {
+    fn status_is_clean(&self, dir: &Path) -> Result<bool, GitError> {
+        if let Some(result) = self.status_is_clean_by_path.borrow().get(dir) {
+            return result.clone();
+        }
         self.status_is_clean_result.borrow().clone()
     }
 
@@ -1893,6 +1932,9 @@ impl GitOps for FakeGitOps {
         self.remove_worktree_calls
             .borrow_mut()
             .push((repo_dir.to_path_buf(), wt_path.to_path_buf()));
+        if let Some(result) = self.remove_worktree_by_path.borrow().get(wt_path) {
+            return result.clone();
+        }
         self.remove_worktree_result.borrow().clone()
     }
 

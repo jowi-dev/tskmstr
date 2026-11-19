@@ -37,6 +37,7 @@ pub mod session;
 pub mod session_gc;
 pub mod setup_session;
 pub mod signal;
+pub mod sweep;
 pub mod thatch_chat;
 pub mod tmux;
 pub mod vdiff;

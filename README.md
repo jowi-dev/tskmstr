@@ -298,6 +298,7 @@ tm auth status
 | `tm work restore` | Recreate tmux sessions for every existing worktree that doesn't already have one running |
 | `tm work session <KEY>` | Rebuild `<KEY>`'s `tm-<scope>-<key>` tmux session and its windows from the ticket's recorded runs — after a reboot, a `tmux kill-server`, or an accidental `kill-session`. Only runs still in flight come back; never attaches, and does nothing to a healthy session. See "Per-ticket tmux sessions" below |
 | `tm work clean <KEY>` | Finish with `<KEY>`: archive each window's scrollback, then one `kill-session` on `tm-<scope>-<key>`, plus one worktree removal. Only a path under the configured worktree root is ever removed, so an audit run's `[work.audit].dir` is never touched |
+| `tm work sweep [KEYS...] [--merged] [--closed] [--yes]` | Clean many tickets in one pass: mark them by key and/or every ticket whose PR is merged or closed, confirm once, then run `tm work clean` for each. Live runs, root sessions, and dirty worktrees are skipped; exits 1 when any ticket failed. See "Sweeping many tickets" below |
 | `tm work start [<dir>]` | Attach to (or create) the tmux session for `<dir>`, defaulting to `cwd` |
 | `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<scope>-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
@@ -1875,6 +1876,35 @@ The session is archived before it is killed, and sometimes left running,
 exactly as after `tm merge`. See "Archived scrollback" below. You rarely
 need `tm work clean` after a `tm merge`, since the merge already does both
 halves.
+
+#### Sweeping many tickets: `tm work sweep`
+
+`tm work clean` handles one ticket. `tm work sweep` handles many: mark
+tickets by key, by PR state, or both, and the sweep cleans them all in one
+pass.
+
+```
+tm work sweep --merged              # every ticket whose PR is merged
+tm work sweep --closed GH-12 GH-14  # closed-unmerged PRs, plus two by key
+tm work sweep --merged --yes        # no confirmation prompt
+```
+
+`--merged` and `--closed` only mark tickets of the current repo's scope
+that still have something to clean: a worktree on disk or a running
+session. The sweep prints one line per marked ticket with its kill-safety
+tier (see `tm runs kill-safety`), its worktree and PR, and whether it will
+be cleaned or skipped, then asks once. A ticket is **skipped, never
+removed**, when:
+
+- its session is a project root session,
+- a run is live in its session,
+- its worktree has uncommitted changes, or `git status` fails there.
+
+Every other ticket goes through `tm work clean` itself, so the same guards
+apply: scrollback is archived before the kill, and only a path under the
+worktree root is removed. A ticket that fails is recorded and the sweep
+moves on. The run ends with one summary of cleaned, skipped, and failed
+tickets, and exits 1 when any failed.
 
 #### Archived scrollback
 

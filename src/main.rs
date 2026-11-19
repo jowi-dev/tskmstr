@@ -833,6 +833,37 @@ fn run_work(
             let identity = backend_identity_or_placeholder(full_config.as_ref());
             tskmstr::cli::work::clean(&ctx, &run_store, &identity, &key, &mut stdout)?;
         }
+        WorkCmd::Sweep {
+            keys,
+            merged,
+            closed,
+            yes,
+        } => {
+            let selection = tskmstr::work::sweep::SweepSelection {
+                keys,
+                merged,
+                closed,
+            };
+            if selection.is_empty() {
+                eprintln!("tm work sweep: name ticket keys, or pass --merged and/or --closed");
+                std::process::exit(2);
+            }
+            let run_store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
+            let identity = backend_identity_or_placeholder(full_config.as_ref());
+            let summary = tskmstr::cli::work::sweep(
+                &ctx,
+                &run_store,
+                &ShellGhCli::new(),
+                &identity,
+                &selection,
+                yes,
+                &mut std::io::stdin().lock(),
+                &mut stdout,
+            )?;
+            if !summary.failed.is_empty() {
+                std::process::exit(1);
+            }
+        }
         WorkCmd::Start { dir } => {
             let dir_path = dir.map(PathBuf::from);
             tskmstr::cli::work::start(&ctx, dir_path.as_deref(), &cwd, &mut stdout)?;

@@ -545,6 +545,29 @@ pub enum WorkCmd {
         /// Jira ticket key, e.g. `PROJ-123`.
         key: String,
     },
+    /// Clean many tickets in one pass: mark them by key and/or by PR
+    /// state, confirm once, then run `tm work clean` for each.
+    ///
+    /// The confirmation lists every marked ticket with its kill-safety
+    /// tier and whether it will be cleaned or skipped. Live runs, root
+    /// sessions, and worktrees with uncommitted changes are skipped, never
+    /// removed, and a ticket that fails does not stop the rest. Ends with
+    /// one summary of cleaned, skipped, and failed tickets; exits non-zero
+    /// when any failed.
+    Sweep {
+        /// Ticket keys to mark, e.g. `PROJ-1 PROJ-2`.
+        keys: Vec<String>,
+        /// Also mark every ticket of this repo whose PR is merged.
+        #[arg(long)]
+        merged: bool,
+        /// Also mark every ticket of this repo whose PR was closed without
+        /// merging.
+        #[arg(long)]
+        closed: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Attach to (or create) the tmux session for a directory, defaulting
     /// to the current working directory.
     Start {
