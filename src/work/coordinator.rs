@@ -334,6 +334,9 @@ pub fn launch_coordinator(
         session_name,
         window_name,
         warning: crate::work::admission::warning_text(&warning),
+        // A coordinator always runs in the epic's own session; there is no
+        // audit-dir fallback to report.
+        fallback: None,
     })
 }
 
