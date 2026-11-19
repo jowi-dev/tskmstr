@@ -303,6 +303,15 @@ pub const EXPECTED_CONFIG_KEYS: &[ExpectedConfigKey] = &[
         severity: KeySeverity::Recommended,
         suggested_default: |_| None,
     },
+    // GitHub issue #244. Which strategy suits a repo depends on how it
+    // merges its PRs, so `tm update` suggests nothing; the default is
+    // today's rebase.
+    ExpectedConfigKey {
+        path: &["work", "merge", "strategy"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
 ];
 
 #[cfg(test)]
@@ -315,6 +324,14 @@ mod tests {
             .iter()
             .find(|k| k.path == path)
             .unwrap_or_else(|| panic!("{path:?} registered"))
+    }
+
+    #[test]
+    fn merge_strategy_is_registered_without_a_default() {
+        let key = expected(&["work", "merge", "strategy"]);
+        assert_eq!(key.severity, KeySeverity::Recommended);
+        assert_eq!((key.suggested_default)(BackendKind::Github), None);
+        assert_eq!((key.suggested_default)(BackendKind::Jira), None);
     }
 
     #[test]

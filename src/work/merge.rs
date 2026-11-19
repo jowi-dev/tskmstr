@@ -21,6 +21,13 @@
 //! thatch memories (GitHub issue #208, see [`consolidate_branch_memories`];
 //! a batch starts one session for every branch it merged).
 //!
+//! How the branch catches up with its base is `[work.merge].strategy`
+//! (GitHub issue #244, see [`integrate_base`]): a rebase by default, a
+//! squash into one commit and then a rebase, or a merge of the base into
+//! the branch. Everywhere below, "rebase" also means that merge under the
+//! `merge` strategy: the conflict prompt, the poll, and the hand-back hints
+//! follow the strategy, and a merged branch is pushed without force.
+//!
 //! The conflict-resolution session is launched the same way an interactive
 //! lane run is: [`crate::agent::AgentRunner::build_invocation`] under
 //! [`crate::agent::RunMode::Interactive`], its prompt written to a file
@@ -56,8 +63,8 @@ use thiserror::Error;
 
 use crate::agent::{AgentInvocation, AgentRunner, InvocationInputs, RunMode, shell_quote};
 use crate::cli::pr::{PrCliError, resolve_watch_repo_root};
-use crate::config::{BackendIdentity, LaneConfig, MergeConfig};
-use crate::github::gh_cli::{GhCli, GhError};
+use crate::config::{BackendIdentity, LaneConfig, MergeConfig, MergeStrategy};
+use crate::github::gh_cli::{GhCli, GhError, RepoMergeMethod};
 use crate::github::pr::{find_issue_key, find_pr_for_ticket};
 use crate::runs::pid::pid_alive;
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
@@ -471,21 +478,25 @@ fn format_ts(unix_secs: i64) -> String {
 fn run_conflict_session(
     deps: &MergeDeps<'_>,
     prepared: &PreparedMerge,
-    dir: &Path,
-    pre_rebase_rev: &str,
+    conflict: &PendingConflict,
     out: &mut dyn Write,
 ) -> Result<ConflictOutcome, MergeError> {
     let PreparedMerge {
         key, branch, base, ..
     } = prepared;
+    let dir = conflict.dir.as_path();
+    let pre_rebase_rev = conflict.pre_rebase_rev.as_str();
     let template = match deps.merge_cfg.prompt_file.as_deref() {
         Some(raw) => read_prompt_file(raw, deps.home, "[work.merge].prompt_file")?,
         None => match deps.merge_cfg.prompt.as_deref() {
             Some(prompt) => prompt.to_string(),
-            None => deps
-                .runner
-                .default_merge_conflict_prompt_template()
-                .to_string(),
+            None => match deps.merge_cfg.strategy {
+                MergeStrategy::Merge => deps.runner.default_merge_commit_conflict_prompt_template(),
+                MergeStrategy::Rebase | MergeStrategy::Squash => {
+                    deps.runner.default_merge_conflict_prompt_template()
+                }
+            }
+            .to_string(),
         },
     };
     let prompt = conflict_prompt(&template, key, branch, base);
@@ -503,16 +514,48 @@ fn run_conflict_session(
         run_id,
         out,
     );
+    let op = operation(deps.merge_cfg.strategy);
     let ending = match &result {
         Ok(ConflictOutcome::Resolved) => None,
         Ok(ConflictOutcome::HandedBack) => Some(format!(
-            "{key}: rebase not completed (timed out, aborted, or the session ended); left in progress in {}",
+            "{key}: {op} not completed (timed out, aborted, or the session ended); left in progress in {}",
             dir.display()
         )),
         Err(err) => Some(format!("{key}: conflict session failed: {err}")),
     };
     finish_conflict_run(deps, run_id, ending);
+    if let Ok(ConflictOutcome::HandedBack) = &result {
+        write_restore_hint(conflict, branch, out)?;
+    }
     result
+}
+
+/// The word for what [`integrate_base`] runs under `strategy`, used in
+/// progress and hand-back messages: `"merge"` for
+/// [`MergeStrategy::Merge`], `"rebase"` otherwise (a squash is rebased).
+fn operation(strategy: MergeStrategy) -> &'static str {
+    match strategy {
+        MergeStrategy::Merge => "merge",
+        MergeStrategy::Rebase | MergeStrategy::Squash => "rebase",
+    }
+}
+
+/// For a handed-back squash (see [`PendingConflict::restore_rev`]), names
+/// the branch's original tip, since an abort leaves the branch squashed
+/// and diverged from its remote, which a rerun of `tm merge` refuses.
+fn write_restore_hint(
+    conflict: &PendingConflict,
+    branch: &str,
+    out: &mut dyn Write,
+) -> Result<(), MergeError> {
+    if let Some(rev) = &conflict.restore_rev {
+        writeln!(
+            out,
+            "{branch} was squashed before the rebase; to restore its original commits, abort any rebase in progress, then run: git -C {} reset --hard {rev}",
+            conflict.dir.display()
+        )?;
+    }
+    Ok(())
 }
 
 /// The window-open and poll half of [`run_conflict_session`], split out so
@@ -956,8 +999,10 @@ enum RebaseCheck {
     Incomplete,
 }
 
-/// Inspects `dir`'s rebase state once. Shared by the single-ticket poll
-/// loop ([`poll_conflict_session`]) and the batch one
+/// Inspects `dir`'s rebase state once (its merge state under
+/// [`MergeStrategy::Merge`]: `git merge --abort` likewise restores the
+/// pre-merge tip, and committing the merge always moves it). Shared by the
+/// single-ticket poll loop ([`poll_conflict_session`]) and the batch one
 /// ([`poll_batch_conflict_session`]).
 ///
 /// `pre_rebase_rev` is the branch tip captured before `rebase_onto` ran:
@@ -971,7 +1016,11 @@ fn check_rebase(
     branch: &str,
     pre_rebase_rev: &str,
 ) -> Result<RebaseCheck, MergeError> {
-    if deps.git.rebase_in_progress(dir)? {
+    let in_progress = match deps.merge_cfg.strategy {
+        MergeStrategy::Merge => deps.git.merge_in_progress(dir)?,
+        MergeStrategy::Rebase | MergeStrategy::Squash => deps.git.rebase_in_progress(dir)?,
+    };
+    if in_progress {
         return Ok(RebaseCheck::InProgress);
     }
     let clean = deps.git.status_is_clean(dir)?;
@@ -1002,6 +1051,7 @@ fn poll_conflict_session(
     pre_rebase_rev: &str,
     out: &mut dyn Write,
 ) -> Result<ConflictOutcome, MergeError> {
+    let op = operation(deps.merge_cfg.strategy);
     let start = deps.clock.now_unix_secs();
     let mut last_count: Option<usize> = None;
     let mut last_heartbeat = start;
@@ -1012,15 +1062,15 @@ fn poll_conflict_session(
         match check_rebase(deps, dir, branch, pre_rebase_rev)? {
             RebaseCheck::InProgress => {}
             RebaseCheck::Resolved => {
-                writeln!(out, "conflicts resolved; rebase complete")?;
+                writeln!(out, "conflicts resolved; {op} complete")?;
                 return Ok(ConflictOutcome::Resolved);
             }
             RebaseCheck::Aborted => {
-                writeln!(out, "rebase was aborted; handing back")?;
+                writeln!(out, "{op} was aborted; handing back")?;
                 return Ok(ConflictOutcome::HandedBack);
             }
             RebaseCheck::Incomplete => {
-                writeln!(out, "conflict session ended without completing the rebase")?;
+                writeln!(out, "conflict session ended without completing the {op}")?;
                 return Ok(ConflictOutcome::HandedBack);
             }
         }
@@ -1032,13 +1082,13 @@ fn poll_conflict_session(
                 "conflict resolution timed out after {CONFLICT_TIMEOUT_SECS}s"
             )?;
             writeln!(out, "attach: tmux attach -t {target}")?;
-            writeln!(out, "abort: git -C {} rebase --abort", dir.display())?;
+            writeln!(out, "abort: git -C {} {op} --abort", dir.display())?;
             return Ok(ConflictOutcome::HandedBack);
         }
 
         let windows = deps.tmux.list_windows()?;
         if !has_live_window(&windows, target, window) {
-            writeln!(out, "conflict session ended without completing the rebase")?;
+            writeln!(out, "conflict session ended without completing the {op}")?;
             return Ok(ConflictOutcome::HandedBack);
         }
 
@@ -1069,13 +1119,7 @@ pub fn run_merge(
 ) -> Result<MergeFlowOutcome, MergeError> {
     let mut prepared = prepare_merge(deps, key, out)?;
     if let Some(conflict) = prepared.conflict.take() {
-        match run_conflict_session(
-            deps,
-            &prepared,
-            &conflict.dir,
-            &conflict.pre_rebase_rev,
-            out,
-        )? {
+        match run_conflict_session(deps, &prepared, &conflict, out)? {
             ConflictOutcome::Resolved => prepared.needs_push = true,
             ConflictOutcome::HandedBack => return Ok(MergeFlowOutcome::ConflictsHandedBack),
         }
@@ -1175,7 +1219,8 @@ pub fn run_merge_batch(
             Some(conflict) => {
                 writeln!(
                     out,
-                    "{key}: rebase stopped on conflicts; set aside for the conflict session"
+                    "{key}: {} stopped on conflicts; set aside for the conflict session",
+                    operation(deps.merge_cfg.strategy)
                 )?;
                 set_aside.push((prepared, conflict));
             }
@@ -1195,13 +1240,7 @@ pub fn run_merge_batch(
         1 => {
             let (prepared, conflict) = set_aside.remove(0);
             writeln!(out, "=== conflict session: {} ===", prepared.key)?;
-            match run_conflict_session(
-                deps,
-                &prepared,
-                &conflict.dir,
-                &conflict.pre_rebase_rev,
-                out,
-            ) {
+            match run_conflict_session(deps, &prepared, &conflict, out) {
                 Ok(ConflictOutcome::Resolved) => vec![prepared],
                 Ok(ConflictOutcome::HandedBack) => {
                     report.handed_back.push(prepared.key);
@@ -1221,10 +1260,11 @@ pub fn run_merge_batch(
                         kept_session = Some(target);
                     }
                     let mut resolved = Vec::new();
-                    for ((prepared, _), ok) in set_aside.into_iter().zip(flags) {
+                    for ((prepared, conflict), ok) in set_aside.into_iter().zip(flags) {
                         if ok {
                             resolved.push(prepared);
                         } else {
+                            write_restore_hint(&conflict, &prepared.branch, out)?;
                             report.handed_back.push(prepared.key);
                         }
                     }
@@ -1260,7 +1300,8 @@ pub fn run_merge_batch(
     for key in &report.handed_back {
         writeln!(
             out,
-            "  handed back: {key} (finish the rebase, then rerun `tm merge {key}`)"
+            "  handed back: {key} (finish the {}, then rerun `tm merge {key}`)",
+            operation(deps.merge_cfg.strategy)
         )?;
     }
     for (key, err) in &report.failed {
@@ -1327,19 +1368,29 @@ fn consolidate_batch_memories(deps: &MergeDeps<'_>, merged: &[PreparedMerge], ou
 }
 
 /// Renders the `{ticket_list}` placeholder: one line per ticket giving its
-/// key, branch, base, and the checkout directory its rebase is in progress
-/// in.
-fn batch_ticket_list(tickets: &[(PreparedMerge, PendingConflict)]) -> String {
+/// key, branch, base, and the checkout directory its rebase (or, under
+/// [`MergeStrategy::Merge`], its merge) is in progress in.
+fn batch_ticket_list(
+    strategy: MergeStrategy,
+    tickets: &[(PreparedMerge, PendingConflict)],
+) -> String {
     tickets
         .iter()
-        .map(|(prepared, conflict)| {
-            format!(
+        .map(|(prepared, conflict)| match strategy {
+            MergeStrategy::Merge => format!(
+                "- {}: origin/{} into branch {} in {}",
+                prepared.key,
+                prepared.base,
+                prepared.branch,
+                conflict.dir.display()
+            ),
+            MergeStrategy::Rebase | MergeStrategy::Squash => format!(
                 "- {}: branch {} onto origin/{} in {}",
                 prepared.key,
                 prepared.branch,
                 prepared.base,
                 conflict.dir.display()
-            )
+            ),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1362,14 +1413,20 @@ fn run_batch_conflict_session(
     tickets: &[(PreparedMerge, PendingConflict)],
     out: &mut dyn Write,
 ) -> Result<(Vec<bool>, String), MergeError> {
+    let strategy = deps.merge_cfg.strategy;
     let template = match deps.merge_cfg.batch_conflict_prompt.as_deref() {
         Some(prompt) => prompt.to_string(),
-        None => deps
-            .runner
-            .default_batch_merge_conflict_prompt_template()
-            .to_string(),
+        None => match strategy {
+            MergeStrategy::Merge => deps
+                .runner
+                .default_batch_merge_commit_conflict_prompt_template(),
+            MergeStrategy::Rebase | MergeStrategy::Squash => {
+                deps.runner.default_batch_merge_conflict_prompt_template()
+            }
+        }
+        .to_string(),
     };
-    let prompt = template.replace("{ticket_list}", &batch_ticket_list(tickets));
+    let prompt = template.replace("{ticket_list}", &batch_ticket_list(strategy, tickets));
 
     // The window opens in the first ticket's checkout; the prompt names
     // every other ticket's directory explicitly.
@@ -1401,7 +1458,8 @@ fn run_batch_conflict_session(
                 .collect();
             (!handed_back.is_empty()).then(|| {
                 format!(
-                    "rebase not completed for {}; left in progress",
+                    "{} not completed for {}; left in progress",
+                    operation(strategy),
                     handed_back.join(", ")
                 )
             })
@@ -1465,6 +1523,7 @@ fn poll_batch_conflict_session(
     window: &str,
     out: &mut dyn Write,
 ) -> Result<Vec<bool>, MergeError> {
+    let op = operation(deps.merge_cfg.strategy);
     let timeout = CONFLICT_TIMEOUT_SECS * tickets.len() as i64;
     let start = deps.clock.now_unix_secs();
     let mut resolved = vec![false; tickets.len()];
@@ -1485,16 +1544,16 @@ fn poll_batch_conflict_session(
             )? {
                 RebaseCheck::InProgress => still_pending.push(i),
                 RebaseCheck::Resolved => {
-                    writeln!(out, "{key}: conflicts resolved; rebase complete")?;
+                    writeln!(out, "{key}: conflicts resolved; {op} complete")?;
                     resolved[i] = true;
                 }
                 RebaseCheck::Aborted => {
-                    writeln!(out, "{key}: rebase was aborted; handing back")?;
+                    writeln!(out, "{key}: {op} was aborted; handing back")?;
                 }
                 RebaseCheck::Incomplete => {
                     writeln!(
                         out,
-                        "{key}: rebase state cleared without completing; handing back"
+                        "{key}: {op} state cleared without completing; handing back"
                     )?;
                 }
             }
@@ -1512,7 +1571,7 @@ fn poll_batch_conflict_session(
                 let (prepared, conflict) = &tickets[i];
                 writeln!(
                     out,
-                    "abort {}: git -C {} rebase --abort",
+                    "abort {}: git -C {} {op} --abort",
                     prepared.key,
                     conflict.dir.display()
                 )?;
@@ -1522,10 +1581,7 @@ fn poll_batch_conflict_session(
 
         let windows = deps.tmux.list_windows()?;
         if !has_live_window(&windows, target, window) {
-            writeln!(
-                out,
-                "conflict session ended without completing every rebase"
-            )?;
+            writeln!(out, "conflict session ended without completing every {op}")?;
             return Ok(resolved);
         }
 
@@ -1556,8 +1612,13 @@ fn poll_batch_conflict_session(
 struct PendingConflict {
     /// The checkout the rebase is in progress in.
     dir: PathBuf,
-    /// The branch tip before the rebase started (see [`check_rebase`]).
+    /// The branch tip before the rebase (or merge) started, after any
+    /// squash (see [`check_rebase`]).
     pre_rebase_rev: String,
+    /// Under [`MergeStrategy::Squash`], the branch tip before it was
+    /// squashed, named in the hand-back message so the original commits
+    /// can be restored (see [`write_restore_hint`]); `None` otherwise.
+    restore_rev: Option<String>,
 }
 
 /// Everything [`prepare_merge`] learned about a ticket's PR, carried into
@@ -1574,10 +1635,18 @@ struct PreparedMerge {
     branch: String,
     /// The PR's base branch.
     base: String,
+    /// The PR's title, the message of a [`MergeStrategy::Squash`] commit.
+    title: String,
     /// The local checkout of `branch`, if one was found.
     checkout_dir: Option<PathBuf>,
-    /// Whether the local tip must be force-pushed before `gh pr merge`.
+    /// Whether the local tip must be pushed before `gh pr merge`: with
+    /// lease protection, except under [`MergeStrategy::Merge`] when the
+    /// remote tip is still an ancestor (see [`PreparedMerge::needs_force`]).
     needs_push: bool,
+    /// Whether that push must be forced even under
+    /// [`MergeStrategy::Merge`]: set when the local branch was already
+    /// rewritten (rebased) and diverged from its remote.
+    needs_force: bool,
     /// `Some` when the rebase stopped on conflicts; the caller must get it
     /// resolved (and set `needs_push`) before calling [`finish_merge`].
     conflict: Option<PendingConflict>,
@@ -1612,6 +1681,7 @@ fn prepare_merge(
     let number = pr.number;
     let branch = pr.head_ref_name.clone();
     let base = pr.base_ref_name.clone();
+    let title = pr.title.clone();
     writeln!(out, "found PR #{number} ({branch} -> {base})")?;
     ensure_base_not_red(deps, &repo_root, &base, out)?;
 
@@ -1634,6 +1704,7 @@ fn prepare_merge(
     // tip) or when a rebase runs below. The pushed tip is what `gh pr
     // merge` merges.
     let mut needs_push = false;
+    let mut needs_force = false;
     let mut conflict = None;
     match checkout_dir.as_deref() {
         Some(dir) => {
@@ -1667,6 +1738,7 @@ fn prepare_merge(
                         "local {branch} diverged from {origin_branch_ref} but is already rebased onto {base}; will push before merging"
                     )?;
                     needs_push = true;
+                    needs_force = true;
                 } else {
                     return Err(MergeError::BranchDiverged {
                         branch: branch.clone(),
@@ -1683,25 +1755,19 @@ fn prepare_merge(
                         dir: dir.to_path_buf(),
                     });
                 }
-                writeln!(out, "rebasing {branch} onto {origin_base_ref}...")?;
-                match deps.git.rebase_onto(dir, &origin_base_ref)? {
-                    RebaseOutcome::Completed => {
-                        writeln!(out, "rebase complete")?;
-                        needs_push = true;
-                    }
-                    RebaseOutcome::Conflicted => {
-                        conflict = Some(PendingConflict {
-                            dir: dir.to_path_buf(),
-                            pre_rebase_rev: current_tip,
-                        });
-                    }
+                let squash_message = squash_message(&title, key, &branch);
+                conflict =
+                    integrate_base(deps, dir, &branch, &base, &squash_message, current_tip, out)?;
+                if conflict.is_none() {
+                    needs_push = true;
                 }
             }
         }
         None => {
             writeln!(
                 out,
-                "warning: no local checkout of {branch}; skipping auto-rebase"
+                "warning: no local checkout of {branch}; skipping auto-{}",
+                operation(deps.merge_cfg.strategy)
             )?;
         }
     }
@@ -1712,10 +1778,128 @@ fn prepare_merge(
         number,
         branch,
         base,
+        title,
         checkout_dir,
         needs_push,
+        needs_force,
         conflict,
     })
+}
+
+/// The message of a [`MergeStrategy::Squash`] commit: the PR's title, or
+/// `<key>: <branch>` when the title is blank.
+fn squash_message(title: &str, key: &str, branch: &str) -> String {
+    if title.trim().is_empty() {
+        format!("{key}: {branch}")
+    } else {
+        title.to_string()
+    }
+}
+
+/// Brings the checkout at `dir` (on `branch`, whose tip is `tip`, with a
+/// clean tree) up to date with `origin/<base>` the way
+/// `[work.merge].strategy` says (GitHub issue #244):
+///
+/// - [`MergeStrategy::Rebase`]: `git rebase origin/<base>`.
+/// - [`MergeStrategy::Squash`]: squash the branch's commits since its merge
+///   base with `origin/<base>` into one commit with `squash_message`, then
+///   rebase that commit, so every conflict comes up in one pass. Warns
+///   (never refuses) when the repo merges PRs with a merge commit, since the
+///   branch's commit history then never reaches the base.
+/// - [`MergeStrategy::Merge`]: `git merge --no-ff origin/<base>` into the
+///   branch, one conflict pass and no rewritten history.
+///
+/// Returns `None` once the branch is up to date, or the
+/// [`PendingConflict`] left in progress on disk when it stopped on
+/// conflicts.
+fn integrate_base(
+    deps: &MergeDeps<'_>,
+    dir: &Path,
+    branch: &str,
+    base: &str,
+    squash_message: &str,
+    tip: String,
+    out: &mut dyn Write,
+) -> Result<Option<PendingConflict>, MergeError> {
+    let strategy = deps.merge_cfg.strategy;
+    let origin_base_ref = format!("origin/{base}");
+    let mut pre_rebase_rev = tip.clone();
+    let mut restore_rev = None;
+    let outcome = match strategy {
+        MergeStrategy::Merge => {
+            writeln!(out, "merging {origin_base_ref} into {branch}...")?;
+            deps.git.merge_into(dir, &origin_base_ref)?
+        }
+        MergeStrategy::Rebase | MergeStrategy::Squash => {
+            if strategy == MergeStrategy::Squash {
+                squash_branch(deps, dir, branch, base, squash_message, &tip, out)?;
+                pre_rebase_rev = deps.git.rev_parse(dir, branch)?;
+                restore_rev = Some(tip);
+            }
+            writeln!(out, "rebasing {branch} onto {origin_base_ref}...")?;
+            deps.git.rebase_onto(dir, &origin_base_ref)?
+        }
+    };
+    match outcome {
+        RebaseOutcome::Completed => {
+            writeln!(out, "{} complete", operation(strategy))?;
+            Ok(None)
+        }
+        RebaseOutcome::Conflicted => Ok(Some(PendingConflict {
+            dir: dir.to_path_buf(),
+            pre_rebase_rev,
+            restore_rev,
+        })),
+    }
+}
+
+/// The squash half of [`integrate_base`] under [`MergeStrategy::Squash`].
+///
+/// Logs `squashed <branch> (was <tip>)` as soon as the squash lands, so the
+/// pre-squash sha is in the output whatever goes wrong afterwards: an error
+/// after this point leaves the branch squashed and diverged from its
+/// remote, and only that sha (or the reflog) restores it.
+fn squash_branch(
+    deps: &MergeDeps<'_>,
+    dir: &Path,
+    branch: &str,
+    base: &str,
+    message: &str,
+    tip: &str,
+    out: &mut dyn Write,
+) -> Result<(), MergeError> {
+    if let Ok(Some(RepoMergeMethod::MergeCommit)) = deps.gh.repo_merge_method(dir, MERGE_TIMEOUT) {
+        writeln!(
+            out,
+            "warning: this repo merges PRs with a merge commit; squashing {branch} drops its commit history from {base}"
+        )?;
+    }
+    let since = deps
+        .git
+        .merge_base(dir, branch, &format!("origin/{base}"))?;
+    writeln!(out, "squashing {branch} into one commit...")?;
+    deps.git.squash_since(dir, &since, message)?;
+    writeln!(out, "squashed {branch} (was {tip})")?;
+    Ok(())
+}
+
+/// Publishes `branch` from `dir`: with lease protection when `force`, else
+/// a plain push that only fast-forwards the remote.
+fn push_branch(
+    deps: &MergeDeps<'_>,
+    dir: &Path,
+    branch: &str,
+    force: bool,
+    out: &mut dyn Write,
+) -> Result<(), MergeError> {
+    if force {
+        writeln!(out, "pushing {branch} (force-with-lease)...")?;
+        deps.git.push_force_with_lease(dir, branch)?;
+    } else {
+        writeln!(out, "pushing {branch}...")?;
+        deps.git.push(dir, branch)?;
+    }
+    Ok(())
 }
 
 /// Stages 3-7 of the flow for a ticket whose rebase (if any) is complete:
@@ -1746,13 +1930,15 @@ fn finish_merge(
         base,
         checkout_dir,
         needs_push,
+        needs_force,
         conflict: _,
+        title: _,
     } = prepared;
     let (key, number, needs_push) = (key.as_str(), *number, *needs_push);
 
     if needs_push && let Some(dir) = checkout_dir.as_deref() {
-        writeln!(out, "pushing {branch} (force-with-lease)...")?;
-        deps.git.push_force_with_lease(dir, branch)?;
+        let force = deps.merge_cfg.strategy != MergeStrategy::Merge || *needs_force;
+        push_branch(deps, dir, branch, force, out)?;
     }
 
     if merge_pr_with_retry(deps, prepared, out)? == MergeFlowOutcome::ConflictsHandedBack {
@@ -1899,10 +2085,12 @@ fn merge_pr_with_retry(
     out: &mut dyn Write,
 ) -> Result<MergeFlowOutcome, MergeError> {
     let PreparedMerge {
+        key,
         repo_root,
         number,
         branch,
         base,
+        title,
         checkout_dir,
         ..
     } = prepared;
@@ -1921,7 +2109,11 @@ fn merge_pr_with_retry(
 
     writeln!(
         out,
-        "PR #{number} rejected: {branch} is behind {base}; rebasing and retrying once"
+        "PR #{number} rejected: {branch} is behind {base}; {} and retrying once",
+        match deps.merge_cfg.strategy {
+            MergeStrategy::Merge => "merging",
+            MergeStrategy::Rebase | MergeStrategy::Squash => "rebasing",
+        }
     )?;
     deps.git.fetch_origin(dir)?;
     let pre_rebase_rev = deps.git.rev_parse(dir, branch)?;
@@ -1930,20 +2122,24 @@ fn merge_pr_with_retry(
             dir: dir.to_path_buf(),
         });
     }
-    let origin_base_ref = format!("origin/{base}");
-    writeln!(out, "rebasing {branch} onto {origin_base_ref}...")?;
-    match deps.git.rebase_onto(dir, &origin_base_ref)? {
-        RebaseOutcome::Completed => writeln!(out, "rebase complete")?,
-        RebaseOutcome::Conflicted => {
-            match run_conflict_session(deps, prepared, dir, &pre_rebase_rev, out)? {
-                ConflictOutcome::Resolved => {}
-                ConflictOutcome::HandedBack => return Ok(MergeFlowOutcome::ConflictsHandedBack),
-            }
+    let squash_message = squash_message(title, key, branch);
+    if let Some(conflict) = integrate_base(
+        deps,
+        dir,
+        branch,
+        base,
+        &squash_message,
+        pre_rebase_rev,
+        out,
+    )? {
+        match run_conflict_session(deps, prepared, &conflict, out)? {
+            ConflictOutcome::Resolved => {}
+            ConflictOutcome::HandedBack => return Ok(MergeFlowOutcome::ConflictsHandedBack),
         }
     }
 
-    writeln!(out, "pushing {branch} (force-with-lease)...")?;
-    deps.git.push_force_with_lease(dir, branch)?;
+    let force = deps.merge_cfg.strategy != MergeStrategy::Merge;
+    push_branch(deps, dir, branch, force, out)?;
     writeln!(out, "retrying merge of PR #{number}...")?;
     deps.gh.pr_merge(repo_root, *number, MERGE_TIMEOUT)?;
     Ok(MergeFlowOutcome::Merged)
@@ -4933,5 +5129,322 @@ mod tests {
             "a handed-back branch is not merged: {command}"
         );
         assert!(out.contains("consolidating thatch memories"), "{out}");
+    }
+
+    // --- [work.merge] strategy (GitHub issue #244) ---
+
+    use crate::config::MergeStrategy;
+    use crate::github::gh_cli::RepoMergeMethod;
+
+    /// A single ticket whose base moved, checked out at a registered
+    /// worktree, under `strategy`. Runs inside tmux session `dev`.
+    fn strategy_fixture(strategy: MergeStrategy) -> Fixture {
+        let mut fx = Fixture::new();
+        fx.merge_cfg.strategy = strategy;
+        fx.register_checkout("proj-1-fix");
+        fx.gh = fx
+            .gh
+            .with_pr_list(Ok(vec![pr_info(7, "proj-1-fix", "main", "PROJ-1")]));
+        fx.git = fx
+            .git
+            .with_current_branch(Ok("main".to_string()))
+            .with_rev_parse_result("origin/proj-1-fix", Ok("aaa".to_string()))
+            .with_is_ancestor_result(Ok(false))
+            .with_branch_exists_local(Ok(false));
+        fx.tmux = fx
+            .tmux
+            .with_current_session_name(Ok(Some("dev".to_string())))
+            .with_list_windows_sequence(vec![
+                Ok(vec![shell_window()]),
+                Ok(vec![shell_window(), merge_window()]),
+            ]);
+        fx
+    }
+
+    /// Puts the registered checkout back on its branch once a conflict
+    /// session finishes, as a real resolution leaves it.
+    fn on_branch_after_resolution(fx: &mut Fixture) {
+        fx.git = std::mem::take(&mut fx.git).with_current_branch(Ok("proj-1-fix".to_string()));
+    }
+
+    fn single_prompt(fx: &Fixture) -> String {
+        std::fs::read_to_string(fx.state_dir.join("merge-PROJ-1-1000.prompt.md"))
+            .expect("prompt file should exist")
+    }
+
+    #[test]
+    fn squash_strategy_squashes_since_the_merge_base_before_rebasing() {
+        let mut fx = strategy_fixture(MergeStrategy::Squash);
+        fx.git = fx
+            .git
+            .with_rev_parse_sequence(
+                "proj-1-fix",
+                vec![Ok("aaa".to_string()), Ok("squashed".to_string())],
+            )
+            .with_merge_base_result(Ok("base-sha".to_string()))
+            .with_rebase_onto_result(Ok(RebaseOutcome::Completed));
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(
+            fx.git.call_log(),
+            vec![
+                "fetch_origin",
+                "squash_since",
+                "rebase_onto",
+                "push_force_with_lease",
+                "fetch_origin",
+                "merge_ff_only",
+            ]
+        );
+        let squash = fx.git.squash_since_calls();
+        assert_eq!(squash.len(), 1);
+        assert_eq!(squash[0].1, "base-sha");
+        assert_eq!(squash[0].2, "[PROJ-1] fix the thing");
+        assert!(out.contains("squashing proj-1-fix"), "{out}");
+        assert!(!out.contains("warning"), "{out}");
+    }
+
+    #[test]
+    fn squash_strategy_skips_the_squash_when_no_rebase_is_needed() {
+        let mut fx = up_to_date_fixture();
+        fx.merge_cfg.strategy = MergeStrategy::Squash;
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert!(fx.git.squash_since_calls().is_empty());
+    }
+
+    #[test]
+    fn squash_strategy_warns_when_the_repo_merges_with_a_merge_commit() {
+        let mut fx = strategy_fixture(MergeStrategy::Squash);
+        fx.gh = fx
+            .gh
+            .with_repo_merge_method_result(Ok(Some(RepoMergeMethod::MergeCommit)));
+        fx.git = fx
+            .git
+            .with_rev_parse_sequence(
+                "proj-1-fix",
+                vec![Ok("aaa".to_string()), Ok("squashed".to_string())],
+            )
+            .with_rebase_onto_result(Ok(RebaseOutcome::Completed));
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert!(
+            out.contains("warning: this repo merges PRs with a merge commit"),
+            "{out}"
+        );
+        assert_eq!(fx.git.squash_since_calls().len(), 1, "warn, never refuse");
+    }
+
+    #[test]
+    fn squash_strategy_conflict_resolves_in_one_session_against_the_squashed_tip() {
+        let mut fx = strategy_fixture(MergeStrategy::Squash);
+        fx.git = std::mem::take(&mut fx.git)
+            // "aaa" before the squash, "squashed" right after it (the tip
+            // an abort would restore), "bbb" once the rebase completes.
+            .with_rev_parse_sequence(
+                "proj-1-fix",
+                vec![
+                    Ok("aaa".to_string()),
+                    Ok("squashed".to_string()),
+                    Ok("bbb".to_string()),
+                ],
+            )
+            .with_rebase_onto_result(Ok(RebaseOutcome::Conflicted))
+            .with_rebase_in_progress_sequence(vec![Ok(true), Ok(false)]);
+        on_branch_after_resolution(&mut fx);
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(opened_windows(&fx), 1);
+        assert!(single_prompt(&fx).contains("git rebase --continue"));
+        assert_eq!(fx.git.push_force_with_lease_calls().len(), 1);
+    }
+
+    #[test]
+    fn squash_strategy_abort_names_the_unsquashed_tip_to_restore() {
+        let mut fx = strategy_fixture(MergeStrategy::Squash);
+        fx.git = fx
+            .git
+            .with_rev_parse_sequence(
+                "proj-1-fix",
+                vec![Ok("aaa".to_string()), Ok("squashed".to_string())],
+            )
+            .with_rebase_onto_result(Ok(RebaseOutcome::Conflicted))
+            .with_rebase_in_progress_sequence(vec![Ok(false)]);
+        on_branch_after_resolution(&mut fx);
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::ConflictsHandedBack)));
+        assert!(out.contains("rebase was aborted"), "{out}");
+        assert!(out.contains("reset --hard aaa"), "{out}");
+    }
+
+    #[test]
+    fn squash_strategy_logs_the_unsquashed_tip_before_a_later_error() {
+        let mut fx = strategy_fixture(MergeStrategy::Squash);
+        fx.git = fx
+            .git
+            .with_rev_parse_sequence(
+                "proj-1-fix",
+                vec![Ok("aaa".to_string()), Ok("squashed".to_string())],
+            )
+            .with_rebase_onto_result(Err(GitError::Command {
+                command: "git rebase".to_string(),
+                exit_code: Some(128),
+                stderr: "fatal: something broke".to_string(),
+            }));
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(result.is_err(), "{out}");
+        assert!(out.contains("squashed proj-1-fix (was aaa)"), "{out}");
+    }
+
+    #[test]
+    fn merge_strategy_merges_the_base_in_and_pushes_without_force() {
+        let mut fx = strategy_fixture(MergeStrategy::Merge);
+        fx.git = fx
+            .git
+            .with_rev_parse_result("proj-1-fix", Ok("aaa".to_string()))
+            .with_merge_into_result(Ok(RebaseOutcome::Completed));
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(
+            fx.git.call_log(),
+            vec![
+                "fetch_origin",
+                "merge_into",
+                "push",
+                "fetch_origin",
+                "merge_ff_only",
+            ]
+        );
+        assert_eq!(
+            fx.git.merge_into_calls()[0].1,
+            "origin/main",
+            "merges the base into the branch"
+        );
+        assert!(fx.git.rebase_onto_calls().is_empty());
+        assert!(fx.git.push_force_with_lease_calls().is_empty());
+        assert!(out.contains("merging origin/main into proj-1-fix"), "{out}");
+    }
+
+    #[test]
+    fn merge_strategy_conflict_polls_the_merge_and_prompts_for_git_commit() {
+        let mut fx = strategy_fixture(MergeStrategy::Merge);
+        fx.git = fx
+            .git
+            .with_rev_parse_sequence(
+                "proj-1-fix",
+                vec![Ok("aaa".to_string()), Ok("merged".to_string())],
+            )
+            .with_merge_into_result(Ok(RebaseOutcome::Conflicted))
+            .with_merge_in_progress_sequence(vec![Ok(true), Ok(false)])
+            // A stale rebase marker must not be read as the merge's state.
+            .with_rebase_in_progress_sequence(vec![Ok(true)]);
+        on_branch_after_resolution(&mut fx);
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert!(out.contains("conflicts resolved; merge complete"), "{out}");
+        let prompt = single_prompt(&fx);
+        assert!(prompt.contains("git commit --no-edit"), "{prompt}");
+        assert!(!prompt.contains("rebase --continue"), "{prompt}");
+        assert_eq!(fx.git.push_calls().len(), 1);
+        assert!(fx.git.push_force_with_lease_calls().is_empty());
+    }
+
+    #[test]
+    fn merge_strategy_abort_hands_back_with_a_merge_abort_hint_on_timeout() {
+        let mut fx = strategy_fixture(MergeStrategy::Merge);
+        fx.git = fx
+            .git
+            .with_rev_parse_result("proj-1-fix", Ok("aaa".to_string()))
+            .with_merge_into_result(Ok(RebaseOutcome::Conflicted))
+            .with_merge_in_progress_sequence(vec![Ok(true)]);
+        // Every clock read jumps past the conflict timeout.
+        fx.clock = FakeClock::advancing(1_000, CONFLICT_TIMEOUT_SECS + 1);
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::ConflictsHandedBack)));
+        assert!(out.contains("merge --abort"), "{out}");
+        assert!(fx.git.push_calls().is_empty());
+        assert!(fx.gh.pr_merge_calls().is_empty());
+    }
+
+    #[test]
+    fn merge_strategy_stale_base_retry_merges_and_pushes_without_force() {
+        let mut fx = up_to_date_fixture();
+        fx.merge_cfg.strategy = MergeStrategy::Merge;
+        fx.gh = fx
+            .gh
+            .with_pr_merge_sequence(vec![Err(stale_base_error()), Ok(())]);
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(fx.git.merge_into_calls().len(), 1);
+        assert!(fx.git.rebase_onto_calls().is_empty());
+        assert_eq!(fx.git.push_calls().len(), 1);
+        assert!(fx.git.push_force_with_lease_calls().is_empty());
+    }
+
+    #[test]
+    fn merge_strategy_batch_session_uses_the_merge_prompt_and_polls_merges() {
+        let mut fx = batch_fixture(&[
+            BatchTicket::Conflict { resolves: true },
+            BatchTicket::Conflict { resolves: true },
+        ]);
+        fx.merge_cfg.strategy = MergeStrategy::Merge;
+        fx.git = fx
+            .git
+            .with_merge_into_result(Ok(RebaseOutcome::Conflicted))
+            // Both tickets in progress on the first tick, done on the next.
+            .with_merge_in_progress_sequence(vec![Ok(true), Ok(true), Ok(false)]);
+
+        let (result, out) = run_batch(&fx.deps(), &keys(2));
+
+        let report = result.expect("batch should succeed");
+        assert_eq!(report.merged, keys(2), "{out}");
+        let prompt = batch_prompt(&fx);
+        assert!(prompt.contains("git commit --no-edit"), "{prompt}");
+        assert!(
+            prompt.contains("- PROJ-1: origin/main into branch proj-1-fix in "),
+            "{prompt}"
+        );
+        assert_eq!(fx.git.push_calls().len(), 2);
+        assert!(fx.git.push_force_with_lease_calls().is_empty());
+        assert!(fx.git.rebase_onto_calls().is_empty());
+        assert!(
+            out.contains("PROJ-1: merge stopped on conflicts; set aside"),
+            "{out}"
+        );
+        assert!(!out.contains("rebase stopped"), "{out}");
+    }
+
+    #[test]
+    fn merge_strategy_without_a_checkout_says_it_skips_the_merge() {
+        let mut fx = Fixture::new();
+        fx.merge_cfg.strategy = MergeStrategy::Merge;
+        fx.gh = fx
+            .gh
+            .with_pr_list(Ok(vec![pr_info(7, "proj-1-fix", "main", "PROJ-1")]));
+        fx.git = fx.git.with_branch_exists_local(Ok(false));
+
+        let (_result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(out.contains("skipping auto-merge"), "{out}");
     }
 }

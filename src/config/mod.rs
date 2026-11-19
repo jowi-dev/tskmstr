@@ -708,6 +708,13 @@ pub struct RawMergeConfig {
     /// session that consolidates the merged branches' thatch memories into
     /// an archived record (GitHub issue #208). Defaults to `true` when unset.
     pub consolidate_memories: Option<bool>,
+    /// How `tm merge` brings the branch up to date with its base before
+    /// merging (GitHub issue #244): `"rebase"` (the default) rebases the
+    /// branch's commits onto the base, `"squash"` squashes them into one
+    /// commit first so every conflict comes up in a single pass, and
+    /// `"merge"` merges the base into the branch instead of rewriting it.
+    /// Any other value is a [`ConfigError::InvalidMergeStrategy`].
+    pub strategy: Option<String>,
 }
 
 /// Raw, partially-specified `[work.retro]` subsection as parsed directly
@@ -1458,9 +1465,10 @@ pub struct CreateConfig {
 /// `batch_conflict_prompt` overrides the built-in template for the combined
 /// session a multi-key `tm merge` opens (its one placeholder is
 /// `{ticket_list}`). `consolidate_memories` turns the post-merge
-/// memory-consolidation session on or off. All fields are optional: an
-/// absent section falls back to the built-in prompts, the rest of the model
-/// chain, and consolidation on.
+/// memory-consolidation session on or off. `strategy` picks how the branch
+/// catches up with its base (see [`MergeStrategy`]). All fields are
+/// optional: an absent section falls back to the built-in prompts, the rest
+/// of the model chain, consolidation on, and the rebase strategy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeConfig {
     /// See [`RawMergeConfig::prompt`].
@@ -1473,6 +1481,37 @@ pub struct MergeConfig {
     pub batch_conflict_prompt: Option<String>,
     /// See [`RawMergeConfig::consolidate_memories`]; `true` when unset.
     pub consolidate_memories: bool,
+    /// See [`RawMergeConfig::strategy`]; [`MergeStrategy::Rebase`] when
+    /// unset.
+    pub strategy: MergeStrategy,
+}
+
+/// How `tm merge` brings a branch up to date with its base before merging
+/// it. See [`RawMergeConfig::strategy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MergeStrategy {
+    /// Rebase the branch's commits onto the base. A rebase stops at every
+    /// commit that conflicts.
+    #[default]
+    Rebase,
+    /// Squash the branch's commits since its merge base into one commit,
+    /// then rebase that commit, so every conflict comes up in one pass.
+    Squash,
+    /// Merge the base into the branch: one conflict pass, no rewritten
+    /// history, at the cost of a merge commit on the branch.
+    Merge,
+}
+
+impl MergeStrategy {
+    /// Parses a config string. Returns `None` for unrecognized values.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "rebase" => Some(MergeStrategy::Rebase),
+            "squash" => Some(MergeStrategy::Squash),
+            "merge" => Some(MergeStrategy::Merge),
+            _ => None,
+        }
+    }
 }
 
 impl Default for MergeConfig {
@@ -1483,6 +1522,7 @@ impl Default for MergeConfig {
             model: None,
             batch_conflict_prompt: None,
             consolidate_memories: true,
+            strategy: MergeStrategy::Rebase,
         }
     }
 }
@@ -1825,6 +1865,16 @@ pub enum ConfigError {
         "invalid [work.retro].defect_session value `{value}`; expected \"ask\", \"start\" or \"off\""
     )]
     InvalidDefectSession {
+        /// The unrecognized value as written in config.
+        value: String,
+    },
+
+    /// `[work.merge].strategy` was set to something other than
+    /// `"rebase"`, `"squash"`, or `"merge"`.
+    #[error(
+        "invalid [work.merge].strategy value `{value}`; expected \"rebase\", \"squash\" or \"merge\""
+    )]
+    InvalidMergeStrategy {
         /// The unrecognized value as written in config.
         value: String,
     },
@@ -3038,6 +3088,12 @@ fn merge_merge_section(
             .consolidate_memories
             .or(global.consolidate_memories)
             .unwrap_or(true),
+        strategy: match repo.strategy.or(global.strategy) {
+            Some(value) => {
+                MergeStrategy::parse(&value).ok_or(ConfigError::InvalidMergeStrategy { value })?
+            }
+            None => MergeStrategy::default(),
+        },
     })
 }
 
@@ -6674,6 +6730,59 @@ mod tests {
         assert!(!cfg.merge.consolidate_memories);
     }
 
+    // --- `[work.merge] strategy` (GitHub issue #244) ---
+
+    fn merge_strategy_section(value: &str) -> RawWorkConfig {
+        RawWorkConfig {
+            merge: Some(RawMergeConfig {
+                strategy: Some(value.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merge_work_strategy_defaults_to_rebase() {
+        let cfg = merge_work(None, None, None).expect("should merge");
+        assert_eq!(cfg.merge.strategy, MergeStrategy::Rebase);
+    }
+
+    #[test]
+    fn merge_work_strategy_parses_every_value_and_repo_overrides_global() {
+        for (value, expected) in [
+            ("rebase", MergeStrategy::Rebase),
+            ("squash", MergeStrategy::Squash),
+            ("merge", MergeStrategy::Merge),
+        ] {
+            let cfg = merge_work(Some(merge_strategy_section(value)), None, None).expect("merge");
+            assert_eq!(cfg.merge.strategy, expected, "{value}");
+        }
+        let cfg = merge_work(
+            Some(merge_strategy_section("merge")),
+            Some(merge_strategy_section("squash")),
+            None,
+        )
+        .expect("merge");
+        assert_eq!(cfg.merge.strategy, MergeStrategy::Squash);
+    }
+
+    #[test]
+    fn merge_work_strategy_rejects_unknown_value() {
+        let err = merge_work(Some(merge_strategy_section("octopus")), None, None)
+            .expect_err("unknown strategy");
+        assert!(
+            matches!(&err, ConfigError::InvalidMergeStrategy { value } if value == "octopus"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn load_merge_section_parses_strategy() {
+        let cfg = load_global_toml("[work.merge]\nstrategy = \"squash\"\n").expect("load");
+        assert_eq!(cfg.work.merge.strategy, MergeStrategy::Squash);
+    }
+
     #[test]
     fn merge_work_batch_conflict_prompt_repo_overrides_global() {
         let global = RawWorkConfig {
@@ -6764,6 +6873,7 @@ mod tests {
                 model: Some("opus".to_string()),
                 batch_conflict_prompt: None,
                 consolidate_memories: None,
+                strategy: None,
             }),
             ..Default::default()
         };
@@ -6774,6 +6884,7 @@ mod tests {
                 model: Some("sonnet".to_string()),
                 batch_conflict_prompt: None,
                 consolidate_memories: None,
+                strategy: None,
             }),
             ..Default::default()
         };

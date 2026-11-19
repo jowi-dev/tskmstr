@@ -267,15 +267,52 @@ pub trait GitOps {
     /// delete even though the branch's work has been fully incorporated
     /// upstream.
     fn delete_branch(&self, dir: &Path, branch: &str) -> Result<(), GitError>;
+
+    /// The best common ancestor of `a` and `b` (`git merge-base <a> <b>`),
+    /// as a full commit sha.
+    fn merge_base(&self, dir: &Path, a: &str, b: &str) -> Result<String, GitError>;
+
+    /// Squash every commit on the current branch since `since` into one
+    /// commit with `message`, keeping the tip's tree exactly (GitHub issue
+    /// #244's `squash` merge strategy).
+    ///
+    /// Builds the commit first (`git commit-tree HEAD^{tree} -p <since> -m
+    /// <message>`) and only then moves the branch to it (`git reset --soft
+    /// <commit>`), so a failure partway leaves the branch untouched. The
+    /// caller must make sure the working tree is clean: the index and
+    /// working tree are not changed, so uncommitted changes would stay
+    /// uncommitted on top of the squashed commit.
+    fn squash_since(&self, dir: &Path, since: &str, message: &str) -> Result<(), GitError>;
+
+    /// Merge `reference` into the current branch in the working tree at
+    /// `dir` (`git merge --no-ff --no-edit <reference>`), the `merge`
+    /// strategy's counterpart of [`GitOps::rebase_onto`].
+    ///
+    /// On a clean merge, returns `Ok(RebaseOutcome::Completed)`. On a
+    /// non-zero exit with a merge now in progress (see
+    /// [`GitOps::merge_in_progress`]), returns
+    /// `Ok(RebaseOutcome::Conflicted)` and **leaves the merge in progress on
+    /// disk** for the caller to resolve and commit, or abort. Any other
+    /// failure is the usual [`GitError::Command`].
+    fn merge_into(&self, dir: &Path, reference: &str) -> Result<RebaseOutcome, GitError>;
+
+    /// Whether a merge is currently in progress in the working tree at `dir`
+    /// (`git rev-parse -q --verify MERGE_HEAD` succeeds).
+    fn merge_in_progress(&self, dir: &Path) -> Result<bool, GitError>;
+
+    /// Push `branch` to `origin` without force (`git push origin
+    /// <branch>`). Fails as a [`GitError::Command`] when the push is not a
+    /// fast-forward. Same no-timeout caveat as [`GitOps::fetch_origin`].
+    fn push(&self, dir: &Path, branch: &str) -> Result<(), GitError>;
 }
 
-/// The outcome of [`GitOps::rebase_onto`].
+/// The outcome of [`GitOps::rebase_onto`] and [`GitOps::merge_into`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebaseOutcome {
-    /// The rebase completed cleanly.
+    /// The rebase (or merge) completed cleanly.
     Completed,
-    /// The rebase stopped on a conflict and is left in progress on disk;
-    /// see [`GitOps::rebase_onto`]'s doc comment.
+    /// The rebase (or merge) stopped on a conflict and is left in progress
+    /// on disk; see [`GitOps::rebase_onto`]'s doc comment.
     Conflicted,
 }
 
@@ -728,6 +765,70 @@ impl GitOps for ShellGitOps {
         let output = run_git(dir, &delete_branch_args(branch), "git branch -D")?;
         interpret_success_or_command_error("git branch -D", output.status.code(), &output.stderr)
     }
+
+    fn merge_base(&self, dir: &Path, a: &str, b: &str) -> Result<String, GitError> {
+        let args = vec!["merge-base".to_string(), a.to_string(), b.to_string()];
+        let output = run_git(dir, &args, "git merge-base")?;
+        interpret_success_or_command_error("git merge-base", output.status.code(), &output.stderr)?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn squash_since(&self, dir: &Path, since: &str, message: &str) -> Result<(), GitError> {
+        let output = run_git(
+            dir,
+            &squash_commit_tree_args(since, message),
+            "git commit-tree",
+        )?;
+        interpret_success_or_command_error(
+            "git commit-tree",
+            output.status.code(),
+            &output.stderr,
+        )?;
+        let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let args = vec!["reset".to_string(), "--soft".to_string(), commit];
+        let output = run_git(dir, &args, "git reset --soft")?;
+        interpret_success_or_command_error("git reset --soft", output.status.code(), &output.stderr)
+    }
+
+    fn merge_into(&self, dir: &Path, reference: &str) -> Result<RebaseOutcome, GitError> {
+        let output = run_git(dir, &merge_into_args(reference), "git merge")?;
+        if output.status.success() {
+            return Ok(RebaseOutcome::Completed);
+        }
+        if self.merge_in_progress(dir)? {
+            return Ok(RebaseOutcome::Conflicted);
+        }
+        Err(GitError::Command {
+            command: "git merge".to_string(),
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
+    fn merge_in_progress(&self, dir: &Path) -> Result<bool, GitError> {
+        let args = vec![
+            "rev-parse".to_string(),
+            "-q".to_string(),
+            "--verify".to_string(),
+            "MERGE_HEAD".to_string(),
+        ];
+        let output = run_git(dir, &args, "git rev-parse --verify MERGE_HEAD")?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            code => Err(GitError::Command {
+                command: "git rev-parse --verify MERGE_HEAD".to_string(),
+                exit_code: code,
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
+    }
+
+    fn push(&self, dir: &Path, branch: &str) -> Result<(), GitError> {
+        let args = vec!["push".to_string(), "origin".to_string(), branch.to_string()];
+        let output = run_git(dir, &args, "git push origin")?;
+        interpret_success_or_command_error("git push origin", output.status.code(), &output.stderr)
+    }
 }
 
 /// Whether `toplevel` (the output of `git rev-parse --show-toplevel` run
@@ -975,6 +1076,30 @@ fn fetch_branch_to_local_args(branch: &str) -> Vec<String> {
     ]
 }
 
+/// Build the argument list for the commit half of [`GitOps::squash_since`]:
+/// `git commit-tree HEAD^{tree} -p <since> -m <message>`.
+fn squash_commit_tree_args(since: &str, message: &str) -> Vec<String> {
+    vec![
+        "commit-tree".to_string(),
+        "HEAD^{tree}".to_string(),
+        "-p".to_string(),
+        since.to_string(),
+        "-m".to_string(),
+        message.to_string(),
+    ]
+}
+
+/// Build the argument list for [`GitOps::merge_into`]: `git merge --no-ff
+/// --no-edit <reference>`.
+fn merge_into_args(reference: &str) -> Vec<String> {
+    vec![
+        "merge".to_string(),
+        "--no-ff".to_string(),
+        "--no-edit".to_string(),
+        reference.to_string(),
+    ]
+}
+
 /// Build the argument list for `git branch -D <branch>`.
 fn delete_branch_args(branch: &str) -> Vec<String> {
     vec!["branch".to_string(), "-D".to_string(), branch.to_string()]
@@ -1164,6 +1289,15 @@ pub struct FakeGitOps {
     merge_ff_only_result: std::cell::RefCell<Result<(), GitError>>,
     fetch_branch_to_local_result: std::cell::RefCell<Result<(), GitError>>,
     delete_branch_result: std::cell::RefCell<Result<(), GitError>>,
+    merge_base_result: std::cell::RefCell<Result<String, GitError>>,
+    squash_since_result: std::cell::RefCell<Result<(), GitError>>,
+    merge_into_result: std::cell::RefCell<Result<RebaseOutcome, GitError>>,
+    /// Sequenced answers for `merge_in_progress`, consumed one per call;
+    /// the last entry repeats once exhausted. See
+    /// [`Self::with_merge_in_progress_sequence`].
+    merge_in_progress_sequence: std::cell::RefCell<Vec<Result<bool, GitError>>>,
+    merge_in_progress_index: std::cell::RefCell<usize>,
+    push_result: std::cell::RefCell<Result<(), GitError>>,
 
     branch_exists_local_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
     branch_exists_remote_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
@@ -1176,6 +1310,9 @@ pub struct FakeGitOps {
     merge_ff_only_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
     fetch_branch_to_local_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
     delete_branch_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
+    squash_since_calls: std::cell::RefCell<Vec<(PathBuf, String, String)>>,
+    merge_into_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
+    push_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
     config_values: std::cell::RefCell<std::collections::HashMap<String, String>>,
     /// Branch names that report as existing (both `branch_exists_local` and
     /// `branch_exists_remote`) regardless of those methods' blanket
@@ -1225,6 +1362,12 @@ impl Default for FakeGitOps {
             merge_ff_only_result: std::cell::RefCell::new(Ok(())),
             fetch_branch_to_local_result: std::cell::RefCell::new(Ok(())),
             delete_branch_result: std::cell::RefCell::new(Ok(())),
+            merge_base_result: std::cell::RefCell::new(Ok("merge-base-sha".to_string())),
+            squash_since_result: std::cell::RefCell::new(Ok(())),
+            merge_into_result: std::cell::RefCell::new(Ok(RebaseOutcome::Completed)),
+            merge_in_progress_sequence: std::cell::RefCell::new(vec![Ok(false)]),
+            merge_in_progress_index: std::cell::RefCell::new(0),
+            push_result: std::cell::RefCell::new(Ok(())),
             branch_exists_local_calls: std::cell::RefCell::new(Vec::new()),
             branch_exists_remote_calls: std::cell::RefCell::new(Vec::new()),
             provision_worktree_calls: std::cell::RefCell::new(Vec::new()),
@@ -1236,6 +1379,9 @@ impl Default for FakeGitOps {
             merge_ff_only_calls: std::cell::RefCell::new(Vec::new()),
             fetch_branch_to_local_calls: std::cell::RefCell::new(Vec::new()),
             delete_branch_calls: std::cell::RefCell::new(Vec::new()),
+            squash_since_calls: std::cell::RefCell::new(Vec::new()),
+            merge_into_calls: std::cell::RefCell::new(Vec::new()),
+            push_calls: std::cell::RefCell::new(Vec::new()),
             config_values: std::cell::RefCell::new(std::collections::HashMap::new()),
             existing_branches: std::cell::RefCell::new(std::collections::HashSet::new()),
             call_log: std::cell::RefCell::new(Vec::new()),
@@ -1559,6 +1705,44 @@ impl FakeGitOps {
         self
     }
 
+    /// Set the result `merge_base` will return.
+    pub fn with_merge_base_result(self, result: Result<String, GitError>) -> Self {
+        *self.merge_base_result.borrow_mut() = result;
+        self
+    }
+
+    /// Set the result `squash_since` will return.
+    pub fn with_squash_since_result(self, result: Result<(), GitError>) -> Self {
+        *self.squash_since_result.borrow_mut() = result;
+        self
+    }
+
+    /// Set the result `merge_into` will return.
+    pub fn with_merge_into_result(self, result: Result<RebaseOutcome, GitError>) -> Self {
+        *self.merge_into_result.borrow_mut() = result;
+        self
+    }
+
+    /// Configure `merge_in_progress` to return each element of `sequence`
+    /// in order, one per call, repeating the last element once exhausted.
+    ///
+    /// Panics if `sequence` is empty.
+    pub fn with_merge_in_progress_sequence(self, sequence: Vec<Result<bool, GitError>>) -> Self {
+        assert!(
+            !sequence.is_empty(),
+            "with_merge_in_progress_sequence requires at least one entry"
+        );
+        *self.merge_in_progress_sequence.borrow_mut() = sequence;
+        *self.merge_in_progress_index.borrow_mut() = 0;
+        self
+    }
+
+    /// Set the result `push` will return.
+    pub fn with_push_result(self, result: Result<(), GitError>) -> Self {
+        *self.push_result.borrow_mut() = result;
+        self
+    }
+
     /// Set the result `merge_ff_only` will return.
     pub fn with_merge_ff_only_result(self, result: Result<(), GitError>) -> Self {
         *self.merge_ff_only_result.borrow_mut() = result;
@@ -1586,6 +1770,22 @@ impl FakeGitOps {
     /// order.
     pub fn push_force_with_lease_calls(&self) -> Vec<(PathBuf, String)> {
         self.push_force_with_lease_calls.borrow().clone()
+    }
+
+    /// The `(dir, since, message)` triples passed to `squash_since`, in
+    /// call order.
+    pub fn squash_since_calls(&self) -> Vec<(PathBuf, String, String)> {
+        self.squash_since_calls.borrow().clone()
+    }
+
+    /// The `(dir, reference)` pairs passed to `merge_into`, in call order.
+    pub fn merge_into_calls(&self) -> Vec<(PathBuf, String)> {
+        self.merge_into_calls.borrow().clone()
+    }
+
+    /// The `(dir, branch)` pairs passed to `push`, in call order.
+    pub fn push_calls(&self) -> Vec<(PathBuf, String)> {
+        self.push_calls.borrow().clone()
     }
 
     /// The `(dir, reference)` pairs passed to `merge_ff_only`, in call
@@ -1813,6 +2013,43 @@ impl GitOps for FakeGitOps {
             .borrow_mut()
             .push((dir.to_path_buf(), branch.to_string()));
         self.delete_branch_result.borrow().clone()
+    }
+
+    fn merge_base(&self, _dir: &Path, _a: &str, _b: &str) -> Result<String, GitError> {
+        self.merge_base_result.borrow().clone()
+    }
+
+    fn squash_since(&self, dir: &Path, since: &str, message: &str) -> Result<(), GitError> {
+        self.call_log.borrow_mut().push("squash_since");
+        self.squash_since_calls.borrow_mut().push((
+            dir.to_path_buf(),
+            since.to_string(),
+            message.to_string(),
+        ));
+        self.squash_since_result.borrow().clone()
+    }
+
+    fn merge_into(&self, dir: &Path, reference: &str) -> Result<RebaseOutcome, GitError> {
+        self.call_log.borrow_mut().push("merge_into");
+        self.merge_into_calls
+            .borrow_mut()
+            .push((dir.to_path_buf(), reference.to_string()));
+        self.merge_into_result.borrow().clone()
+    }
+
+    fn merge_in_progress(&self, _dir: &Path) -> Result<bool, GitError> {
+        next_from_sequence(
+            &self.merge_in_progress_sequence,
+            &self.merge_in_progress_index,
+        )
+    }
+
+    fn push(&self, dir: &Path, branch: &str) -> Result<(), GitError> {
+        self.call_log.borrow_mut().push("push");
+        self.push_calls
+            .borrow_mut()
+            .push((dir.to_path_buf(), branch.to_string()));
+        self.push_result.borrow().clone()
     }
 }
 
@@ -3269,5 +3506,193 @@ mod tests {
 
         let config_after = std::fs::read_to_string(tmp.path().join(".git/config")).unwrap();
         assert_eq!(config_before, config_after);
+    }
+
+    // --- merge strategies (GitHub issue #244) ---
+
+    fn git_cmd(dir: &Path, args: &[&str]) -> std::process::Output {
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_EDITOR", "true")
+            .output()
+            .unwrap()
+    }
+
+    fn head_parents(dir: &Path) -> usize {
+        let out = git_cmd(dir, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .split_whitespace()
+            .count()
+            - 1
+    }
+
+    /// A repo whose `feature-branch` has three commits that each conflict
+    /// with a commit on `main` (every one rewrites README.md).
+    fn three_conflicting_commits(dir: &Path) {
+        git_init(dir);
+        commit_file(dir, "README.md", "base\n", "base content");
+        checkout_new_branch(dir, "feature-branch");
+        for n in 1..=3 {
+            commit_file(dir, "README.md", &format!("feature {n}\n"), "feature edit");
+        }
+        git_cmd(dir, &["checkout", "-q", "main"]);
+        commit_file(dir, "README.md", "main change\n", "main edit");
+        git_cmd(dir, &["checkout", "-q", "feature-branch"]);
+    }
+
+    /// Resolves README.md to `contents` and continues the rebase, returning
+    /// whether a rebase is still in progress afterwards.
+    fn resolve_and_continue(ops: &ShellGitOps, dir: &Path, contents: &str) -> bool {
+        std::fs::write(dir.join("README.md"), contents).unwrap();
+        git_cmd(dir, &["add", "README.md"]);
+        git_cmd(dir, &["rebase", "--continue"]);
+        ops.rebase_in_progress(dir).unwrap()
+    }
+
+    #[test]
+    fn shell_git_ops_plain_rebase_stops_once_per_conflicting_commit() {
+        // The baseline the squash strategy exists to avoid.
+        let tmp = TempDir::new().unwrap();
+        three_conflicting_commits(tmp.path());
+        let ops = ShellGitOps::new();
+
+        assert_eq!(
+            ops.rebase_onto(tmp.path(), "main").unwrap(),
+            RebaseOutcome::Conflicted
+        );
+        assert!(resolve_and_continue(&ops, tmp.path(), "resolved\n"));
+    }
+
+    #[test]
+    fn shell_git_ops_squash_since_then_rebase_makes_one_conflict_pass() {
+        let tmp = TempDir::new().unwrap();
+        three_conflicting_commits(tmp.path());
+        let ops = ShellGitOps::new();
+
+        let since = ops
+            .merge_base(tmp.path(), "feature-branch", "main")
+            .unwrap();
+        ops.squash_since(tmp.path(), &since, "squashed feature")
+            .unwrap();
+        assert_eq!(
+            git_cmd(tmp.path(), &["rev-list", "--count", "main..feature-branch"]).stdout,
+            b"1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("README.md")).unwrap(),
+            "feature 3\n"
+        );
+        assert!(ops.status_is_clean(tmp.path()).unwrap());
+
+        assert_eq!(
+            ops.rebase_onto(tmp.path(), "main").unwrap(),
+            RebaseOutcome::Conflicted
+        );
+        assert!(!resolve_and_continue(&ops, tmp.path(), "resolved\n"));
+        assert_eq!(ops.current_branch(tmp.path()).unwrap(), "feature-branch");
+        assert!(
+            ops.is_ancestor(tmp.path(), "main", "feature-branch")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn shell_git_ops_merge_into_completes_with_a_merge_commit() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        checkout_new_branch(tmp.path(), "feature-branch");
+        commit_file(tmp.path(), "feature.txt", "feature\n", "add feature");
+        git_cmd(tmp.path(), &["checkout", "-q", "main"]);
+        commit_file(tmp.path(), "main-extra.txt", "main extra\n", "advance main");
+        git_cmd(tmp.path(), &["checkout", "-q", "feature-branch"]);
+
+        let ops = ShellGitOps::new();
+        assert_eq!(
+            ops.merge_into(tmp.path(), "main").unwrap(),
+            RebaseOutcome::Completed
+        );
+        assert!(!ops.merge_in_progress(tmp.path()).unwrap());
+        assert_eq!(head_parents(tmp.path()), 2);
+        assert!(tmp.path().join("main-extra.txt").exists());
+    }
+
+    #[test]
+    fn shell_git_ops_merge_into_conflict_leaves_merge_in_progress() {
+        let tmp = TempDir::new().unwrap();
+        three_conflicting_commits(tmp.path());
+        let ops = ShellGitOps::new();
+
+        assert_eq!(
+            ops.merge_into(tmp.path(), "main").unwrap(),
+            RebaseOutcome::Conflicted
+        );
+        assert!(ops.merge_in_progress(tmp.path()).unwrap());
+        assert!(!ops.rebase_in_progress(tmp.path()).unwrap());
+        assert_eq!(
+            ops.conflicted_files(tmp.path()).unwrap(),
+            vec!["README.md".to_string()]
+        );
+
+        git_cmd(tmp.path(), &["merge", "--abort"]);
+        assert!(!ops.merge_in_progress(tmp.path()).unwrap());
+    }
+
+    #[test]
+    fn shell_git_ops_merge_into_fails_on_unknown_ref() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        let ops = ShellGitOps::new();
+        let err = ops.merge_into(tmp.path(), "no-such-ref").unwrap_err();
+        assert!(matches!(err, GitError::Command { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn shell_git_ops_push_publishes_a_fast_forward() {
+        let tmp = TempDir::new().unwrap();
+        let origin_bare = tmp.path().join("origin.git");
+        std::fs::create_dir_all(&origin_bare).unwrap();
+        git_cmd(&origin_bare, &["init", "-q", "--bare", "-b", "main"]);
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git_init(&work);
+        git_cmd(
+            &work,
+            &["remote", "add", "origin", origin_bare.to_str().unwrap()],
+        );
+        git_cmd(&work, &["push", "-q", "-u", "origin", "main"]);
+        commit_file(&work, "more.txt", "more\n", "add more");
+
+        let ops = ShellGitOps::new();
+        ops.push(&work, "main").unwrap();
+        assert_eq!(
+            git_cmd(&origin_bare, &["rev-parse", "main"]).stdout,
+            git_cmd(&work, &["rev-parse", "main"]).stdout
+        );
+    }
+
+    #[test]
+    fn shell_git_ops_push_refuses_a_non_fast_forward() {
+        let tmp = TempDir::new().unwrap();
+        let origin_bare = tmp.path().join("origin.git");
+        std::fs::create_dir_all(&origin_bare).unwrap();
+        git_cmd(&origin_bare, &["init", "-q", "--bare", "-b", "main"]);
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git_init(&work);
+        git_cmd(
+            &work,
+            &["remote", "add", "origin", origin_bare.to_str().unwrap()],
+        );
+        commit_file(&work, "more.txt", "more\n", "add more");
+        git_cmd(&work, &["push", "-q", "-u", "origin", "main"]);
+        git_cmd(&work, &["reset", "-q", "--hard", "HEAD~1"]);
+        commit_file(&work, "other.txt", "other\n", "rewrite");
+
+        let ops = ShellGitOps::new();
+        let err = ops.push(&work, "main").unwrap_err();
+        assert!(matches!(err, GitError::Command { .. }), "{err:?}");
     }
 }

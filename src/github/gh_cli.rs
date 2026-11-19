@@ -574,6 +574,17 @@ pub trait GhCli {
     /// board's merge key blocks the event loop while this runs.
     fn pr_merge(&self, dir: &Path, number: u64, timeout: Duration) -> Result<(), GhError>;
 
+    /// The merge method [`GhCli::pr_merge`] would use for the repository
+    /// containing `dir`, read the same way (`gh repo view --json`), or
+    /// `None` when the repository allows none. `tm merge`'s `squash`
+    /// strategy reads it to warn when the repo merges with a merge commit
+    /// (GitHub issue #244). Bounded by `timeout` like `pr_merge`.
+    fn repo_merge_method(
+        &self,
+        dir: &Path,
+        timeout: Duration,
+    ) -> Result<Option<RepoMergeMethod>, GhError>;
+
     // --- Issue operations (phase 4 of the GitHub-Issues-as-a-backend work,
     // docs/plans/github-issues-backend.md) ---
     //
@@ -1221,21 +1232,66 @@ fn interpret_repo_merge_settings_output(
     })
 }
 
-/// The `gh pr merge` strategy flag for the first repo-allowed merge method,
-/// in the order GitHub's own merge button offers them (merge commit, then
-/// squash, then rebase), or `None` when the repository allows none at all
-/// (only reachable through API-level settings drift; the web UI refuses to
-/// save that state).
-fn merge_method_flag(settings: &RawRepoMergeSettings) -> Option<&'static str> {
+/// A GitHub pull request merge method, as [`GhCli::pr_merge`] picks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoMergeMethod {
+    /// A merge commit (`gh pr merge --merge`).
+    MergeCommit,
+    /// Squash and merge (`gh pr merge --squash`).
+    Squash,
+    /// Rebase and merge (`gh pr merge --rebase`).
+    Rebase,
+}
+
+impl RepoMergeMethod {
+    /// The `gh pr merge` flag selecting this method.
+    pub fn flag(self) -> &'static str {
+        match self {
+            RepoMergeMethod::MergeCommit => "--merge",
+            RepoMergeMethod::Squash => "--squash",
+            RepoMergeMethod::Rebase => "--rebase",
+        }
+    }
+}
+
+/// The first repo-allowed merge method, in the order GitHub's own merge
+/// button offers them (merge commit, then squash, then rebase), or `None`
+/// when the repository allows none at all (only reachable through
+/// API-level settings drift; the web UI refuses to save that state).
+fn repo_merge_method(settings: &RawRepoMergeSettings) -> Option<RepoMergeMethod> {
     if settings.merge_commit_allowed {
-        Some("--merge")
+        Some(RepoMergeMethod::MergeCommit)
     } else if settings.squash_merge_allowed {
-        Some("--squash")
+        Some(RepoMergeMethod::Squash)
     } else if settings.rebase_merge_allowed {
-        Some("--rebase")
+        Some(RepoMergeMethod::Rebase)
     } else {
         None
     }
+}
+
+/// The `gh pr merge` strategy flag for [`repo_merge_method`]'s pick.
+fn merge_method_flag(settings: &RawRepoMergeSettings) -> Option<&'static str> {
+    repo_merge_method(settings).map(RepoMergeMethod::flag)
+}
+
+/// Reads the repository's allowed merge methods (`gh repo view --json`,
+/// see [`REPO_MERGE_SETTINGS_JSON_FIELDS`]) from `dir`, bounded by
+/// `timeout`.
+fn read_repo_merge_settings(
+    dir: &Path,
+    timeout: Duration,
+) -> Result<RawRepoMergeSettings, GhError> {
+    let mut command = Command::new("gh");
+    command
+        .args(["repo", "view", "--json", REPO_MERGE_SETTINGS_JSON_FIELDS])
+        .current_dir(dir);
+    let output = spawn_with_timeout(command, "gh repo view", timeout)?;
+    interpret_repo_merge_settings_output(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
 }
 
 /// The argv [`GhCli::pr_merge`] runs once a strategy flag has been derived:
@@ -2131,17 +2187,16 @@ impl GhCli for ShellGhCli {
         )
     }
 
+    fn repo_merge_method(
+        &self,
+        dir: &Path,
+        timeout: Duration,
+    ) -> Result<Option<RepoMergeMethod>, GhError> {
+        Ok(repo_merge_method(&read_repo_merge_settings(dir, timeout)?))
+    }
+
     fn pr_merge(&self, dir: &Path, number: u64, timeout: Duration) -> Result<(), GhError> {
-        let mut settings_command = Command::new("gh");
-        settings_command
-            .args(["repo", "view", "--json", REPO_MERGE_SETTINGS_JSON_FIELDS])
-            .current_dir(dir);
-        let output = spawn_with_timeout(settings_command, "gh repo view", timeout)?;
-        let settings = interpret_repo_merge_settings_output(
-            output.status.code(),
-            &String::from_utf8_lossy(&output.stdout),
-            &String::from_utf8_lossy(&output.stderr),
-        )?;
+        let settings = read_repo_merge_settings(dir, timeout)?;
         let method_flag = merge_method_flag(&settings).ok_or_else(|| GhError::Command {
             command: "gh pr merge".to_string(),
             exit_code: None,
@@ -4416,6 +4471,7 @@ pub struct FakeGhCli {
     pr_merge_result: RefCell<Result<(), GhError>>,
     pr_merge_sequence: RefCell<std::collections::VecDeque<Result<(), GhError>>>,
     pr_merge_calls: RefCell<Vec<(PathBuf, u64)>>,
+    repo_merge_method_result: RefCell<Result<Option<RepoMergeMethod>, GhError>>,
     issue_view_results: RefCell<HashMap<u64, Result<IssueInfo, GhError>>>,
     issue_view_calls: RefCell<Vec<(String, u64)>>,
     issue_list_result: RefCell<Result<Vec<IssueInfo>, GhError>>,
@@ -4511,6 +4567,7 @@ impl Default for FakeGhCli {
             pr_merge_result: RefCell::new(Ok(())),
             pr_merge_sequence: RefCell::new(std::collections::VecDeque::new()),
             pr_merge_calls: RefCell::new(Vec::new()),
+            repo_merge_method_result: RefCell::new(Ok(Some(RepoMergeMethod::Squash))),
             pr_list_bounded_calls: RefCell::new(Vec::new()),
             pr_list_review_state_result: RefCell::new(Ok(Vec::new())),
             pr_list_review_state_calls: RefCell::new(Vec::new()),
@@ -4828,6 +4885,16 @@ impl FakeGhCli {
             "with_pr_merge_sequence requires a non-empty sequence"
         );
         *self.pr_merge_sequence.borrow_mut() = sequence.into();
+        self
+    }
+
+    /// Set the result `repo_merge_method` will return. Unconfigured, it
+    /// reports [`RepoMergeMethod::Squash`].
+    pub fn with_repo_merge_method_result(
+        self,
+        result: Result<Option<RepoMergeMethod>, GhError>,
+    ) -> Self {
+        *self.repo_merge_method_result.borrow_mut() = result;
         self
     }
 
@@ -5323,6 +5390,14 @@ impl GhCli for FakeGhCli {
             Some(result) => result.clone(),
             None => Ok(Vec::new()),
         }
+    }
+
+    fn repo_merge_method(
+        &self,
+        _dir: &Path,
+        _timeout: Duration,
+    ) -> Result<Option<RepoMergeMethod>, GhError> {
+        self.repo_merge_method_result.borrow().clone()
     }
 
     fn pr_merge(&self, dir: &Path, number: u64, _timeout: Duration) -> Result<(), GhError> {
@@ -7276,6 +7351,28 @@ mod tests {
             GhError::Command { command, .. } => assert_eq!(command, "gh repo view"),
             other => panic!("expected Command error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn repo_merge_method_prefers_merge_commit_then_squash_then_rebase() {
+        let settings = |merge, squash, rebase| RawRepoMergeSettings {
+            merge_commit_allowed: merge,
+            squash_merge_allowed: squash,
+            rebase_merge_allowed: rebase,
+        };
+        assert_eq!(
+            repo_merge_method(&settings(true, true, true)),
+            Some(RepoMergeMethod::MergeCommit)
+        );
+        assert_eq!(
+            repo_merge_method(&settings(false, true, true)),
+            Some(RepoMergeMethod::Squash)
+        );
+        assert_eq!(
+            repo_merge_method(&settings(false, false, true)),
+            Some(RepoMergeMethod::Rebase)
+        );
+        assert_eq!(repo_merge_method(&settings(false, false, false)), None);
     }
 
     #[test]

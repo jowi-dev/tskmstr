@@ -926,6 +926,37 @@ pub trait AgentRunner: Sync {
          explain why, and continue with the next ticket."
     }
 
+    /// The `[work.merge] strategy = "merge"` counterpart of
+    /// [`AgentRunner::default_merge_conflict_prompt_template`] (GitHub issue
+    /// #244): the session finishes a stopped `git merge` of the base into
+    /// the branch with `git commit` instead of continuing a rebase. Same
+    /// `{key}`/`{branch}`/`{base}` placeholders.
+    fn default_merge_commit_conflict_prompt_template(&self) -> &'static str {
+        "A git merge of origin/{base} into branch {branch} for ticket {key} has stopped on \
+         conflicts in this worktree. Your job is bounded: resolve only the merge conflicts. \
+         Inspect the conflicted files, resolve each conflict preserving the intent of both \
+         sides, `git add` the resolved files, and run `git commit --no-edit` to finish the \
+         merge. Do not push. Do not make unrelated changes. If a conflict cannot be resolved \
+         safely, run `git merge --abort` and explain why."
+    }
+
+    /// The `[work.merge] strategy = "merge"` counterpart of
+    /// [`AgentRunner::default_batch_merge_conflict_prompt_template`] (GitHub
+    /// issue #244). Same `{ticket_list}` placeholder.
+    fn default_batch_merge_commit_conflict_prompt_template(&self) -> &'static str {
+        "Several git merges have stopped on conflicts, one per ticket below. Each line gives \
+         the ticket key, the base being merged in (origin/<base>), the branch it is being \
+         merged into, and the checkout directory the merge is in progress in:\n\n\
+         {ticket_list}\n\n\
+         Your job is bounded: resolve only the merge conflicts, one ticket at a time, in the \
+         order listed. For each ticket, work in its checkout directory: inspect the conflicted \
+         files, resolve each conflict preserving the intent of both sides, `git add` the \
+         resolved files, and run `git commit --no-edit` to finish that merge, then move on to \
+         the next ticket. Do not push. Do not make unrelated changes. If a ticket's conflicts \
+         cannot be resolved safely, run `git merge --abort` in its directory, explain why, and \
+         continue with the next ticket."
+    }
+
     /// Prompt for the short headless session a successful `tm merge` starts
     /// to consolidate the merged branches' thatch memories (GitHub issue
     /// #208). The one placeholder, `{branch_list}`, is substituted by the
@@ -1128,6 +1159,32 @@ mod tests {
             claude.contains("{ticket_list}"),
             "expected {{ticket_list}} in the default batch merge conflict prompt template, got: {claude:?}"
         );
+    }
+
+    /// Both adapters inherit the `merge` strategy's conflict templates
+    /// (GitHub issue #244); each carries the caller's placeholders and
+    /// finishes with `git commit`, never a rebase command.
+    #[test]
+    fn both_runners_inherit_the_merge_commit_conflict_prompt_templates() {
+        let single = ClaudeRunner.default_merge_commit_conflict_prompt_template();
+        assert_eq!(
+            single,
+            OpencodeRunner.default_merge_commit_conflict_prompt_template()
+        );
+        for placeholder in ["{key}", "{branch}", "{base}"] {
+            assert!(single.contains(placeholder), "{placeholder}: {single:?}");
+        }
+        let batch = ClaudeRunner.default_batch_merge_commit_conflict_prompt_template();
+        assert_eq!(
+            batch,
+            OpencodeRunner.default_batch_merge_commit_conflict_prompt_template()
+        );
+        assert!(batch.contains("{ticket_list}"), "{batch:?}");
+        for prompt in [single, batch] {
+            assert!(prompt.contains("git commit --no-edit"), "{prompt:?}");
+            assert!(prompt.contains("git merge --abort"), "{prompt:?}");
+            assert!(!prompt.contains("rebase"), "{prompt:?}");
+        }
     }
 
     /// Both adapters inherit [`AgentRunner::default_defect_retro_prompt_template`]

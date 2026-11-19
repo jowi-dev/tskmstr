@@ -2570,6 +2570,10 @@ these stages:
    rebases the branch onto it. A clean rebase is force-pushed
    (`--force-with-lease`) automatically. A checkout with uncommitted
    changes is refused rather than rebased out from under you.
+   `[work.merge] strategy` changes how the branch catches up (see
+   "Choosing a merge strategy" below): `squash` squashes it into one
+   commit before the rebase, and `merge` merges the base into it instead
+   and pushes without force.
 3. **Agent-assisted conflict resolution.** A rebase that stops on
    conflicts opens a `merge` window running the configured agent with a
    conflict-resolution prompt — on your *current* tmux session's window
@@ -2678,8 +2682,9 @@ rely on this:
   `merge-batch` event) shows up in `tm runs --kind merge-conflict` while it
   is open. It ends `done` when the rebase resolves and `failed` when it is
   handed back, unless the session's own exit finished it first.
-- **No merge-strategy override.** Always the repo's configured default,
-  same as `M`.
+- **No PR merge-method override.** `gh pr merge` always uses the repo's
+  configured default, same as `M`. `[work.merge] strategy` only changes how
+  the branch catches up with its base before that.
 - **Cleanup is best-effort.** A failed worktree removal or branch deletion
   never fails the command — it's reported with the exact manual command to
   finish the job, and the PR is already merged by that point regardless.
@@ -2749,6 +2754,7 @@ the post-merge memory session (stage 10); it never gates whether merging is avai
 # model = "opus"                               # optional; see "Which model a launch uses"
 # batch_conflict_prompt = "..."               # optional; combined session for `tm merge KEY1 KEY2 ...`
 # consolidate_memories = false                # optional; default true, see stage 10
+# strategy = "squash"                         # optional; "rebase" (default), "squash", or "merge"
 ```
 
 `prompt_file` and `prompt` are mutually exclusive — setting both is a
@@ -2772,6 +2778,35 @@ which stay single-ticket only, so setting it alongside either is fine.
 `consolidate_memories` turns off the post-merge memory-consolidation
 session (stage 10). It is on by default. That session uses `model` the
 same way the conflict sessions do.
+
+#### Choosing a merge strategy
+
+A rebase stops at every commit that conflicts, so a long branch that
+touches a file the base restructured can need several conflict passes.
+`strategy` picks how stage 2 brings the branch up to date instead:
+
+- **`rebase`** (the default): rebase the branch's commits onto
+  `origin/<base>`, exactly as described above.
+- **`squash`**: squash the branch's commits since its merge base into one
+  commit, titled with the PR's title, then rebase that commit. Every
+  conflict comes up in one pass. The squash only happens when a rebase is
+  needed. If the repo merges PRs with a merge commit, tm warns that the
+  branch's commit history won't reach the base, but squashes anyway. tm
+  logs `squashed <branch> (was <tip>)` right after the squash, and a
+  conflict session that is handed back repeats the original tip, so if the
+  flow stops for any reason, `git reset --hard <tip>` restores the
+  unsquashed commits.
+- **`merge`**: merge `origin/<base>` into the branch (`git merge --no-ff`).
+  One conflict pass and no rewritten history, at the cost of a merge
+  commit on the branch, which is pushed without force.
+
+The conflict session follows the strategy. Its built-in prompt (single and
+batch) finishes with `git rebase --continue` for `rebase` and `squash`, and
+with `git commit --no-edit` for `merge`, and tm polls for the rebase or the
+merge accordingly. A custom `prompt`, `prompt_file`, or
+`batch_conflict_prompt` is used as written for every strategy, so keep its
+instructions in line with the strategy you set. The stage-4 retry uses the
+same strategy.
 
 ### Retro board
 
