@@ -522,7 +522,9 @@ pub trait GhCli {
     fn pr_url_for_branch(&self, branch: &str) -> Result<Option<String>, GhError>;
 
     /// List every pull request in the current repository, open *or* merged
-    /// (`gh pr list --state all --json number,headRefName,headRefOid,state,updatedAt`).
+    /// (`gh pr list --state all --limit 1000 --json
+    /// number,headRefName,headRefOid,state,updatedAt`). The limit lifts
+    /// `gh`'s default of the 30 most recent PRs.
     ///
     /// Used by `tm work run`'s blocked-ticket branch-off logic (see
     /// [`crate::work::run::resolve_blocker_stacking`]) to find and classify
@@ -1190,6 +1192,26 @@ const COMMIT_CHECKS_QUERY: &str = "query($owner: String!, $name: String!, $ref: 
 /// deserialization stay in lockstep. Same `merged`-field pitfall as
 /// [`PR_STATE_JSON_FIELDS`] applies here.
 const PR_LIST_ALL_JSON_FIELDS: &str = "number,headRefName,headRefOid,state,updatedAt";
+
+/// How many PRs [`GhCli::pr_list_all`] asks `gh` for. `gh pr list`
+/// returns only the 30 most recent by default, which made every older
+/// merged PR look missing to kill-safety and to the sweep's `--merged`
+/// mark (GitHub issue #253). `gh` pages through the API for larger limits.
+const PR_LIST_ALL_LIMIT: &str = "1000";
+
+/// The argument list [`GhCli::pr_list_all`] passes to `gh`.
+fn pr_list_all_args() -> [&'static str; 8] {
+    [
+        "pr",
+        "list",
+        "--state",
+        "all",
+        "--limit",
+        PR_LIST_ALL_LIMIT,
+        "--json",
+        PR_LIST_ALL_JSON_FIELDS,
+    ]
+}
 
 /// Fields requested from `gh pr list --json` in
 /// [`GhCli::pr_list_review_state`]: [`PR_VIEW_JSON_FIELDS`] plus review,
@@ -2137,14 +2159,7 @@ impl GhCli for ShellGhCli {
 
     fn pr_list_all(&self, dir: &Path) -> Result<Vec<PrSummary>, GhError> {
         let output = Command::new("gh")
-            .args([
-                "pr",
-                "list",
-                "--state",
-                "all",
-                "--json",
-                PR_LIST_ALL_JSON_FIELDS,
-            ])
+            .args(pr_list_all_args())
             .current_dir(dir)
             .output()
             .map_err(|err| GhError::Spawn {
@@ -6443,6 +6458,21 @@ mod tests {
                 .split(',')
                 .any(|f| f == "headRefOid")
         );
+    }
+
+    /// `gh pr list` returns only the 30 most recent PRs unless told
+    /// otherwise, which hid every older merged PR from kill-safety and the
+    /// sweep's `--merged` mark (GitHub issue #253).
+    #[test]
+    fn pr_list_all_lifts_gh_default_thirty_pr_limit() {
+        let args = pr_list_all_args();
+        let limit_at = args
+            .iter()
+            .position(|a| *a == "--limit")
+            .expect("--limit passed");
+        let limit: u32 = args[limit_at + 1].parse().unwrap();
+        assert!(limit > 30, "{args:?}");
+        assert_eq!(&args[..4], ["pr", "list", "--state", "all"]);
     }
 
     #[test]
