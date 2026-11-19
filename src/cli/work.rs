@@ -1049,11 +1049,15 @@ pub fn session(
 /// The worktree comes from the ticket's run rows, newest first — the rows
 /// know where the worktree actually is, so nothing has to be re-derived from
 /// a lane name. But not every run's `worktree` is a worktree: an `audit`
-/// run's is `[work.audit].dir`, the user's own checkout. Two conditions must
+/// run with no lane worktree to use records `[work.audit].dir`, the user's
+/// own checkout. Two conditions must
 /// therefore both hold before anything is removed:
 ///
-/// 1. The run's `lane` names a configured lane, giving a repo root to run
-///    `git worktree remove` against.
+/// 1. A configured lane gives a repo root to run `git worktree remove`
+///    against: the run's own `lane`, or, for an audit run (whose `lane` is
+///    `audit`), any configured lane whose repo the path sits under. An audit
+///    launched before a lane run provisions the ticket's lane worktree
+///    (GitHub issue #252), so its row may be the only one recording it.
 /// 2. The recorded path sits exactly one level below
 ///    `<worktree_root>/<repo>`, per
 ///    [`naming::worktree_path_has_expected_parent`] — the same guard
@@ -1115,9 +1119,10 @@ pub fn clean(
 }
 
 /// The `(repo_root, worktree)` pair [`clean`] may remove: the newest run in
-/// `runs` (which arrive oldest-first) whose lane is configured and whose
-/// recorded worktree passes
-/// [`naming::worktree_path_has_expected_parent`]. `None` when no run
+/// `runs` (which arrive oldest-first) whose recorded worktree passes
+/// [`naming::worktree_path_has_expected_parent`] for its lane's repo, or,
+/// for a run whose lane is not configured (an audit), for any configured
+/// lane's repo. `None` when no run
 /// qualifies — see [`clean`]'s doc comment for why both conditions are
 /// required.
 fn removable_worktree(
@@ -1128,12 +1133,20 @@ fn removable_worktree(
     let root_str = root.to_string_lossy();
 
     runs.iter().rev().find_map(|run| {
-        let lane = ctx.config.lanes.get(&run.lane)?;
-        let repo_root = PathBuf::from(&lane.repo);
-        let repo = repo_name(&repo_root).ok()?;
+        // An audit row's `lane` is `audit`, not a configured lane; its
+        // worktree, when it provisioned one (GitHub issue #252), belongs to
+        // whichever configured lane's repo it sits under.
+        let candidates: Vec<&crate::config::LaneConfig> = match ctx.config.lanes.get(&run.lane) {
+            Some(lane) => vec![lane],
+            None => ctx.config.lanes.values().collect(),
+        };
         let wt_path = PathBuf::from(&run.worktree);
-        naming::worktree_path_has_expected_parent(&root_str, &repo, &wt_path)
-            .then_some((repo_root, wt_path))
+        candidates.into_iter().find_map(|lane| {
+            let repo_root = PathBuf::from(&lane.repo);
+            let repo = repo_name(&repo_root).ok()?;
+            naming::worktree_path_has_expected_parent(&root_str, &repo, &wt_path)
+                .then(|| (repo_root, wt_path.clone()))
+        })
     })
 }
 
@@ -2703,6 +2716,47 @@ mod tests {
             vec![(repo.clone(), worktree.clone())],
             "one worktree removal"
         );
+    }
+
+    /// GitHub issue #252: an audit launched before any lane run records the
+    /// ticket's lane worktree, under the worktree root, as its `worktree`.
+    /// `clean` removes it like a lane run's, even though the audit row's
+    /// `lane` is `audit` rather than a configured lane.
+    #[test]
+    fn clean_removes_a_worktree_an_audit_provisioned() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let worktree = tmp.path().join("Worktrees/repo/proj-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let config = clean_config(&tmp, &repo);
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_has_session(Ok(false));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        store
+            .start_run(&crate::runs::StartRun {
+                scope: compatible_test_identity().scope(),
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: worktree.to_string_lossy().into_owned(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let mut out = Vec::new();
+
+        clean(&ctx, &store, compatible_test_identity(), "PROJ-1", &mut out).unwrap();
+
+        assert_eq!(git.remove_worktree_calls(), vec![(repo, worktree)]);
     }
 
     /// The safety property that matters most: an audit run's `worktree` is
