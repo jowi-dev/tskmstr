@@ -2229,12 +2229,20 @@ fn verify_and_push(
     }
 
     let gate = deps.merge_cfg.wait_for_checks;
+    // A failed read only warns, like a failed poll in [`wait_for_checks`]:
+    // assuming checks exist at worst waits out the timeout, where failing
+    // here would throw away a verify_command run that already passed.
     let expect_checks = gate
-        && !deps
-            .gh
-            .pr_checks(&prepared.repo_root, prepared.number)?
-            .checks
-            .is_empty();
+        && match deps.gh.pr_checks(&prepared.repo_root, prepared.number) {
+            Ok(checks) => !checks.checks.is_empty(),
+            Err(err) => {
+                writeln!(
+                    out,
+                    "warning: could not read checks before pushing: {err}; waiting for checks on the pushed head"
+                )?;
+                true
+            }
+        };
     push_branch(deps, dir, branch, force, out)?;
     let sha = if gate {
         deps.git.rev_parse(dir, branch)?
@@ -5811,6 +5819,31 @@ mod tests {
             .with_rebase_onto_result(Ok(RebaseOutcome::Completed))
             .with_branch_exists_local(Ok(false));
         fx
+    }
+
+    #[test]
+    fn failed_pre_push_checks_read_warns_and_still_waits() {
+        let mut fx = gated_fixture();
+        fx.gh = fx.gh.with_pr_checks_sequence(
+            7,
+            vec![
+                Err(GhError::Command {
+                    command: "gh pr view".to_string(),
+                    exit_code: Some(1),
+                    stderr: "connection reset".to_string(),
+                }),
+                checks_on("aaa", vec![]),
+                checks_on("aaa", vec![check("test", ChecksState::Passing)]),
+            ],
+        );
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert!(out.contains("warning: could not read checks"), "{out}");
+        assert_eq!(fx.git.push_force_with_lease_calls().len(), 1);
+        // The empty list was read as "not queued yet", not "no CI".
+        assert_eq!(fx.gh.pr_checks_calls().len(), 3);
     }
 
     #[test]
