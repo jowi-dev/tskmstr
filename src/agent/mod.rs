@@ -751,6 +751,20 @@ pub trait AgentRunner: Sync {
     /// comment for why that distinction matters to the caller.
     fn parse_outcome(&self, raw: &str) -> Result<RunOutcome, OutcomeParseError>;
 
+    /// The server-mode form of a [`RunMode::Headless`] invocation from
+    /// [`AgentRunner::build_invocation`] (GitHub issue #194): a tm driver
+    /// process, `tm_exe`, that runs the same work as a session on the
+    /// runner's shared server and writes the same stdout
+    /// [`AgentRunner::parse_outcome`] reads. `None` for a runner with no
+    /// server mode, the default; config rejects `mode = "server"` for those.
+    fn server_mode_invocation(
+        &self,
+        _headless: &AgentInvocation,
+        _tm_exe: &Path,
+    ) -> Option<AgentInvocation> {
+        None
+    }
+
     /// User-facing resume hint for a finished run's session id, e.g. `claude
     /// --resume <id>`.
     fn resume_command(&self, session_id: &str) -> String;

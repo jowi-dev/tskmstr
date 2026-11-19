@@ -501,6 +501,15 @@ impl AgentRunner for OpencodeRunner {
         })
     }
 
+    /// See [`server::server_mode_invocation`].
+    fn server_mode_invocation(
+        &self,
+        headless: &AgentInvocation,
+        tm_exe: &Path,
+    ) -> Option<AgentInvocation> {
+        Some(server::server_mode_invocation(headless, tm_exe))
+    }
+
     /// One `--format json` event as viewer lines (GitHub issue #184): a
     /// `text` event as its `part.text`, a `tool_use` event as `→ <tool>
     /// <summary>` from `part.state.input` (just `→ tool` when the event
