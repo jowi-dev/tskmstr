@@ -1,9 +1,9 @@
 //! Seeding a new worktree with copies of the main checkout's dependency
-//! directories (GitHub issue #255).
+//! and build directories (GitHub issues #255 and #259).
 //!
 //! Every worktree normally downloads and builds its own dependencies, even
 //! though most lane runs never change them. With `[work] copy_dirs`
-//! configured (e.g. `["deps"]`), provisioning a worktree copies each listed
+//! configured (e.g. `["deps", "_build"]`), provisioning a worktree copies each listed
 //! directory from the main checkout. On macOS the copy is an APFS
 //! copy-on-write clone (`/bin/cp -c`): the clone shares the original's disk
 //! blocks and uses new space only for files later rewritten, so an
@@ -14,7 +14,8 @@
 //! install in the worktree changes only its copy, never the main
 //! checkout's. That holds whether or not the worktree's lock file matches,
 //! so no lock file check is needed; a mismatched copy is just a head start
-//! for the install.
+//! for the install. Build output (`_build`, `target`) is safe to copy for
+//! the same reason: the build tool rebuilds whatever is stale.
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
