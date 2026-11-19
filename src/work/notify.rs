@@ -153,7 +153,9 @@ fn applescript_string(text: &str) -> String {
 /// One notification a tick may send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
-    /// The ticket it is about, or `""` for a scope-wide one.
+    /// The ticket it is about, or `""` for a scope-wide one. A
+    /// [`BASE_RED`] notice holds its base branch here instead, so each base
+    /// gets its own dedup slot.
     pub ticket: String,
     /// [`AWAITING_REVIEW`], [`FIX_CAP`] or [`STALL`].
     pub reason: &'static str,
@@ -272,7 +274,9 @@ pub struct BaseWatch<'a> {
 }
 
 /// A [`BASE_RED`] notice for each of `watch.bases` whose head commit has a
-/// failed check. The key is `<base>@<sha>`, so each red commit notifies
+/// failed check. The notice's `ticket` is the base name, so each base has
+/// its own dedup slot in runs.db and two red bases don't overwrite each
+/// other's claim. The key is `<base>@<sha>`, so each red commit notifies
 /// once and a new red commit notifies again. Pending checks are not red,
 /// and a base whose checks can't be read is skipped: the next tick tries
 /// again.
@@ -293,7 +297,7 @@ pub fn base_red_notices(watch: &BaseWatch, scope: &str) -> Vec<Notice> {
             continue;
         }
         notices.push(Notice {
-            ticket: String::new(),
+            ticket: base.to_string(),
             reason: BASE_RED,
             key: format!("{base}@{}", checks.sha),
             title: format!("tm: {base} is red ({scope})"),
@@ -687,5 +691,27 @@ mod tests {
         };
 
         assert!(base_red_notices(&watch, SCOPE).is_empty());
+    }
+
+    #[test]
+    fn two_red_bases_each_notify_once_across_ticks() {
+        use crate::github::gh_cli::{ChecksState, FakeGhCli};
+        let gh = FakeGhCli::new()
+            .with_commit_checks("main", Ok(commit("a1", &[("t", ChecksState::Failing)])))
+            .with_commit_checks("staging", Ok(commit("b2", &[("t", ChecksState::Failing)])));
+        let bases = vec!["main".to_string(), "staging".to_string()];
+        let watch = BaseWatch {
+            gh: &gh,
+            repo_dir: Path::new("/repo"),
+            bases: &bases,
+        };
+        let (_dir, store) = open_store();
+        let notifier = Recorder::default();
+
+        let first = send(&store, &notifier, SCOPE, &base_red_notices(&watch, SCOPE)).unwrap();
+        let second = send(&store, &notifier, SCOPE, &base_red_notices(&watch, SCOPE)).unwrap();
+
+        assert_eq!(first.len(), 2, "{first:?}");
+        assert!(second.is_empty(), "{second:?}");
     }
 }
