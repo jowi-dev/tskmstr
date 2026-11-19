@@ -1271,11 +1271,15 @@ pub fn prepare_run_lane(
 
     if !wt_path.exists() {
         let base = resolve_base(deps.git)?;
-        let linked = deps
-            .git
-            .provision_worktree(&repo_root, &wt_path, &wt_name, Some(&base))?;
-        if linked {
-            writeln!(out, "Linked .env.local from main repo")?;
+        for message in crate::work::shared_deps::provision_worktree(
+            deps.git,
+            &repo_root,
+            &wt_path,
+            &wt_name,
+            Some(&base),
+            &config.shared_deps,
+        )? {
+            writeln!(out, "{message}")?;
         }
     }
 
@@ -1317,6 +1321,25 @@ pub fn prepare_run_lane(
         )
     })?;
     deps.git.switch_new_branch(&wt_path, &branch, &base)?;
+
+    // Step 6b: a worktree whose lock file no longer matches the main
+    // checkout's must not keep writing through a shared dependency link
+    // (GitHub issue #255), so replace those links with private copies
+    // before the agent can run a dependency command. A failure here is
+    // fatal: continuing would let the run rewrite the main checkout's copy.
+    let unshared = crate::work::shared_deps::unshare(
+        &repo_root,
+        &wt_path,
+        &config.shared_deps,
+        crate::work::shared_deps::UnshareMode::WhenLockDiffers,
+    )?;
+    if !unshared.is_empty() {
+        writeln!(
+            out,
+            "Unshared deps (lock file differs from main repo): {}",
+            unshared.join(", ")
+        )?;
+    }
 
     writeln!(out, "worktree: {}  branch: {}", wt_path.display(), branch)?;
 
@@ -4148,6 +4171,81 @@ mod tests {
         .unwrap();
 
         assert_eq!(git.fetch_origin_calls(), vec![wt_path]);
+    }
+
+    #[test]
+    fn run_lane_fg_unshares_linked_deps_when_the_worktree_lock_file_differs() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let mut config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+        config.shared_deps = vec![crate::config::SharedDep {
+            path: "deps".to_string(),
+            lock_file: "mix.lock".to_string(),
+        }];
+        std::fs::create_dir_all(repo_root.join("deps/pkg")).unwrap();
+        std::fs::write(repo_root.join("deps/pkg/lib.ex"), "main").unwrap();
+        std::fs::write(repo_root.join("mix.lock"), "lock-v1").unwrap();
+        let wt_path = worktree_root
+            .join(repo_root.file_name().unwrap())
+            .join("mylane");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        std::fs::write(wt_path.join("mix.lock"), "lock-v2").unwrap();
+        std::os::unix::fs::symlink(repo_root.join("deps"), wt_path.join("deps")).unwrap();
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+
+            status_on_run_start: None,
+            status_on_pr: None,
+            ticket_provider_error: None,
+            fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        run_lane_fg(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            &mut out,
+        )
+        .unwrap();
+
+        let deps_meta = wt_path.join("deps").symlink_metadata().unwrap();
+        assert!(!deps_meta.file_type().is_symlink());
+        assert!(wt_path.join("deps/pkg/lib.ex").is_file());
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            printed.contains("Unshared deps (lock file differs from main repo): deps"),
+            "{printed}"
+        );
     }
 
     #[test]

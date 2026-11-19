@@ -1178,11 +1178,15 @@ pub fn new(
             "Creating worktree: {} (branch: {branch_name})",
             wt_path.display()
         )?;
-        let linked = ctx
-            .git
-            .provision_worktree(&repo_root, &wt_path, branch_name, from_base)?;
-        if linked {
-            writeln!(out, "Linked .env.local from main repo")?;
+        for message in crate::work::shared_deps::provision_worktree(
+            ctx.git,
+            &repo_root,
+            &wt_path,
+            branch_name,
+            from_base,
+            &ctx.config.shared_deps,
+        )? {
+            writeln!(out, "{message}")?;
         }
     }
 

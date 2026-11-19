@@ -26,6 +26,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use crate::config::SharedDep;
+use crate::work::git::{GitError, GitOps};
 
 /// Which linked paths [`unshare`] replaces with a private copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,35 @@ pub fn is_contained_relative_path(path: &str) -> bool {
         && p.components()
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
         && p.components().any(|c| matches!(c, Component::Normal(_)))
+}
+
+/// Provision a worktree with [`GitOps::provision_worktree`], then link the
+/// configured shared dependency paths into it. Returns the lines to print:
+/// "Linked .env.local from main repo" when that link was made, the linked
+/// shared paths, or a warning when linking failed. A failed link is not an
+/// error: the worktree just builds its own dependencies, as it would with
+/// no `shared_deps` configured.
+pub fn provision_worktree(
+    git: &dyn GitOps,
+    repo_dir: &Path,
+    wt_path: &Path,
+    branch: &str,
+    from_base: Option<&str>,
+    shared: &[SharedDep],
+) -> Result<Vec<String>, GitError> {
+    let mut messages = Vec::new();
+    if git.provision_worktree(repo_dir, wt_path, branch, from_base)? {
+        messages.push("Linked .env.local from main repo".to_string());
+    }
+    match link_shared_deps(repo_dir, wt_path, shared) {
+        Ok(linked) if linked.is_empty() => {}
+        Ok(linked) => messages.push(format!(
+            "Linked shared deps from main repo: {}",
+            linked.join(", ")
+        )),
+        Err(err) => messages.push(format!("warning: could not link shared deps: {err}")),
+    }
+    Ok(messages)
 }
 
 /// Symlink each configured path in `wt_path` to the same path in
@@ -457,6 +487,49 @@ mod tests {
             fs::read_to_string(repo.join("deps/pkg/lib.ex")).unwrap(),
             "main"
         );
+    }
+
+    #[test]
+    fn provision_links_shared_deps_and_reports_it() {
+        use crate::work::git::ShellGitOps;
+        let root = tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        fs::write(repo.join(".gitignore"), "/deps/\n").unwrap();
+        fs::write(repo.join("mix.lock"), "lock-v1").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        fs::create_dir_all(repo.join("deps/pkg")).unwrap();
+        let wt = root.path().join("wt");
+
+        let messages =
+            provision_worktree(&ShellGitOps::new(), &repo, &wt, "lane", None, &mix_deps()).unwrap();
+
+        assert!(is_symlink(&wt.join("deps")));
+        assert_eq!(
+            messages,
+            vec!["Linked shared deps from main repo: deps".to_string()]
+        );
+    }
+
+    #[test]
+    fn provision_without_shared_deps_only_provisions() {
+        use crate::work::git::FakeGitOps;
+        let fake = FakeGitOps::new();
+
+        let messages = provision_worktree(
+            &fake,
+            Path::new("/repo"),
+            Path::new("/wt"),
+            "lane",
+            Some("main"),
+            &[],
+        )
+        .unwrap();
+
+        assert!(messages.is_empty());
+        assert_eq!(fake.provision_worktree_calls().len(), 1);
     }
 
     #[test]
