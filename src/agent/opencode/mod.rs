@@ -75,6 +75,8 @@
 //! | glm-5-3 + glm-5-3-flash | $0.50/$2.00 | $0.05/$0.20 | **24x cheaper** |
 //! | deepseek-v4-pro + v4-flash | $1.65/$4.95 | $0.138/$0.275 | **7x cheaper** |
 
+pub mod server;
+
 use std::path::{Path, PathBuf};
 
 use crate::agent::{
@@ -497,6 +499,15 @@ impl AgentRunner for OpencodeRunner {
             // opencode reports no usage windows.
             usage: None,
         })
+    }
+
+    /// See [`server::server_mode_invocation`].
+    fn server_mode_invocation(
+        &self,
+        headless: &AgentInvocation,
+        tm_exe: &Path,
+    ) -> Option<AgentInvocation> {
+        Some(server::server_mode_invocation(headless, tm_exe))
     }
 
     /// One `--format json` event as viewer lines (GitHub issue #184): a

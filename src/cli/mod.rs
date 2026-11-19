@@ -661,6 +661,20 @@ pub enum WorkCmd {
         #[arg(long = "state-file")]
         state_file: String,
     },
+    /// Hidden: a runner's server-mode lane driver (GitHub issue #194). Not a
+    /// user-facing command: with `[agent.<runner>] mode = "server"`, a
+    /// headless lane run spawns this in place of the agent CLI, with the
+    /// argv the agent CLI would have received. It drives one session on the
+    /// runner's shared server and writes the agent CLI's own output format
+    /// to stdout (see `docs/plans/gh-194-opencode-server-mode.md`).
+    #[command(name = "__agent-driver", hide = true)]
+    AgentDriver {
+        /// The runner whose driver to run.
+        runner: String,
+        /// The runner's own headless argv, passed through verbatim.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Install/maintain tm's hook scripts outside a lane worktree (see
     /// `tskmstr::agent::claude::hooks_install`).
     Hooks {
@@ -3819,6 +3833,45 @@ mod tests {
             }
             other => panic!("expected Work Run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_the_server_mode_driver_invocation_verbatim() {
+        // The exact argv `server_mode_invocation` builds, including the
+        // runner's own flags and a prompt that starts with a dash.
+        let invocation = crate::agent::opencode::server::server_mode_invocation(
+            &crate::agent::AgentInvocation {
+                program: "opencode".to_string(),
+                args: ["run", "--format", "json", "--auto", "--", "-x do it"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                env_set: Vec::new(),
+                env_remove: Vec::new(),
+            },
+            std::path::Path::new("/bin/tm"),
+        );
+        let argv = std::iter::once("tm".to_string()).chain(invocation.args.clone());
+
+        let cli = Cli::try_parse_from(argv).expect("should parse");
+
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::AgentDriver { runner, args },
+            }) => {
+                assert_eq!(runner, "opencode");
+                assert_eq!(args, invocation.args[3..].to_vec());
+            }
+            other => panic!("expected Work AgentDriver, got {other:?}"),
+        }
+        let mut cmd = Cli::command();
+        let work_cmd = cmd.find_subcommand_mut("work").unwrap();
+        assert!(
+            work_cmd
+                .find_subcommand("__agent-driver")
+                .expect("registered")
+                .is_hide_set()
+        );
     }
 
     #[test]

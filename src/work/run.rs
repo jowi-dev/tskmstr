@@ -1605,6 +1605,32 @@ pub fn prepare_run_lane(
         });
     }
 
+    // GitHub issue #194: a headless attempt on a runner configured with
+    // `[agent.<runner>] mode = "server"` spawns tm's server-mode driver in
+    // place of the agent CLI. Same argv and environment, so everything below
+    // and the supervisor treat it as the agent process.
+    if request.mode == crate::agent::RunMode::Headless
+        && let Ok(tm_exe) = std::env::current_exe()
+    {
+        let driven = |runner: &dyn AgentRunner, invocation: &AgentInvocation| {
+            let kind = crate::config::AgentKind::parse(runner.name())?;
+            if deps.models.for_kind(kind).mode != crate::config::RunnerMode::Server {
+                return None;
+            }
+            runner.server_mode_invocation(invocation, &tm_exe)
+        };
+        if let Some(server) = driven(primary_runner, &invocation) {
+            invocation = server;
+        }
+        for fallback in &mut fallbacks {
+            let runner = crate::config::AgentKind::parse(&fallback.agent)
+                .map(crate::agent::routing::runner_for);
+            if let Some(server) = runner.and_then(|runner| driven(runner, &fallback.invocation)) {
+                fallback.invocation = server;
+            }
+        }
+    }
+
     // GitHub issue #144: name the lane's delegation subagent to the guard
     // hook, which tells the main loop to delegate edits to it instead of
     // naming a model. Every attempt runs the same lane, so fallbacks get it
@@ -6789,6 +6815,7 @@ mod tests {
             opencode: crate::config::RunnerModels {
                 default_model: Some("venice/glm-fallback".to_string()),
                 usage_probe_model: None,
+                ..Default::default()
             },
             ..crate::config::ModelsConfig::default()
         };
@@ -6801,6 +6828,47 @@ mod tests {
             model_arg(&prepared.fallbacks[0].invocation),
             "venice/glm-fallback"
         );
+    }
+
+    /// GitHub issue #194: a headless attempt on a runner configured with
+    /// `mode = "server"` spawns tm's server-mode driver with the runner's
+    /// own argv; attempts on other runners are untouched.
+    #[test]
+    fn a_server_mode_runner_attempt_spawns_the_driver() {
+        let models = crate::config::ModelsConfig {
+            opencode: crate::config::RunnerModels {
+                mode: crate::config::RunnerMode::Server,
+                ..Default::default()
+            },
+            ..crate::config::ModelsConfig::default()
+        };
+
+        let prepared = prepare_with_opencode_fallback("fable", &models);
+
+        assert_eq!(prepared.invocation.args[0], "-p", "claude stays a process");
+        let fallback = &prepared.fallbacks[0].invocation;
+        let tm_exe = std::env::current_exe().unwrap();
+        assert_eq!(fallback.program, tm_exe.to_string_lossy());
+        assert_eq!(
+            &fallback.args[..4],
+            ["work", "__agent-driver", "opencode", "run"]
+        );
+        assert!(
+            fallback
+                .env_set
+                .iter()
+                .any(|(key, _)| key == crate::agent::TSKMSTR_RUN_ID),
+            "the run id still reaches the driver: {:?}",
+            fallback.env_set
+        );
+    }
+
+    #[test]
+    fn a_process_mode_runner_attempt_spawns_the_agent_cli() {
+        let prepared =
+            prepare_with_opencode_fallback("fable", &crate::config::ModelsConfig::default());
+
+        assert_eq!(prepared.fallbacks[0].invocation.program, "opencode");
     }
 
     /// GitHub issue #143: a lane model is kept on whichever attempt's runner

@@ -32,6 +32,17 @@ pub fn runner_for(kind: AgentKind) -> &'static dyn AgentRunner {
     }
 }
 
+/// Runs the server-mode lane driver for the runner named `runner` (`tm work
+/// __agent-driver`, GitHub issue #194) with that runner's own headless
+/// argv, returning the process exit code. `Err` for a runner with no server
+/// mode.
+pub fn run_server_driver(runner: &str, args: &[String]) -> Result<i32, String> {
+    match AgentKind::parse(runner) {
+        Some(AgentKind::Opencode) => Ok(crate::agent::opencode::server::run_from_cli(args)),
+        _ => Err(format!("runner `{runner}` has no server mode")),
+    }
+}
+
 /// How long to hold an agent's usage-limit window closed when the
 /// rate-limit outcome that triggered it carried no reset timestamp.
 ///
@@ -135,6 +146,13 @@ mod tests {
     #[test]
     fn runner_for_claude_returns_the_claude_runner() {
         assert_eq!(runner_for(AgentKind::Claude).name(), "claude");
+    }
+
+    #[test]
+    fn run_server_driver_refuses_a_runner_without_a_server_mode() {
+        let err = run_server_driver("claude", &[]).unwrap_err();
+        assert!(err.contains("claude"), "{err}");
+        assert!(run_server_driver("nope", &[]).is_err());
     }
 
     #[test]
