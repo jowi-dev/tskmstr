@@ -1536,6 +1536,22 @@ mod tests {
         }
     }
 
+    /// Ends every run in `store` as done, so `tm work clean`'s live-run
+    /// guard doesn't hold the ticket session open.
+    fn finish_done(store: &RunStore) {
+        for run in store.all_runs().unwrap() {
+            store
+                .finish_run(
+                    run.id,
+                    &crate::runs::FinishRun {
+                        status: crate::runs::RunStatus::Done,
+                        ..crate::runs::FinishRun::default()
+                    },
+                )
+                .unwrap();
+        }
+    }
+
     fn compatible_test_identity() -> &'static BackendIdentity {
         static IDENTITY: OnceLock<BackendIdentity> = OnceLock::new();
         // `session_slug()` is `proj`, so ticket sessions in these tests are
@@ -2375,7 +2391,7 @@ mod tests {
         let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         let run_id = store
             .start_run(&crate::runs::StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: "/wt/proj-1".to_string(),
@@ -2450,7 +2466,7 @@ mod tests {
         let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         let run_id = store
             .start_run(&crate::runs::StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: "/wt/proj-1".to_string(),
@@ -2510,7 +2526,7 @@ mod tests {
         let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         let run_id = store
             .start_run(&crate::runs::StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: "/wt/proj-1".to_string(),
@@ -2594,7 +2610,7 @@ mod tests {
         let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         store
             .start_run(&crate::runs::StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: "/wt/proj-1".to_string(),
@@ -2705,7 +2721,7 @@ mod tests {
         let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         store
             .start_run(&crate::runs::StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: worktree.to_string_lossy().into_owned(),
@@ -2715,6 +2731,7 @@ mod tests {
                 log_path: None,
             })
             .unwrap();
+        finish_done(&store);
         let mut out = Vec::new();
 
         clean(&ctx, &store, compatible_test_identity(), "proj-1", &mut out).unwrap();
@@ -2815,7 +2832,7 @@ mod tests {
         // An audit run, rooted in the real repo rather than a worktree.
         store
             .start_run(&crate::runs::StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: repo.to_string_lossy().into_owned(),
@@ -2825,6 +2842,7 @@ mod tests {
                 log_path: None,
             })
             .unwrap();
+        finish_done(&store);
         let mut out = Vec::new();
 
         clean(&ctx, &store, compatible_test_identity(), "PROJ-1", &mut out).unwrap();
@@ -2932,7 +2950,7 @@ mod tests {
         let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         store
             .start_run(&crate::runs::StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: worktree.to_string_lossy().into_owned(),

@@ -1367,7 +1367,7 @@ mod tests {
     fn seed_lane_run(run_store: &RunStore, worktree: &Path) {
         run_store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: worktree.to_string_lossy().into_owned(),
@@ -1441,7 +1441,7 @@ mod tests {
         let (tmp, run_store, worktree) = setup();
         run_store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: worktree.to_string_lossy().into_owned(),
@@ -2344,7 +2344,7 @@ mod tests {
     fn seed_auto_review_row(run_store: &RunStore, worktree: &Path, loop_pid: u32) -> i64 {
         let id = run_store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: worktree.to_string_lossy().into_owned(),
@@ -2441,7 +2441,7 @@ mod tests {
         seed_lane_run(&run_store, &worktree);
         run_store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: worktree.to_string_lossy().into_owned(),
@@ -3219,7 +3219,7 @@ mod tests {
         finish_lane_run(&run_store);
         run_store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: worktree.to_string_lossy().into_owned(),

@@ -4563,7 +4563,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
         store
-            .record_retro("", "PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
+            .record_retro(
+                crate::runs::TEST_SCOPE,
+                "PROJ-1",
+                crate::runs::RetroVerdict::Clean,
+                None,
+                None,
+            )
             .unwrap();
         let mut deps = net_deps(jira);
         deps.store = Ok(store);
@@ -5436,7 +5442,7 @@ mod tests {
 
     fn start_params(ticket: &str) -> crate::runs::StartRun {
         crate::runs::StartRun {
-            scope: String::new(),
+            scope: crate::runs::TEST_SCOPE.to_string(),
             ticket: ticket.to_string(),
             lane: "backend".to_string(),
             worktree: "/tmp/wt".to_string(),
@@ -7279,7 +7285,7 @@ mod tests {
         let worktree = tempfile::tempdir().unwrap();
         store
             .start_run(&crate::runs::StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: worktree.path().to_string_lossy().to_string(),
@@ -7300,7 +7306,7 @@ mod tests {
         let gone = dir.path().join("gone-worktree");
         store
             .start_run(&crate::runs::StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: gone.to_string_lossy().to_string(),
@@ -7327,7 +7333,7 @@ mod tests {
         let worktree = tempfile::tempdir().unwrap();
         store
             .start_run(&crate::runs::StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: worktree.path().to_string_lossy().to_string(),

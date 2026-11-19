@@ -363,6 +363,12 @@ const MIGRATIONS: &[&str] = &[
 /// rather than shared by every repo that reuses the ticket key.
 pub const LEGACY_UNSCOPED: &str = "legacy:unscoped";
 
+/// The scope test fixtures record under: the
+/// [`crate::config::BackendIdentity::scope`] of the `PROJ` Jira identity
+/// most tests build their deps from.
+#[cfg(test)]
+pub(crate) const TEST_SCOPE: &str = "jira:https://x.atlassian.net:PROJ";
+
 /// How many recent finished lane runs [`RunStore::lane_peak_estimate`] looks
 /// back over. Small enough that the estimate follows a repo whose builds got
 /// heavier, large enough that one unusually light run doesn't hide the
@@ -2516,13 +2522,11 @@ impl RunStore {
     }
 
     /// The tickets of `scope`'s `running` lane-kind runs, oldest first: what
-    /// `[dispatch] max_lanes` caps (GitHub issue #170, ADR-0011). Legacy
-    /// unscoped runs (`scope = ''`) count for every scope, as they do
-    /// elsewhere.
+    /// `[dispatch] max_lanes` caps (GitHub issue #170, ADR-0011).
     pub fn running_lane_tickets(&self, scope: &str) -> Result<Vec<String>, RunStoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT ticket FROM runs
-              WHERE status = 'running' AND kind = 'lane' AND (scope = ?1 OR scope = '')
+              WHERE status = 'running' AND kind = 'lane' AND scope = ?1
               ORDER BY started_at ASC, id ASC",
         )?;
         let rows = stmt.query_map(params![scope], |row| row.get(0))?;
@@ -2575,9 +2579,8 @@ impl RunStore {
 
     /// Like [`RunStore::list_runs`], restricted to runs whose `kind` column
     /// equals `kind` when `Some` (`None` lists every kind) and to the
-    /// caller's ticket namespace when `scope` is `Some` (matching that scope
-    /// plus legacy-unscoped rows, like [`RunStore::latest_run_for_ticket`];
-    /// `None` doesn't filter — a bare `tm runs` is the machine-wide
+    /// caller's ticket namespace when `scope` is `Some` (like
+    /// [`RunStore::latest_run_for_ticket`]; `None` doesn't filter — a bare `tm runs` is the machine-wide
     /// dashboard, while the board passes its own scope so another repo's
     /// same-numbered tickets never light up its badges).
     pub fn list_runs_filtered(
@@ -2603,7 +2606,7 @@ impl RunStore {
                 r.mem_peak_bytes
              FROM runs r
              WHERE (?1 IS NULL OR r.kind = ?1)
-                AND (?2 IS NULL OR r.scope = ?2 OR r.scope = '')
+                AND (?2 IS NULL OR r.scope = ?2)
              ORDER BY
                 CASE r.status WHEN 'done' THEN 1 WHEN 'failed' THEN 1 WHEN 'interrupted' THEN 1 ELSE 0 END ASC,
                 r.started_at DESC";
@@ -2666,12 +2669,12 @@ impl RunStore {
                     ORDER BY e.at DESC, e.id DESC LIMIT 1) AS loop_pid
              FROM runs r
              WHERE r.kind = ?1
-                AND (?2 IS NULL OR r.scope = ?2 OR r.scope = '')
+                AND (?2 IS NULL OR r.scope = ?2)
                 AND NOT EXISTS (
                     SELECT 1 FROM runs n
                     WHERE n.ticket = r.ticket
                         AND n.kind = ?1
-                        AND (?2 IS NULL OR n.scope = ?2 OR n.scope = '')
+                        AND (?2 IS NULL OR n.scope = ?2)
                         AND (n.started_at > r.started_at
                             OR (n.started_at = r.started_at AND n.id > r.id))
                 )
@@ -2976,10 +2979,9 @@ impl RunStore {
     /// by `id`, both descending), or `None` if it has no runs.
     ///
     /// `scope` restricts the lookup to the caller's own ticket namespace
-    /// (see [`StartRun::scope`]): `Some` matches rows recorded under that
-    /// scope plus legacy-unscoped (`''`) rows, `None` doesn't filter at all
-    /// — the stance of config-less callers like a bare `tm runs`, and the
-    /// pre-issue-#10 behavior.
+    /// (see [`StartRun::scope`]): `Some` matches only rows recorded under
+    /// that scope, `None` doesn't filter at all — the stance of config-less
+    /// callers like a bare `tm runs`.
     ///
     /// Delegates to [`RunStore::latest_run_for_ticket_kind`] with
     /// `kind: None`.
@@ -3011,7 +3013,7 @@ impl RunStore {
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
                 mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
-             WHERE ticket = ?1 AND (?2 IS NULL OR scope = ?2 OR scope = '')
+             WHERE ticket = ?1 AND (?2 IS NULL OR scope = ?2)
              ORDER BY started_at ASC, id ASC";
 
         let mut stmt = self.conn.prepare(sql)?;
@@ -3063,7 +3065,7 @@ impl RunStore {
                 mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
              WHERE ticket = ?1 AND (?2 IS NULL OR kind = ?2)
-                AND (?3 IS NULL OR scope = ?3 OR scope = '')
+                AND (?3 IS NULL OR scope = ?3)
              ORDER BY started_at DESC, id DESC
              LIMIT 1";
 
@@ -3097,7 +3099,7 @@ impl RunStore {
                 mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
              WHERE ticket = ?1 AND kind = ?2 AND status NOT IN ('running', 'queued')
-                AND (?3 IS NULL OR scope = ?3 OR scope = '')
+                AND (?3 IS NULL OR scope = ?3)
              ORDER BY started_at DESC, id DESC
              LIMIT 1";
 
@@ -3139,20 +3141,20 @@ impl RunStore {
     /// 3): a repo the operator stopped working in drops out on its own.
     /// The tickets are the keys whose tracker status the poller fetches;
     /// the worktrees let it resolve the repo root while `runs.repo_root`
-    /// is not yet recorded. Legacy unscoped (`""`) rows are skipped, since
-    /// they can't name a repo.
+    /// is not yet recorded. [`LEGACY_UNSCOPED`] rows are skipped, since they
+    /// can't name a repo.
     pub fn recent_scope_activity(
         &self,
         within_days: u32,
     ) -> Result<Vec<ScopeActivity>, RunStoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT scope, ticket, worktree FROM runs
-             WHERE scope != ''
+             WHERE scope NOT IN ('', ?2)
                AND (ended_at IS NULL OR julianday('now') - julianday(ended_at) <= ?1)
              ORDER BY started_at DESC, id DESC",
         )?;
         let rows = stmt
-            .query_map(params![within_days], |row| {
+            .query_map(params![within_days, LEGACY_UNSCOPED], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -3377,7 +3379,7 @@ impl RunStore {
             .query_row(
                 "SELECT ticket_key, verdict, notes, audited_at
                  FROM ticket_audits
-                 WHERE ticket_key = ?1 AND (?2 IS NULL OR scope = ?2 OR scope = '')
+                 WHERE ticket_key = ?1 AND (?2 IS NULL OR scope = ?2)
                  ORDER BY audited_at DESC, id DESC
                  LIMIT 1",
                 params![ticket_key, scope],
@@ -3419,7 +3421,7 @@ impl RunStore {
 
     /// Every archived window recorded for `ticket`, oldest first. `scope`
     /// filters like [`RunStore::latest_run_for_ticket`]: `None` sees every
-    /// scope, `Some` sees that scope plus unscoped (`''`) rows.
+    /// scope, `Some` sees only that scope.
     pub fn session_archives_for_ticket(
         &self,
         scope: Option<&str>,
@@ -3428,7 +3430,7 @@ impl RunStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, scope, ticket, session, window, path, captured_at
              FROM session_archives
-             WHERE ticket = ?1 AND (?2 IS NULL OR scope = ?2 OR scope = '')
+             WHERE ticket = ?1 AND (?2 IS NULL OR scope = ?2)
              ORDER BY captured_at ASC, id ASC",
         )?;
         let rows = stmt.query_map(params![ticket, scope], |row| {
@@ -3512,7 +3514,7 @@ impl RunStore {
         let mut stmt = self.conn.prepare(
             "SELECT ticket_key, verdict, severity, notes, recorded_at
              FROM ticket_retros
-             WHERE ticket_key = ?1 AND (?2 IS NULL OR scope = ?2 OR scope = '')
+             WHERE ticket_key = ?1 AND (?2 IS NULL OR scope = ?2)
              ORDER BY recorded_at DESC, id DESC",
         )?;
         let mut rows = stmt.query(params![ticket_key, scope])?;
@@ -3551,7 +3553,7 @@ impl RunStore {
             "SELECT ticket_key, verdict, severity, notes, recorded_at
              FROM ticket_retros
              WHERE ticket_key IN ({placeholders})
-                AND (?{scope_param} IS NULL OR scope = ?{scope_param} OR scope = '')
+                AND (?{scope_param} IS NULL OR scope = ?{scope_param})
              ORDER BY ticket_key, recorded_at DESC, id DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -3582,11 +3584,7 @@ impl RunStore {
     ///
     /// The primary key is `(scope, ticket_key)`, so ranking `GH-3` in one
     /// repo can never overwrite another repo's rank for *its* `GH-3` — the
-    /// data-corrupting case of GitHub issue #10. A legacy-unscoped (`''`)
-    /// row for the same key is left in place, not adopted: it may belong to
-    /// a different repo than the one writing now, and deleting it would be
-    /// exactly the cross-repo clobber this key exists to prevent. It merely
-    /// becomes shadowed for this scope (see [`RunStore::ticket_rank`]).
+    /// data-corrupting case of GitHub issue #10.
     ///
     /// See the module doc comment for why this table exists and is
     /// authoritative rather than a mirror.
@@ -3605,18 +3603,11 @@ impl RunStore {
     }
 
     /// Returns `ticket_key`'s current rank within `scope`, or `None` if it
-    /// has never been ranked. A row recorded under `scope` itself wins;
-    /// failing that, a legacy-unscoped (`''`) row from before scoping
-    /// existed still counts — pre-#10 ranks all belong to the single repo
-    /// that existed then, so they stay readable rather than silently
-    /// resetting every rank on upgrade.
+    /// has never been ranked there.
     pub fn ticket_rank(&self, scope: &str, ticket_key: &str) -> Result<Option<f64>, RunStoreError> {
         self.conn
             .query_row(
-                "SELECT rank FROM ticket_rank
-                 WHERE ticket_key = ?1 AND scope IN (?2, '')
-                 ORDER BY scope = '' ASC
-                 LIMIT 1",
+                "SELECT rank FROM ticket_rank WHERE ticket_key = ?1 AND scope = ?2",
                 params![ticket_key, scope],
                 |row| row.get(0),
             )
@@ -3625,20 +3616,13 @@ impl RunStore {
     }
 
     /// Returns every ranked ticket's `(ticket_key, rank)` pair within
-    /// `scope`, ordered ascending by rank. Legacy-unscoped (`''`) rows are
-    /// included unless shadowed by a scoped row for the same key, matching
-    /// [`RunStore::ticket_rank`]'s preference. Tickets with no recorded
+    /// `scope`, ordered ascending by rank. Tickets with no recorded
     /// rank are simply absent — callers (`GithubProvider::search`'s
     /// `Ranked`/`ReadyCandidates` handling) sort those to the end by issue
     /// number themselves, per the design doc.
     pub fn all_ticket_ranks(&self, scope: &str) -> Result<Vec<(String, f64)>, RunStoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT ticket_key, rank FROM ticket_rank WHERE scope = ?1
-             UNION ALL
-             SELECT ticket_key, rank FROM ticket_rank
-             WHERE scope = '' AND ?1 != '' AND ticket_key NOT IN
-                (SELECT ticket_key FROM ticket_rank WHERE scope = ?1)
-             ORDER BY rank ASC",
+            "SELECT ticket_key, rank FROM ticket_rank WHERE scope = ?1 ORDER BY rank ASC",
         )?;
         let rows = stmt.query_map(params![scope], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<rusqlite::Result<Vec<(String, f64)>>>()
@@ -4051,11 +4035,7 @@ impl RunStore {
     ) -> Result<Vec<RetroCostSummary>, RunStoreError> {
         // The latest-verdict subquery and the run join are both keyed per
         // (scope, ticket_key): two repos' same-numbered tickets are distinct
-        // tickets, so one's verdict must not bucket the other's runs. A
-        // legacy-unscoped ('') retro or run joins across the scope boundary
-        // — pre-#10 rows can't actually be ambiguous (see the version-9
-        // migration comment), and dropping them from the aggregates would
-        // misread as "those runs never happened".
+        // tickets, so one's verdict must not bucket the other's runs.
         let sql = "WITH latest_retro AS (
                 SELECT t1.ticket_key AS ticket_key, t1.scope AS scope, t1.verdict AS verdict
                 FROM ticket_retros t1
@@ -4079,7 +4059,7 @@ impl RunStore {
              FROM latest_retro
              LEFT JOIN runs r
                 ON r.ticket = latest_retro.ticket_key
-                AND (r.scope = latest_retro.scope OR r.scope = '' OR latest_retro.scope = '')
+                AND r.scope = latest_retro.scope
                 AND (?1 IS NULL OR r.kind = ?1)
              GROUP BY latest_retro.verdict";
 
@@ -4560,13 +4540,13 @@ mod tests {
     }
 
     #[test]
-    fn runs_for_ticket_scoped_keeps_matching_and_legacy_rows_only() {
+    fn runs_for_ticket_scoped_keeps_matching_rows_only() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
         store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ..start_params("GH-3")
             })
             .unwrap();
@@ -4586,7 +4566,7 @@ mod tests {
         let runs = store
             .runs_for_ticket(Some("github:jowi-dev/tskmstr"), "GH-3")
             .unwrap();
-        assert_eq!(runs.len(), 2, "own scope + legacy, never the other repo");
+        assert_eq!(runs.len(), 1, "own scope only, never another scope");
     }
 
     #[test]
@@ -4747,7 +4727,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "review-watch".to_string(),
                 worktree: "/irrelevant".to_string(),
@@ -4769,7 +4749,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "review-watch".to_string(),
                 worktree: "/irrelevant".to_string(),
@@ -4796,7 +4776,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -4874,7 +4854,7 @@ mod tests {
 
         let id1 = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -4886,7 +4866,7 @@ mod tests {
             .unwrap();
         let id2 = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-2".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt2".to_string(),
@@ -4925,7 +4905,7 @@ mod tests {
 
         let lane_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -4937,7 +4917,7 @@ mod tests {
             .unwrap();
         let audit_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-2".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt2".to_string(),
@@ -4961,7 +4941,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -5045,7 +5025,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -5091,7 +5071,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "review-watch".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -5128,7 +5108,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "review-watch".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -5174,7 +5154,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "review-watch".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -5207,7 +5187,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -5260,7 +5240,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -5305,7 +5285,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -5408,7 +5388,7 @@ mod tests {
     fn finished_run(store: &RunStore, status: RunStatus) -> i64 {
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -5524,7 +5504,7 @@ mod tests {
             let store = open_store(dir.path());
             let id = store
                 .start_run(&StartRun {
-                    scope: String::new(),
+                    scope: crate::runs::TEST_SCOPE.to_string(),
                     ticket: "PROJ-1".to_string(),
                     lane: "backend".to_string(),
                     worktree: "/tmp/wt1".to_string(),
@@ -5589,7 +5569,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -5628,7 +5608,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -5765,7 +5745,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -5810,7 +5790,7 @@ mod tests {
 
         let done_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-DONE".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-done".to_string(),
@@ -5841,7 +5821,7 @@ mod tests {
 
         let running_older_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-OLDER".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-older".to_string(),
@@ -5861,7 +5841,7 @@ mod tests {
 
         let running_newer_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-NEWER".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-newer".to_string(),
@@ -5903,7 +5883,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-EVT".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-evt".to_string(),
@@ -5938,7 +5918,7 @@ mod tests {
 
         let lane_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-LANE".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-lane".to_string(),
@@ -5950,7 +5930,7 @@ mod tests {
             .unwrap();
         let audit_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-AUDIT".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt-audit".to_string(),
@@ -5987,7 +5967,7 @@ mod tests {
             .unwrap();
         let legacy_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-legacy".to_string(),
@@ -6002,7 +5982,7 @@ mod tests {
         let scoped = runs.iter().find(|r| r.id == scoped_id).unwrap();
         let legacy = runs.iter().find(|r| r.id == legacy_id).unwrap();
         assert_eq!(scoped.scope, "github:jowi-dev/tskmstr");
-        assert_eq!(legacy.scope, "");
+        assert_eq!(legacy.scope, crate::runs::TEST_SCOPE);
     }
 
     #[test]
@@ -6012,7 +5992,7 @@ mod tests {
 
         let lane_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-LANE".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-lane".to_string(),
@@ -6024,7 +6004,7 @@ mod tests {
             .unwrap();
         let audit_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-AUDIT".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt-audit".to_string(),
@@ -6047,7 +6027,7 @@ mod tests {
 
     fn start_params(ticket: &str) -> StartRun {
         StartRun {
-            scope: String::new(),
+            scope: crate::runs::TEST_SCOPE.to_string(),
             ticket: ticket.to_string(),
             lane: "backend".to_string(),
             worktree: "/tmp/wt".to_string(),
@@ -6144,7 +6124,7 @@ mod tests {
 
         let lane_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt".to_string(),
@@ -6158,7 +6138,7 @@ mod tests {
 
         let audit_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-2".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt2".to_string(),
@@ -6203,7 +6183,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-AWAIT".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt-await".to_string(),
@@ -6232,7 +6212,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-RESUME".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt-resume".to_string(),
@@ -6262,7 +6242,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-TOOL".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt-tool".to_string(),
@@ -6295,7 +6275,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-DONE".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt-done".to_string(),
@@ -6344,7 +6324,7 @@ mod tests {
 
         let run_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -6392,7 +6372,7 @@ mod tests {
 
         let run_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -6456,7 +6436,7 @@ mod tests {
             let store = RunStore::open(&db_path).unwrap();
             store
                 .start_run(&StartRun {
-                    scope: String::new(),
+                    scope: crate::runs::TEST_SCOPE.to_string(),
                     ticket: "PROJ-1".to_string(),
                     lane: "backend".to_string(),
                     worktree: "/tmp/wt1".to_string(),
@@ -6555,7 +6535,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -6607,7 +6587,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -6656,7 +6636,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -6683,7 +6663,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -6721,7 +6701,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -6755,7 +6735,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -6918,7 +6898,7 @@ mod tests {
 
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -6943,7 +6923,7 @@ mod tests {
 
         let blocked_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-BLOCKED".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -6975,7 +6955,7 @@ mod tests {
 
         let done_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-DONE".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt2".to_string(),
@@ -7021,7 +7001,7 @@ mod tests {
 
         let older_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-older".to_string(),
@@ -7041,7 +7021,7 @@ mod tests {
 
         let newer_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-newer".to_string(),
@@ -7076,7 +7056,7 @@ mod tests {
 
         let first_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-first".to_string(),
@@ -7088,7 +7068,7 @@ mod tests {
             .unwrap();
         let second_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-second".to_string(),
@@ -7122,7 +7102,7 @@ mod tests {
 
         let audit_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt-audit".to_string(),
@@ -7134,7 +7114,7 @@ mod tests {
             .unwrap();
         let lane_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-lane".to_string(),
@@ -7146,7 +7126,7 @@ mod tests {
             .unwrap();
         store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-2".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-other".to_string(),
@@ -7183,7 +7163,7 @@ mod tests {
         let start = |ticket: &str, kind: &str, session: &str| {
             let id = store
                 .start_run(&StartRun {
-                    scope: String::new(),
+                    scope: crate::runs::TEST_SCOPE.to_string(),
                     ticket: ticket.to_string(),
                     lane: kind.to_string(),
                     worktree: "/tmp/wt".to_string(),
@@ -7216,7 +7196,7 @@ mod tests {
 
         store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-lane".to_string(),
@@ -7228,7 +7208,7 @@ mod tests {
             .unwrap();
         let audit_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt-audit".to_string(),
@@ -7258,7 +7238,7 @@ mod tests {
 
         let lane_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-lane".to_string(),
@@ -7272,7 +7252,7 @@ mod tests {
         // shadow the lane-kind lookup below.
         store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt-audit".to_string(),
@@ -7304,7 +7284,7 @@ mod tests {
 
         let watch_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "review-watch".to_string(),
                 worktree: "/tmp/wt-watch".to_string(),
@@ -7316,7 +7296,7 @@ mod tests {
             .unwrap();
         let cleanup_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "bugbot-cleanup".to_string(),
                 worktree: "/tmp/wt-cleanup".to_string(),
@@ -7367,7 +7347,7 @@ mod tests {
         // shadowing" ground truth in docs/plans/session-usage.md.
         store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt-running".to_string(),
@@ -7381,7 +7361,7 @@ mod tests {
         // A finished run of a different kind: must also be ignored.
         let create_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "create".to_string(),
                 worktree: "/tmp/wt-create".to_string(),
@@ -7404,7 +7384,7 @@ mod tests {
         // An older finished audit run.
         let older_audit_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt-older".to_string(),
@@ -7434,7 +7414,7 @@ mod tests {
         // The latest finished audit run.
         let newer_audit_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt-newer".to_string(),
@@ -7477,7 +7457,7 @@ mod tests {
 
         store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt-running".to_string(),
@@ -7511,7 +7491,7 @@ mod tests {
 
         let other_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-other".to_string(),
@@ -7523,7 +7503,7 @@ mod tests {
             .unwrap();
         let id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt-target".to_string(),
@@ -7549,7 +7529,7 @@ mod tests {
         let store = open_store(dir.path());
         let run_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -7570,7 +7550,7 @@ mod tests {
         let store = open_store(dir.path());
         let run_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt1".to_string(),
@@ -7694,7 +7674,12 @@ mod tests {
         let store = open_store(dir.path());
 
         store
-            .record_audit("", "PROJ-1", "ready", Some("looks good"))
+            .record_audit(
+                crate::runs::TEST_SCOPE,
+                "PROJ-1",
+                "ready",
+                Some("looks good"),
+            )
             .unwrap();
 
         let audit = store
@@ -7718,7 +7703,7 @@ mod tests {
         let store = open_store(dir.path());
 
         store
-            .record_audit("", "PROJ-1", "needs-work", None)
+            .record_audit(crate::runs::TEST_SCOPE, "PROJ-1", "needs-work", None)
             .unwrap();
 
         let audit = store
@@ -7734,7 +7719,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
-        assert!(store.ticket_rank("", "GH-1").unwrap().is_none());
+        assert!(
+            store
+                .ticket_rank(crate::runs::TEST_SCOPE, "GH-1")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -7742,9 +7732,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
-        store.set_ticket_rank("", "GH-1", 500.0).unwrap();
+        store
+            .set_ticket_rank(crate::runs::TEST_SCOPE, "GH-1", 500.0)
+            .unwrap();
 
-        assert_eq!(store.ticket_rank("", "GH-1").unwrap(), Some(500.0));
+        assert_eq!(
+            store.ticket_rank(crate::runs::TEST_SCOPE, "GH-1").unwrap(),
+            Some(500.0)
+        );
     }
 
     #[test]
@@ -7752,10 +7747,17 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
-        store.set_ticket_rank("", "GH-1", 500.0).unwrap();
-        store.set_ticket_rank("", "GH-1", 250.0).unwrap();
+        store
+            .set_ticket_rank(crate::runs::TEST_SCOPE, "GH-1", 500.0)
+            .unwrap();
+        store
+            .set_ticket_rank(crate::runs::TEST_SCOPE, "GH-1", 250.0)
+            .unwrap();
 
-        assert_eq!(store.ticket_rank("", "GH-1").unwrap(), Some(250.0));
+        assert_eq!(
+            store.ticket_rank(crate::runs::TEST_SCOPE, "GH-1").unwrap(),
+            Some(250.0)
+        );
     }
 
     #[test]
@@ -7763,12 +7765,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
-        store.set_ticket_rank("", "GH-3", 300.0).unwrap();
-        store.set_ticket_rank("", "GH-1", 100.0).unwrap();
-        store.set_ticket_rank("", "GH-2", 200.0).unwrap();
+        store
+            .set_ticket_rank(crate::runs::TEST_SCOPE, "GH-3", 300.0)
+            .unwrap();
+        store
+            .set_ticket_rank(crate::runs::TEST_SCOPE, "GH-1", 100.0)
+            .unwrap();
+        store
+            .set_ticket_rank(crate::runs::TEST_SCOPE, "GH-2", 200.0)
+            .unwrap();
 
         assert_eq!(
-            store.all_ticket_ranks("",).unwrap(),
+            store.all_ticket_ranks(crate::runs::TEST_SCOPE).unwrap(),
             vec![
                 ("GH-1".to_string(), 100.0),
                 ("GH-2".to_string(), 200.0),
@@ -7782,7 +7790,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
-        assert!(store.all_ticket_ranks("",).unwrap().is_empty());
+        assert!(
+            store
+                .all_ticket_ranks(crate::runs::TEST_SCOPE)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -8418,7 +8431,7 @@ mod tests {
         let store = open_store(dir.path());
 
         store
-            .record_audit("", "PROJ-1", "needs-work", None)
+            .record_audit(crate::runs::TEST_SCOPE, "PROJ-1", "needs-work", None)
             .unwrap();
         store
             .conn
@@ -8428,7 +8441,12 @@ mod tests {
             )
             .unwrap();
         store
-            .record_audit("", "PROJ-1", "ready", Some("second pass"))
+            .record_audit(
+                crate::runs::TEST_SCOPE,
+                "PROJ-1",
+                "ready",
+                Some("second pass"),
+            )
             .unwrap();
 
         let audit = store
@@ -9366,9 +9384,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
-        store.record_audit("", "PROJ-1", "ready", None).unwrap();
         store
-            .record_audit("", "PROJ-2", "needs-work", None)
+            .record_audit(crate::runs::TEST_SCOPE, "PROJ-1", "ready", None)
+            .unwrap();
+        store
+            .record_audit(crate::runs::TEST_SCOPE, "PROJ-2", "needs-work", None)
             .unwrap();
 
         let audit = store
@@ -9421,7 +9441,13 @@ mod tests {
         let store = open_store(dir.path());
 
         store
-            .record_retro("", "PROJ-1", RetroVerdict::Clean, None, None)
+            .record_retro(
+                crate::runs::TEST_SCOPE,
+                "PROJ-1",
+                RetroVerdict::Clean,
+                None,
+                None,
+            )
             .unwrap();
 
         let retro = store
@@ -9447,7 +9473,7 @@ mod tests {
 
         store
             .record_retro(
-                "",
+                crate::runs::TEST_SCOPE,
                 "PROJ-1",
                 RetroVerdict::Defect,
                 Some(RetroSeverity::Critical),
@@ -9470,7 +9496,13 @@ mod tests {
         let store = open_store(dir.path());
 
         let err = store
-            .record_retro("", "PROJ-1", RetroVerdict::Defect, None, None)
+            .record_retro(
+                crate::runs::TEST_SCOPE,
+                "PROJ-1",
+                RetroVerdict::Defect,
+                None,
+                None,
+            )
             .expect_err("should fail");
         assert!(matches!(err, RunStoreError::RetroSeverityRequired));
         assert!(
@@ -9488,7 +9520,7 @@ mod tests {
 
         let err = store
             .record_retro(
-                "",
+                crate::runs::TEST_SCOPE,
                 "PROJ-1",
                 RetroVerdict::Clean,
                 Some(RetroSeverity::Minor),
@@ -9513,7 +9545,13 @@ mod tests {
         let store = open_store(dir.path());
 
         store
-            .record_retro("", "PROJ-1", RetroVerdict::Clean, None, None)
+            .record_retro(
+                crate::runs::TEST_SCOPE,
+                "PROJ-1",
+                RetroVerdict::Clean,
+                None,
+                None,
+            )
             .unwrap();
         store
             .conn
@@ -9524,7 +9562,7 @@ mod tests {
             .unwrap();
         store
             .record_retro(
-                "",
+                crate::runs::TEST_SCOPE,
                 "PROJ-1",
                 RetroVerdict::Defect,
                 Some(RetroSeverity::Major),
@@ -9546,11 +9584,17 @@ mod tests {
         let store = open_store(dir.path());
 
         store
-            .record_retro("", "PROJ-1", RetroVerdict::Clean, None, None)
+            .record_retro(
+                crate::runs::TEST_SCOPE,
+                "PROJ-1",
+                RetroVerdict::Clean,
+                None,
+                None,
+            )
             .unwrap();
         store
             .record_retro(
-                "",
+                crate::runs::TEST_SCOPE,
                 "PROJ-2",
                 RetroVerdict::Defect,
                 Some(RetroSeverity::Minor),
@@ -9578,7 +9622,13 @@ mod tests {
         let store = open_store(dir.path());
 
         store
-            .record_retro("", "PROJ-1", RetroVerdict::Clean, None, None)
+            .record_retro(
+                crate::runs::TEST_SCOPE,
+                "PROJ-1",
+                RetroVerdict::Clean,
+                None,
+                None,
+            )
             .unwrap();
         store
             .conn
@@ -9589,7 +9639,7 @@ mod tests {
             .unwrap();
         store
             .record_retro(
-                "",
+                crate::runs::TEST_SCOPE,
                 "PROJ-1",
                 RetroVerdict::Defect,
                 Some(RetroSeverity::Critical),
@@ -9647,7 +9697,13 @@ mod tests {
             )
             .unwrap();
         store
-            .record_retro("", "PROJ-1", RetroVerdict::Clean, None, None)
+            .record_retro(
+                crate::runs::TEST_SCOPE,
+                "PROJ-1",
+                RetroVerdict::Clean,
+                None,
+                None,
+            )
             .unwrap();
 
         // PROJ-2: defect, two runs with cost.
@@ -9675,7 +9731,7 @@ mod tests {
             .unwrap();
         store
             .record_retro(
-                "",
+                crate::runs::TEST_SCOPE,
                 "PROJ-2",
                 RetroVerdict::Defect,
                 Some(RetroSeverity::Major),
@@ -9686,7 +9742,7 @@ mod tests {
         // PROJ-3: defect, but no run at all -- must not count as $0.
         store
             .record_retro(
-                "",
+                crate::runs::TEST_SCOPE,
                 "PROJ-3",
                 RetroVerdict::Defect,
                 Some(RetroSeverity::Minor),
@@ -9723,7 +9779,7 @@ mod tests {
 
         let lane_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt".to_string(),
@@ -9746,7 +9802,7 @@ mod tests {
 
         let audit_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt2".to_string(),
@@ -9768,7 +9824,13 @@ mod tests {
             .unwrap();
 
         store
-            .record_retro("", "PROJ-1", RetroVerdict::Clean, None, None)
+            .record_retro(
+                crate::runs::TEST_SCOPE,
+                "PROJ-1",
+                RetroVerdict::Clean,
+                None,
+                None,
+            )
             .unwrap();
 
         let lane_only = store.cost_by_retro_verdict(Some("lane")).unwrap();
@@ -10293,7 +10355,7 @@ mod tests {
     }
 
     #[test]
-    fn running_lane_tickets_counts_the_scope_and_legacy_unscoped_lanes() {
+    fn running_lane_tickets_counts_only_the_scope_s_own_lanes() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
         let scoped = |ticket: &str, scope: &str, kind: &str| {
@@ -10307,7 +10369,7 @@ mod tests {
         };
         scoped("GH-1", "github:jowi-dev/tskmstr", "lane");
         scoped("AX-809", "jira:AX", "lane");
-        scoped("GH-2", "", "lane");
+        scoped("GH-2", LEGACY_UNSCOPED, "lane");
         scoped("GH-3", "github:jowi-dev/tskmstr", "audit");
         let ended = scoped("GH-4", "github:jowi-dev/tskmstr", "lane");
         finish_done(&store, ended);
@@ -10316,12 +10378,76 @@ mod tests {
             store
                 .running_lane_tickets("github:jowi-dev/tskmstr")
                 .unwrap(),
-            vec!["GH-1", "GH-2"]
+            vec!["GH-1"]
         );
         assert_eq!(
             store.running_lane_tickets("jira:AX").unwrap(),
-            vec!["AX-809", "GH-2"]
+            vec!["AX-809"]
         );
+    }
+
+    /// GitHub issue #263: an empty scope is not a wildcard. No code path
+    /// writes one any more, so the rows are inserted directly, standing in
+    /// for a database a migration somehow missed.
+    #[test]
+    fn an_empty_scope_row_matches_no_scoped_lookup() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO runs (ticket, lane, status, worktree, started_at, scope, kind, pr_url)
+                 VALUES ('GH-3', 'a', 'running', '/wt', '2026-08-01T00:00:00.000Z', '', 'lane', NULL),
+                        ('GH-3', 'a', 'done', '/wt', '2026-07-01T00:00:00.000Z', '', 'lane', 'u');
+                 INSERT INTO ticket_audits (ticket_key, verdict, audited_at, scope)
+                 VALUES ('GH-3', 'ready', '2026-08-01T00:00:00.000Z', '');
+                 INSERT INTO ticket_retros (ticket_key, verdict, recorded_at, scope)
+                 VALUES ('GH-3', 'clean', '2026-08-01T00:00:00.000Z', '');
+                 INSERT INTO ticket_rank (scope, ticket_key, rank) VALUES ('', 'GH-3', 1.0);
+                 INSERT INTO session_archives (scope, ticket, session, window, path, captured_at)
+                 VALUES ('', 'GH-3', 's', 'w', '/p', '2026-08-01T00:00:00.000Z');",
+            )
+            .unwrap();
+        let scope = "github:o/new";
+        let some = Some(scope);
+
+        assert!(store.latest_run_for_ticket(some, "GH-3").unwrap().is_none());
+        assert!(store.runs_for_ticket(some, "GH-3").unwrap().is_empty());
+        assert!(
+            store
+                .latest_finished_run_for_ticket_kind(some, "GH-3", "lane")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.list_runs_filtered(some, None).unwrap().is_empty());
+        assert!(store.latest_round_runs(some, "lane").unwrap().is_empty());
+        assert!(store.running_lane_tickets(scope).unwrap().is_empty());
+        assert!(
+            store
+                .latest_audit_for_ticket(some, "GH-3")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .latest_retro_for_ticket(some, "GH-3")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .retro_verdicts_for_tickets(some, &["GH-3".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .session_archives_for_ticket(some, "GH-3")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.ticket_rank(scope, "GH-3").unwrap(), None);
+        assert!(store.all_ticket_ranks(scope).unwrap().is_empty());
     }
 
     fn start_kind(store: &RunStore, kind: &str, agent: &str, repo: &str) -> i64 {

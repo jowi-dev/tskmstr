@@ -402,8 +402,8 @@ pub enum Skip {
 pub enum Refusal {
     /// `max_lanes` lanes are already running in the scope.
     MaxLanes {
-        /// Tickets of the lanes counted: the scope's running lanes plus
-        /// legacy unscoped ones, oldest first (see
+        /// Tickets of the lanes counted: the scope's running lanes, oldest
+        /// first (see
         /// [`RunStore::running_lane_tickets`]).
         running: Vec<String>,
         /// `[dispatch] max_lanes`.
@@ -796,14 +796,12 @@ pub enum InHand {
 }
 
 /// The tickets in `scope` that the run store says are already in hand,
-/// from [`RunStore::overview_runs`] (newest first). Legacy unscoped runs
-/// (`scope = ''`) count for every scope, as they do elsewhere.
+/// from [`RunStore::overview_runs`] (newest first). Only runs recorded
+/// under `scope` count: GitHub keys restart in every repo, so another
+/// repo's `GH-3` says nothing about this one's (GitHub issue #263).
 pub fn in_hand(runs: &[OverviewRun], scope: &str) -> HashMap<String, InHand> {
     let mut by_ticket: HashMap<&str, Vec<&OverviewRun>> = HashMap::new();
-    for run in runs
-        .iter()
-        .filter(|run| run.scope == scope || run.scope.is_empty())
-    {
+    for run in runs.iter().filter(|run| run.scope == scope) {
         by_ticket.entry(&run.ticket).or_default().push(run);
     }
 
@@ -2208,6 +2206,56 @@ mod tests {
         assert_eq!(busy.get("GH-2"), Some(&InHand::Attempted));
         assert_eq!(busy.get("GH-3"), Some(&InHand::OpenPr));
         assert_eq!(busy.get("GH-4"), Some(&InHand::FixRoundCap));
+    }
+
+    /// GitHub issue #263: GitHub keys restart at 1 in every repo, so
+    /// another repo's run on the same key leaves this repo's ticket free.
+    #[test]
+    fn a_run_on_the_same_key_in_another_scope_does_not_hold_the_ticket() {
+        let fx = Fixture::new();
+        for scope in ["github:o/other", crate::runs::LEGACY_UNSCOPED] {
+            let id = fx
+                .store
+                .start_run(&StartRun {
+                    ticket: "GH-3".to_string(),
+                    scope: scope.to_string(),
+                    lane: "x".to_string(),
+                    worktree: "/wt/x".to_string(),
+                    branch: None,
+                    pid: None,
+                    kind: "lane".to_string(),
+                    log_path: None,
+                })
+                .unwrap();
+            finish(&fx.store, id, RunStatus::Failed, None);
+        }
+        let launcher = FakeLauncher::new(&fx.store);
+
+        fx.tick(&[ready("GH-3", 0)], &launcher);
+
+        assert_eq!(launcher.tickets(), vec!["GH-3"]);
+    }
+
+    #[test]
+    fn an_empty_scope_run_does_not_hold_a_ticket() {
+        let run = OverviewRun {
+            id: 1,
+            scope: String::new(),
+            ticket: "GH-3".to_string(),
+            kind: "lane".to_string(),
+            status: RunStatus::Failed,
+            awaiting_input: false,
+            heartbeat_age_secs: None,
+            state_age_secs: 0,
+            worktree: "/wt".to_string(),
+            pr_url: None,
+            repo_root: None,
+            auto_review_round: None,
+            review_import: None,
+            pr_closed: false,
+        };
+
+        assert!(in_hand(&[run], SCOPE).is_empty());
     }
 
     /// GH-169: an interactive audit session that records its verdict and

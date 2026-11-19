@@ -375,7 +375,7 @@ mod tests {
         let id = store
             .start_run(&StartRun {
                 ticket: "PROJ-1".to_string(),
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 lane: "backend".to_string(),
                 worktree: "/wt/proj-1".to_string(),
                 branch: None,

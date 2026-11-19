@@ -1121,7 +1121,7 @@ mod tests {
         let id = store
             .start_run(&StartRun {
                 ticket: "PROJ-1".to_string(),
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 lane: "lane".to_string(),
                 worktree: "/tmp/wt".to_string(),
                 branch: None,
@@ -1333,7 +1333,7 @@ mod kind_tests {
         let id = store
             .start_run(&StartRun {
                 ticket: "PROJ-1".to_string(),
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 lane: kind.to_string(),
                 worktree: "/tmp/wt".to_string(),
                 branch: None,
@@ -1558,7 +1558,7 @@ mod gate_tests {
         let id = store
             .start_run(&StartRun {
                 ticket: "PROJ-1".to_string(),
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 lane: kind.to_string(),
                 worktree: "/tmp/wt".to_string(),
                 branch: None,
@@ -2234,7 +2234,7 @@ mod usage_tests {
         let id = store
             .start_run(&StartRun {
                 ticket: "PROJ-1".to_string(),
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 lane: "lane".to_string(),
                 worktree: "/tmp/wt".to_string(),
                 branch: None,

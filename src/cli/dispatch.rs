@@ -1179,12 +1179,12 @@ mod tests {
         };
         lane("GH-1", ONE);
         lane("AX-809", "jira:AX");
-        lane("GH-OLD", "");
+        lane("GH-OLD", crate::runs::LEGACY_UNSCOPED);
 
         let out = text(|out| status(&store, 0, out).unwrap());
 
         assert!(
-            out.starts_with("github:o/one: on, 2 lanes running (GH-1, GH-OLD), "),
+            out.starts_with("github:o/one: on, 1 lanes running (GH-1), "),
             "{out}"
         );
     }

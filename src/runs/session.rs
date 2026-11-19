@@ -827,7 +827,7 @@ mod tests {
 
         let pre_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/repo/axiom".to_string(),
@@ -874,7 +874,7 @@ mod tests {
 
         let pre_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "proj-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: "/Worktrees/axiom/proj-1".to_string(),
@@ -903,7 +903,7 @@ mod tests {
     fn preregister_create(store: &RunStore) -> i64 {
         store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: CREATE_PLACEHOLDER_TICKET.to_string(),
                 lane: "create".to_string(),
                 worktree: "/repo/axiom".to_string(),
@@ -1009,7 +1009,7 @@ mod tests {
 
         let pre_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "create".to_string(),
                 worktree: "/repo/axiom".to_string(),
@@ -1044,7 +1044,7 @@ mod tests {
 
         let pre_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-2".to_string(),
                 lane: "create".to_string(),
                 worktree: "/repo/axiom".to_string(),
@@ -1094,7 +1094,7 @@ mod tests {
 
         let pre_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/repo/axiom".to_string(),
@@ -1590,7 +1590,7 @@ mod tests {
     fn preregister_audit(store: &RunStore, ticket: &str) -> i64 {
         store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: ticket.to_string(),
                 lane: "audit".to_string(),
                 worktree: "/repo/axiom".to_string(),
@@ -1784,7 +1784,7 @@ mod tests {
         let id = store
             .start_run(&StartRun {
                 ticket: "GH-1".to_string(),
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 lane: "tskmstr".to_string(),
                 worktree: "/tmp/wt".to_string(),
                 branch: Some("gh-1".to_string()),
