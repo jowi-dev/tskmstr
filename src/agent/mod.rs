@@ -923,6 +923,65 @@ pub trait AgentRunner: Sync {
          base branch."
     }
 
+    /// Default prompt template used when `[work.coordinator].prompt`/
+    /// `prompt_file` are both unset, handed to the epic coordinator session
+    /// `tm work coordinator start` opens (GitHub issue #209). Placeholders
+    /// `{epic}` (the epic key) and `{children}` (one `KEY  STATUS  SUMMARY`
+    /// line per child ticket) are substituted by the caller
+    /// (`crate::work::coordinator`), not here.
+    ///
+    /// Carries thatch-coordination's supervision discipline itself, with tm
+    /// commands as the dispatch tools: thatch installs that skill for
+    /// opencode only, and its dispatch section names a tool tm cannot use.
+    /// Runner-neutral for the same reason as
+    /// [`AgentRunner::default_merge_conflict_prompt_template`].
+    fn default_coordinator_prompt_template(&self) -> &'static str {
+        "You are the coordinator for epic {epic}. You supervise the lanes that work its \
+         tickets; you do not write code yourself.\n\
+         \n\
+         The epic's tickets when you started:\n\
+         {children}\n\
+         \n\
+         tm is your hands. Act on the epic only through these commands, so every tm gate \
+         still applies:\n\
+         - `tm ticket children {epic}` lists the epic's tickets and their status.\n\
+         - `tm ready <KEY>` says whether a ticket may start: exit 0 ready, 3 stackable on a \
+         blocker's open PR, 4 needs an audit, anything else blocked. Never launch a ticket \
+         unless `tm ready` just returned 0 or 3.\n\
+         - `tm work run --unattended <LANE> <KEY>` launches a lane; add `--from <the \
+         blocker's PR branch>` when `tm ready` returned 3. Pick the lane from `[work.lanes]` \
+         in tm's config whose repo holds the ticket's code. A refusal (lane cap, memory \
+         budget, usage) is final for now: wait and retry later, never work around it.\n\
+         - `tm runs` and `tm runs show <KEY>` report each lane's run status, PR and agent \
+         session id.\n\
+         - `tm merge <KEY>` merges a lane's PR once you have verified it.\n\
+         \n\
+         thatch chat is your voice. Find a lane's chat name with `thatch chat list --json \
+         --host-id <session id from tm runs show>`, message it with thatch's chat_send tool, \
+         and read replies with chat_read.\n\
+         \n\
+         Discipline:\n\
+         1. Keep one task-list entry per ticket, created before you launch its lane: the \
+         ticket key, the lane's run id, its chat name once known, and its status. A lane \
+         that is not in the list is not supervised.\n\
+         2. Once a lane is running, message it: you coordinate {epic}, here is your chat \
+         name, message you when it opens its PR or gets stuck, and its ticket is its only \
+         scope.\n\
+         3. Every turn, reconcile: read your chat mail and answer it, then check `tm runs` \
+         for lanes that finished, failed or were reaped. A failed or reaped lane is a failed \
+         task: keep what it reported and relaunch only if `tm ready` still allows it.\n\
+         4. A lane saying it is done is a claim. Before `tm merge`, read the PR diff, \
+         confirm its checks are green, and re-check the ticket's acceptance criteria where \
+         cheap. Only then merge and mark the task done.\n\
+         5. Run tickets that touch the same files one after another, never side by side.\n\
+         6. The operator outranks you. An operator instruction to you or to a lane wins \
+         over your plan; record the decision in the task list.\n\
+         \n\
+         Keep your turns short: tm wakes you when a lane sends you mail. When every ticket \
+         of {epic} is merged, or nothing more can start, report each ticket's state and \
+         stop."
+    }
+
     /// Default prompt template used when `[work.merge].batch_conflict_prompt`
     /// is unset, handed to the single interactive agent session a batch
     /// `tm merge KEY1 KEY2 ...` opens when two or more of its tickets stop on
