@@ -180,6 +180,9 @@ at the board and real tickets, so it happens after this change merges:
 
 1. File a two-ticket epic of small, independent fixes and audit both.
 2. `tm work coordinator start <EPIC>`, attach, and watch it launch both.
+   Keep autopilot off for the scope until both lanes are running, so
+   autopilot does not launch a child the coordinator does not know about;
+   then turn it on, since chat wakes only run in its dispatch tick.
 3. Confirm at least one chat exchange in the coordinator's chat panel.
 4. Confirm both PRs merge through `tm merge`, then
    `tm work coordinator stop <EPIC>`.
@@ -188,6 +191,8 @@ at the board and real tickets, so it happens after this change merges:
 ## Not in this change
 
 - the board start/stop key;
+- autopilot skipping the children of an epic with a running coordinator
+  (today the operator keeps autopilot off while the coordinator launches);
 - `tm work run --unattended` enforcing the full `tm ready` decision (#254);
 - upstreaming a dispatch-agnostic `thatch-coordination` to thatch;
 - the dogfood run itself.

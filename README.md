@@ -1785,6 +1785,15 @@ one while the epic's coordinator is hibernated: attach to the epic's session
 to resume it, or `stop` it first. `stop` also finishes a hibernated
 coordinator, so a later attach does not wake it.
 
+**Chat wakes need autopilot on for the scope.** Wakes run in the dispatch
+tick, and the tick does nothing while autopilot is off, so with autopilot
+off the coordinator reads its mail only when you prompt it. But with
+autopilot on, autopilot also launches the scope's ready tickets, this
+epic's children included. It does not tell the coordinator, which treats a
+lane it did not launch as unsupervised. **Pick one per epic**: leave
+autopilot off and prompt the coordinator yourself, or turn it on only when
+the epic's children are all launched or not yet ready.
+
 **tm is the coordinator's hands.** Its prompt lets it act on the epic only
 through `tm` commands: `tm ticket children`, `tm ready`, `tm work run
 --unattended`, `tm runs` and `tm merge`. Memory admission, the lane cap and
