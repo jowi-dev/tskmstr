@@ -19,7 +19,8 @@
 //! **One merge per head commit.** Before it launches, the sweep records an
 //! [`AUTO_MERGE_EVENT`] on the ticket's lane run naming the PR's head SHA,
 //! so the next tick does not start a second merge while the first is still
-//! starting. A failed merge is not retried until the PR's head changes.
+//! starting. A failed merge is not retried until the PR's head changes, in
+//! either mode: the sweep leaves its own rows out of [`awaiting_review`].
 //!
 //! Each merge gets its own [`AUTO_MERGE_KIND`] run row, registered by the
 //! sweep and adopted by the detached `tm merge --auto-merge-run <ID>`,
@@ -181,7 +182,16 @@ pub fn sweep(
         }) else {
             continue;
         };
-        candidates.push((number, ticket, lane, awaiting_review(runs)));
+        // A failed automerge row would otherwise count as a failure after
+        // the review watch and hold the ticket out of Awaiting review for
+        // good. `handled` already keeps a failed merge from retrying on the
+        // same head, so the sweep leaves its own rows out here.
+        let reviewed: Vec<&OverviewRun> = runs
+            .iter()
+            .copied()
+            .filter(|run| run.kind != AUTO_MERGE_KIND)
+            .collect();
+        candidates.push((number, ticket, lane, awaiting_review(&reviewed)));
     }
     if candidates.is_empty() {
         return Ok(Vec::new());
@@ -700,6 +710,27 @@ mod tests {
 
         fx.sweep(&gh, &launcher, AutoMerge::Approved);
 
+        assert_eq!(launcher.tickets(), vec!["GH-1", "GH-1"]);
+    }
+
+    #[test]
+    fn reviewed_mode_retries_an_awaiting_review_pr_on_a_new_head() {
+        let fx = Fixture::new();
+        fx.awaiting("GH-1", 7);
+        let gh = FakeGhCli::new()
+            .with_pr_list_review_state(Ok(vec![unapproved(7)]))
+            .with_pr_checks(7, Ok(head("abc")));
+        let launcher = FakeLauncher::new();
+        fx.sweep(&gh, &launcher, AutoMerge::Reviewed);
+        let first = launcher.launched.borrow()[0].1;
+        // `tm merge` rebased and pushed, then ran out of checks time.
+        finish(&fx.store, first, &Ok(MergeFlowOutcome::ChecksPending)).unwrap();
+
+        fx.sweep(&gh, &launcher, AutoMerge::Reviewed);
+        assert_eq!(launcher.tickets(), vec!["GH-1"], "same head: no retry");
+
+        let gh = gh.with_pr_checks(7, Ok(head("def")));
+        fx.sweep(&gh, &launcher, AutoMerge::Reviewed);
         assert_eq!(launcher.tickets(), vec!["GH-1", "GH-1"]);
     }
 

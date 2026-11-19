@@ -2545,7 +2545,9 @@ several PRs qualify, the lowest-numbered one goes first.
 **One merge runs per head commit.** Before it starts, tm records an
 `auto_merge started <sha> run <id>` event on the lane run, so later ticks
 leave that commit alone. A merge that fails is not retried until the PR's
-head changes, for example after a fix pass pushes.
+head changes, for example after a fix pass pushes. That holds in both
+modes: in `"reviewed"` the failed `auto-merge` run does not take the PR out
+of Awaiting review.
 
 Each automerge is an `auto-merge` run: `tm dispatch` spawns `tm merge
 <KEY>` detached in the repo, logging to
