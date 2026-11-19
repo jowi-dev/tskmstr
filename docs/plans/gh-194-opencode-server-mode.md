@@ -173,5 +173,48 @@ usage-limit fallback attempt that lands on opencode.
 
 Acceptance: 5 concurrent server-mode lanes peak under half the memory of
 5 process-mode lanes, measured the way #192 measured (sum of client RSS
-plus server RSS, sampled during the run). Results are recorded below once
-taken.
+plus server RSS, sampled during the run).
+
+**Result: not met, and not reachable on opencode 2.x.**
+
+Measured 2026-11-19 on CLI 2.2.5 / service 2.3.0. Each run is 5
+concurrent lanes on `venice/z-ai-glm-5-3-flash` with the prompt "Run
+`ls -la && sleep 15` and reply with how many entries there were.", all
+exiting 0. `ps` was sampled every 0.25 s and the peak of (client RSS +
+server RSS) recorded. Clients are the `opencode run` processes in
+process mode, and the tm drivers plus their `opencode api` children in
+server mode.
+
+| Run | Mode | Peak total | Clients | Server |
+|---|---|---|---|---|
+| 1 | process | 1,036 MB | 398 MB (5 procs) | 638 MB |
+| 1 | server | 1,260 MB | 347 MB (9 procs) | 913 MB |
+| 2 | process | 947 MB | 407 MB (5 procs) | 540 MB |
+| 2 | process | 914 MB | 401 MB (5 procs) | 513 MB |
+| 3 | server | 834 MB | 372 MB (9 procs) | 462 MB |
+| 3 | process | 947 MB | 429 MB (5 procs) | 517 MB |
+
+Server mode peaked at 0.88x to 1.22x of process mode depending on order;
+the server's own RSS swings by a few hundred MB between runs.
+
+Why the premise no longer holds:
+
+- **opencode 2.x already removed the expensive client.** The ticket's
+  numbers come from 1.18, where every `opencode run --attach` client
+  loaded a ~360 MB runtime. On 2.x an `opencode run` client peaks around
+  80 MB, because the server owns sessions and tools.
+- **The driver's `opencode api` calls cost the same as that client.**
+  The tm driver itself is about 11 MB (debug build). Each `opencode api`
+  call it makes peaks at about 82 MB. With five drivers polling, their
+  calls overlap, which is the 9 client processes in the table.
+- **The shared server dominates, and both modes pay it.** Each session
+  adds roughly 90 MB inside the server no matter which client started it.
+  Even a native HTTP client in tm (about 11 MB per lane) would land
+  around 0.55x to 0.68x of process mode at 5 lanes, and would approach
+  about 0.5x only as lane count grows. It would also need tm to read the
+  service password from `~/.local/state/opencode/service.json`.
+
+Recommendation: do not enable server mode. On opencode 2.x, a process-mode
+lane already costs about 80 MB of client plus its session inside the
+server. The remaining per-lane memory lives in the server, where no
+client-side change can reach it.
