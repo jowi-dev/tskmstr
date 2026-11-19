@@ -461,11 +461,9 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             .map_err(|err| err.to_string())?;
         let gh = ShellGhCli::new();
         let git = ShellGitOps::new();
-        let containment = tskmstr::blocker_stacking::BaseContainment::new(
-            &git,
-            repo_dir,
-            ready_lane_bases(&config, &git, repo_dir),
-        );
+        let bases = ready_lane_bases(&config, &git, repo_dir);
+        let containment =
+            tskmstr::blocker_stacking::BaseContainment::new(&git, repo_dir, bases.clone());
         let audit_store = open_ready_audit_store(&config);
         let candidates = tskmstr::cli::ready::ReadyContext {
             jira: provider.as_ref(),
@@ -517,6 +515,11 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             now: unix_now(),
             notifier: &notifier,
             ci: Some(&ci),
+            base_watch: Some(&tskmstr::work::notify::BaseWatch {
+                gh: &gh,
+                repo_dir,
+                bases: &bases,
+            }),
         };
         let cfg = tskmstr::work::dispatch::TickConfig {
             scope,
@@ -3117,11 +3120,9 @@ impl AutopilotTicker {
             };
         let gh = ShellGhCli::new();
         let git = ShellGitOps::new();
-        let containment = tskmstr::blocker_stacking::BaseContainment::new(
-            &git,
-            &target.repo_root,
-            ready_lane_bases(&config, &git, &target.repo_root),
-        );
+        let bases = ready_lane_bases(&config, &git, &target.repo_root);
+        let containment =
+            tskmstr::blocker_stacking::BaseContainment::new(&git, &target.repo_root, bases.clone());
         let audit_store = open_ready_audit_store(&config);
         let candidates = tskmstr::cli::ready::ReadyContext {
             jira: jira.as_ref(),
@@ -3192,6 +3193,11 @@ impl AutopilotTicker {
             now: unix_now(),
             notifier: &notifier,
             ci: Some(&ci),
+            base_watch: Some(&tskmstr::work::notify::BaseWatch {
+                gh: &gh,
+                repo_dir: &target.repo_root,
+                bases: &bases,
+            }),
         };
         let cfg = dispatch::TickConfig {
             scope: &scope,

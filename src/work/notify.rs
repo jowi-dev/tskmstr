@@ -1,14 +1,18 @@
 //! Autopilot desktop notifications (GitHub issue #121).
 //!
 //! A dispatch tick ([`crate::work::dispatch::tick`]) asks three questions of
-//! the run store and notifies the operator when the answer changes:
+//! the run store, and one of GitHub, and notifies the operator when the
+//! answer changes:
 //!
 //! - a ticket entered "awaiting review" ([`awaiting_review`]): the machine
 //!   is done and it is the operator's turn;
 //! - a ticket hit the fix-round cap: auto-review stopped at its round cap,
 //!   or the ticket has `[dispatch] max_fix_rounds` fix passes;
 //! - dispatch has refused for the same reason for longer than
-//!   `[dispatch] stall_notify_mins`.
+//!   `[dispatch] stall_notify_mins`;
+//! - a lane base branch's head commit has a failed check
+//!   ([`base_red_notices`], GitHub issue #242), so `tm merge` refuses to
+//!   merge onto it. Each red commit notifies once.
 //!
 //! Each [`Notice`] carries a transition key. [`send`] claims the key in
 //! runs.db before notifying ([`RunStore::claim_notification`]), so a
@@ -24,6 +28,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::github::gh_cli::GhCli;
 use crate::runs::overview::{
     ACTIVE_SCOPE_WINDOW_SECS, OverviewRun, REVIEW_FIX_KIND, awaiting_review,
 };
@@ -36,6 +41,9 @@ pub const AWAITING_REVIEW: &str = "awaiting_review";
 pub const FIX_CAP: &str = "fix_cap";
 /// [`Notice::reason`] of a stalled dispatcher.
 pub const STALL: &str = "stall";
+/// [`Notice::reason`] of a base branch whose head commit has a failed
+/// check.
+pub const BASE_RED: &str = "base_red";
 
 /// Shows one desktop notification.
 pub trait Notifier {
@@ -252,6 +260,53 @@ pub fn stall_notice(
     })
 }
 
+/// What [`base_red_notices`] reads base branch checks with.
+pub struct BaseWatch<'a> {
+    /// Reads each base's head commit checks.
+    pub gh: &'a dyn GhCli,
+    /// Where `gh` runs: a checkout of the scope's repo.
+    pub repo_dir: &'a Path,
+    /// The lane base branches to watch, as configured (`main`) or as `git`
+    /// names them (`origin/main`). Duplicates are read once.
+    pub bases: &'a [String],
+}
+
+/// A [`BASE_RED`] notice for each of `watch.bases` whose head commit has a
+/// failed check. The key is `<base>@<sha>`, so each red commit notifies
+/// once and a new red commit notifies again. Pending checks are not red,
+/// and a base whose checks can't be read is skipped: the next tick tries
+/// again.
+pub fn base_red_notices(watch: &BaseWatch, scope: &str) -> Vec<Notice> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut notices = Vec::new();
+    for base in watch.bases {
+        let base = base.strip_prefix("origin/").unwrap_or(base);
+        if seen.contains(&base) {
+            continue;
+        }
+        seen.push(base);
+        let Ok(checks) = watch.gh.commit_checks(watch.repo_dir, base) else {
+            continue;
+        };
+        let failing: Vec<&str> = checks.failing().map(|c| c.name.as_str()).collect();
+        if failing.is_empty() {
+            continue;
+        }
+        notices.push(Notice {
+            ticket: String::new(),
+            reason: BASE_RED,
+            key: format!("{base}@{}", checks.sha),
+            title: format!("tm: {base} is red ({scope})"),
+            body: format!(
+                "{} failing: {}. tm merge refuses to merge onto {base} until it is green.",
+                crate::work::merge::short_sha(&checks.sha),
+                failing.join(", ")
+            ),
+        });
+    }
+    notices
+}
+
 /// Sends each of `notices` whose transition `scope` hasn't notified yet,
 /// claiming it first so no other tick sends it again. Returns the titles
 /// sent, in order.
@@ -283,6 +338,7 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     use super::*;
+    use crate::github::gh_cli::CommitChecks;
     use crate::runs::{FinishRun, StartRun};
     use crate::work::auto_review::ROUND_EVENT;
 
@@ -553,5 +609,83 @@ mod tests {
             assert!(!notifier.available());
             notifier.notify("title", "body");
         }
+    }
+
+    // --- red base notices (GitHub issue #242) ---
+
+    fn commit(sha: &str, states: &[(&str, crate::github::gh_cli::ChecksState)]) -> CommitChecks {
+        CommitChecks {
+            sha: sha.to_string(),
+            checks: states
+                .iter()
+                .map(|(name, state)| crate::github::gh_cli::CheckResult {
+                    name: name.to_string(),
+                    state: *state,
+                    run_id: None,
+                    job_id: None,
+                    details_url: None,
+                    conclusion: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_red_base_gives_one_notice_keyed_by_its_commit() {
+        use crate::github::gh_cli::{ChecksState, FakeGhCli};
+        let gh = FakeGhCli::new().with_commit_checks(
+            "main",
+            Ok(commit(
+                "0123456789abcdef",
+                &[
+                    ("test", ChecksState::Failing),
+                    ("lint", ChecksState::Passing),
+                ],
+            )),
+        );
+        let bases = vec!["origin/main".to_string(), "main".to_string()];
+        let watch = BaseWatch {
+            gh: &gh,
+            repo_dir: Path::new("/repo"),
+            bases: &bases,
+        };
+
+        let notices = base_red_notices(&watch, SCOPE);
+
+        assert_eq!(gh.commit_checks_calls(), vec!["main".to_string()]);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].reason, BASE_RED);
+        assert_eq!(notices[0].key, "main@0123456789abcdef");
+        assert_eq!(notices[0].title, format!("tm: main is red ({SCOPE})"));
+        assert!(
+            notices[0].body.contains("0123456789ab"),
+            "{}",
+            notices[0].body
+        );
+        assert!(notices[0].body.contains("test"), "{}", notices[0].body);
+        assert!(!notices[0].body.contains("lint"), "{}", notices[0].body);
+    }
+
+    #[test]
+    fn green_pending_or_unreadable_bases_give_no_notice() {
+        use crate::github::gh_cli::{ChecksState, FakeGhCli, GhError};
+        let gh = FakeGhCli::new()
+            .with_commit_checks("main", Ok(commit("a", &[("t", ChecksState::Passing)])))
+            .with_commit_checks("dev", Ok(commit("b", &[("t", ChecksState::Pending)])))
+            .with_commit_checks(
+                "gone",
+                Err(GhError::Parse {
+                    command: "gh".to_string(),
+                    message: "ref did not resolve to a commit".to_string(),
+                }),
+            );
+        let bases = vec!["main".to_string(), "dev".to_string(), "gone".to_string()];
+        let watch = BaseWatch {
+            gh: &gh,
+            repo_dir: Path::new("/repo"),
+            bases: &bases,
+        };
+
+        assert!(base_red_notices(&watch, SCOPE).is_empty());
     }
 }
