@@ -27,7 +27,8 @@ use thiserror::Error;
 
 use crate::cli::runs::format_age;
 use crate::config::{BackendIdentity, BackendIdentityResolver, Config, compatible_lane_names};
-use crate::runs::{AutopilotScope, RunStore, RunStoreError};
+use crate::runs::{AutopilotScope, RunStatus, RunStore, RunStoreError};
+use crate::work::auto_merge::{AUTO_MERGE_KIND, AutoMergeAction};
 use crate::work::ci_fix::CiFixAction;
 use crate::work::dispatch::{LaneChoice, Skip, TickReport, dispatch_state};
 
@@ -213,6 +214,7 @@ fn tick_json(scope: &str, outcome: &TickOutcome) -> serde_json::Value {
             "skipped": report.skipped.map(skip_name),
             "notified": report.notified,
             "ci_fixes": report.ci_fixes.iter().map(ci_fix_json).collect::<Vec<_>>(),
+            "auto_merges": report.auto_merges.iter().map(auto_merge_json).collect::<Vec<_>>(),
             "error": null,
         }),
         TickOutcome::Failed(err) => json!({
@@ -222,6 +224,7 @@ fn tick_json(scope: &str, outcome: &TickOutcome) -> serde_json::Value {
             "skipped": null,
             "notified": [],
             "ci_fixes": [],
+            "auto_merges": [],
             "error": err,
         }),
     }
@@ -259,6 +262,53 @@ fn ci_fix_text(action: &CiFixAction) -> String {
     }
 }
 
+/// One automerge sweep action as `tm dispatch tick --json` reports it. A
+/// scope-wide `gh` failure has a `null` ticket.
+fn auto_merge_json(action: &AutoMergeAction) -> serde_json::Value {
+    let (ticket, name, sha, run_id, error) = match action {
+        AutoMergeAction::Started {
+            ticket,
+            sha,
+            run_id,
+        } => (Some(ticket), "started", Some(sha), Some(*run_id), None),
+        AutoMergeAction::LaunchFailed { ticket, sha, error } => {
+            (Some(ticket), "launch_failed", Some(sha), None, Some(error))
+        }
+        AutoMergeAction::CheckFailed { ticket, error } => (
+            Some(ticket).filter(|t| !t.is_empty()),
+            "prs_unavailable",
+            None,
+            None,
+            Some(error),
+        ),
+    };
+    json!({"ticket": ticket, "action": name, "sha": sha, "run_id": run_id, "error": error})
+}
+
+/// One automerge sweep action as a `tm dispatch tick` line, after the
+/// scope.
+fn auto_merge_text(action: &AutoMergeAction) -> String {
+    match action {
+        AutoMergeAction::Started {
+            ticket,
+            sha,
+            run_id,
+        } => format!(
+            "automerge {ticket} started ({}, run {run_id})",
+            sha.chars().take(7).collect::<String>()
+        ),
+        AutoMergeAction::LaunchFailed { ticket, error, .. } => {
+            format!("automerge {ticket} launch failed: {error}")
+        }
+        AutoMergeAction::CheckFailed { ticket, error } if ticket.is_empty() => {
+            format!("automerge PRs unavailable: {error}")
+        }
+        AutoMergeAction::CheckFailed { ticket, error } => {
+            format!("automerge {ticket} PR unavailable: {error}")
+        }
+    }
+}
+
 fn write_tick_text(scope: &str, outcome: &TickOutcome, out: &mut dyn Write) -> io::Result<()> {
     let report = match outcome {
         TickOutcome::Failed(err) => return writeln!(out, "{scope}: error: {err}"),
@@ -292,6 +342,9 @@ fn write_tick_text(scope: &str, outcome: &TickOutcome, out: &mut dyn Write) -> i
     }
     for action in &report.ci_fixes {
         writeln!(out, "{scope}: {}", ci_fix_text(action))?;
+    }
+    for action in &report.auto_merges {
+        writeln!(out, "{scope}: {}", auto_merge_text(action))?;
     }
     for title in &report.notified {
         writeln!(out, "{scope}: notified: {title}")?;
@@ -340,9 +393,12 @@ pub fn set(
 /// off, its running lanes (the ones `max_lanes` caps, named by ticket; see
 /// [`RunStore::running_lane_tickets`]), when it last ticked, and how long ago it last
 /// launched. A scope whose newest tick refused also gets the refusal and how
-/// long refusals for that reason have lasted. `now` is unix seconds.
+/// long refusals for that reason have lasted, and a scope with an automerge
+/// (GitHub issue #243) gets its newest one: running, merged, or failed with
+/// the reason. `now` is unix seconds.
 pub fn status(store: &RunStore, now: i64, out: &mut dyn Write) -> Result<(), DispatchCliError> {
     let rows = store.autopilot_scopes()?;
+    let runs = store.overview_runs()?;
     if rows.is_empty() {
         writeln!(out, "no scopes registered; run `tm dispatch on` in a repo")?;
         return Ok(());
@@ -376,8 +432,38 @@ pub fn status(store: &RunStore, now: i64, out: &mut dyn Write) -> Result<(), Dis
                 blocked.detail
             )?;
         }
+        let newest_merge = runs
+            .iter()
+            .find(|run| run.scope == row.scope && run.kind == AUTO_MERGE_KIND);
+        if let Some(merge) = newest_merge {
+            writeln!(out, "  {}", auto_merge_status(store, merge)?)?;
+        }
     }
     Ok(())
+}
+
+/// `tm dispatch status`'s line for a scope's newest automerge run.
+fn auto_merge_status(
+    store: &RunStore,
+    merge: &crate::runs::overview::OverviewRun,
+) -> Result<String, DispatchCliError> {
+    let (ticket, id) = (&merge.ticket, merge.id);
+    Ok(match merge.status {
+        RunStatus::Running | RunStatus::Queued | RunStatus::Hibernated => {
+            format!("automerge running: {ticket} (run {id})")
+        }
+        RunStatus::Done => format!("last automerge: {ticket} merged (run {id})"),
+        status => {
+            let blocker = store.run_by_id(id)?.and_then(|run| run.blocker);
+            match blocker {
+                Some(reason) => format!(
+                    "last automerge: {ticket} {} (run {id}): {reason}",
+                    status.as_str()
+                ),
+                None => format!("last automerge: {ticket} {} (run {id})", status.as_str()),
+            }
+        }
+    })
 }
 
 /// `N lanes running`, then the counted lanes' tickets in parentheses when
@@ -436,6 +522,7 @@ mod tests {
     use crate::config::{Billing, FakeBackendIdentityResolver, LaneConfig, MemoryConfig};
     use crate::runs::StartRun;
     use crate::work::admission::UsageProber;
+    use crate::work::auto_merge::AUTO_MERGE_KIND;
     use crate::work::dispatch::{
         Candidate, CandidateSource, FileScopeLock, LAUNCH_EVENT, Launch, Launcher, Refusal,
         ScopeLock, TickConfig, TickDeps,
@@ -617,7 +704,26 @@ mod tests {
                     error: "rate limited".to_string(),
                 },
             ],
-            auto_merges: Vec::new(),
+            auto_merges: vec![
+                AutoMergeAction::Started {
+                    ticket: "GH-9".to_string(),
+                    sha: "fed9876543".to_string(),
+                    run_id: 41,
+                },
+                AutoMergeAction::LaunchFailed {
+                    ticket: "GH-10".to_string(),
+                    sha: "edc8765".to_string(),
+                    error: "no tm".to_string(),
+                },
+                AutoMergeAction::CheckFailed {
+                    ticket: String::new(),
+                    error: "gh down".to_string(),
+                },
+                AutoMergeAction::CheckFailed {
+                    ticket: "GH-11".to_string(),
+                    error: "rate limited".to_string(),
+                },
+            ],
         }
     }
 
@@ -659,6 +765,10 @@ mod tests {
              github:o/one: ci-fix GH-4 capped (bcd2345)\n\
              github:o/one: ci-fix GH-5 launch failed: no such file\n\
              github:o/one: ci-fix GH-6 checks unavailable: rate limited\n\
+             github:o/one: automerge GH-9 started (fed9876, run 41)\n\
+             github:o/one: automerge GH-10 launch failed: no tm\n\
+             github:o/one: automerge PRs unavailable: gh down\n\
+             github:o/one: automerge GH-11 PR unavailable: rate limited\n\
              github:o/one: notified: tm: GH-0 is awaiting your review\n\
              github:o/two: skipped: another host is ticking this scope\n\
              github:o/idle: nothing to launch\n\
@@ -729,6 +839,12 @@ mod tests {
                         {"ticket": "GH-5", "action": "launch_failed", "sha": "cde3456", "error": "no such file"},
                         {"ticket": "GH-6", "action": "checks_unavailable", "sha": null, "error": "rate limited"},
                     ],
+                    "auto_merges": [
+                        {"ticket": "GH-9", "action": "started", "sha": "fed9876543", "run_id": 41, "error": null},
+                        {"ticket": "GH-10", "action": "launch_failed", "sha": "edc8765", "run_id": null, "error": "no tm"},
+                        {"ticket": null, "action": "prs_unavailable", "sha": null, "run_id": null, "error": "gh down"},
+                        {"ticket": "GH-11", "action": "prs_unavailable", "sha": null, "run_id": null, "error": "rate limited"},
+                    ],
                     "error": null,
                 },
                 {
@@ -738,6 +854,7 @@ mod tests {
                     "skipped": null,
                     "notified": [],
                     "ci_fixes": [],
+                    "auto_merges": [],
                     "error": "no repo recorded for github:o/two; run `tm dispatch on` inside it once",
                 },
             ])
@@ -1068,6 +1185,74 @@ mod tests {
 
         assert!(
             out.starts_with("github:o/one: on, 2 lanes running (GH-1, GH-OLD), "),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn status_shows_a_running_or_the_last_automerge() {
+        let (_dir, store) = store();
+        store.set_autopilot(ONE, true).unwrap();
+        store.set_autopilot(TWO, true).unwrap();
+        let merge = |ticket: &str, scope: &str| {
+            store
+                .start_run(&StartRun {
+                    ticket: ticket.to_string(),
+                    scope: scope.to_string(),
+                    lane: AUTO_MERGE_KIND.to_string(),
+                    worktree: format!("/wt/{ticket}"),
+                    branch: None,
+                    pid: None,
+                    kind: AUTO_MERGE_KIND.to_string(),
+                    log_path: None,
+                })
+                .unwrap()
+        };
+        let running = merge("GH-3", ONE);
+        let failed = merge("GH-4", TWO);
+        crate::work::auto_merge::finish(&store, failed, &Err("checks failed".to_string())).unwrap();
+
+        let out = text(|out| status(&store, 0, out).unwrap());
+
+        assert!(
+            out.contains(&format!("\n  automerge running: GH-3 (run {running})\n")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "\n  last automerge: GH-4 failed (run {failed}): checks failed\n"
+            )),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn status_shows_a_landed_automerge_as_merged() {
+        let (_dir, store) = store();
+        store.set_autopilot(ONE, true).unwrap();
+        let merged = store
+            .start_run(&StartRun {
+                ticket: "GH-3".to_string(),
+                scope: ONE.to_string(),
+                lane: AUTO_MERGE_KIND.to_string(),
+                worktree: "/wt/GH-3".to_string(),
+                branch: None,
+                pid: None,
+                kind: AUTO_MERGE_KIND.to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        crate::work::auto_merge::finish(
+            &store,
+            merged,
+            &Ok(crate::work::merge::MergeFlowOutcome::Merged),
+        )
+        .unwrap();
+
+        let out = text(|out| status(&store, 0, out).unwrap());
+
+        assert!(
+            out.ends_with(&format!("  last automerge: GH-3 merged (run {merged})\n")),
             "{out}"
         );
     }
