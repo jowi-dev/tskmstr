@@ -69,7 +69,7 @@ use thiserror::Error;
 use crate::agent::{AgentInvocation, AgentRunner, InvocationInputs, RunMode, shell_quote};
 use crate::cli::pr::{PrCliError, resolve_watch_repo_root};
 use crate::config::{BackendIdentity, LaneConfig, MergeConfig, MergeStrategy};
-use crate::github::gh_cli::{ChecksState, GhCli, GhError, PrChecks, RepoMergeMethod};
+use crate::github::gh_cli::{ChecksState, CommitPull, GhCli, GhError, PrChecks, RepoMergeMethod};
 use crate::github::pr::{find_issue_key, find_pr_for_ticket};
 use crate::runs::pid::pid_alive;
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
@@ -443,13 +443,134 @@ fn ensure_base_not_red(
     }
 }
 
-/// Substitutes `{key}`, `{branch}`, and `{base}` in `template`, producing
-/// the prompt text handed to the conflict-resolution agent session.
-pub fn conflict_prompt(template: &str, key: &str, branch: &str, base: &str) -> String {
+/// Substitutes `{key}`, `{branch}`, `{base}`, and `{upstream_context}` in
+/// `template`, producing the prompt text handed to the conflict-resolution
+/// agent session. `upstream_context` is the rendered list of upstream pull
+/// requests ([`upstream_context`]); a template without the placeholder is
+/// unaffected by it.
+pub fn conflict_prompt(
+    template: &str,
+    key: &str,
+    branch: &str,
+    base: &str,
+    upstream_context: &str,
+) -> String {
     template
         .replace("{key}", key)
         .replace("{branch}", branch)
         .replace("{base}", base)
+        .replace("{upstream_context}", upstream_context)
+}
+
+/// The most bytes the `{upstream_context}` placeholder carries, across every
+/// pull request (and, in a batch, every ticket). Bodies are trimmed to share
+/// it, the way [`crate::work::ci_fix::LOG_LIMIT_BYTES`] caps failure logs.
+pub const UPSTREAM_CONTEXT_LIMIT_BYTES: usize = 12_000;
+
+/// The `{upstream_context}` text when no upstream pull request touched the
+/// conflicted files.
+const NO_UPSTREAM_PRS: &str =
+    "No pull requests merged into the base since this branch was cut changed the conflicted files.";
+
+/// Renders `{upstream_context}` for one conflicted rebase in `dir`: the pull
+/// requests behind the upstream commits that touched the conflicted files
+/// (GitHub issue #246).
+///
+/// The commits are those in `<pre_rebase_rev>..origin/<base>` touching any of
+/// `conflicted` ([`GitOps::commits_touching`]), so only work that landed on
+/// the base after the branch was cut. Each maps to its pull requests through
+/// [`GhCli::commit_pulls`]; a PR reached by several commits is listed once.
+/// A lookup failure is not fatal: the text then says the context is
+/// unavailable and why, and the session opens anyway.
+fn upstream_context(
+    deps: &MergeDeps<'_>,
+    dir: &Path,
+    pre_rebase_rev: &str,
+    base: &str,
+    conflicted: &[String],
+    limit: usize,
+) -> String {
+    match upstream_pulls(deps, dir, pre_rebase_rev, base, conflicted) {
+        Ok(pulls) => render_upstream_context(&pulls, limit),
+        Err(err) => format!(
+            "Upstream pull request context is unavailable ({err}); work out the intent of \
+             the base's changes from the diff."
+        ),
+    }
+}
+
+/// The deduplicated pull requests behind [`upstream_context`]'s commits, in
+/// commit order (newest first).
+fn upstream_pulls(
+    deps: &MergeDeps<'_>,
+    dir: &Path,
+    pre_rebase_rev: &str,
+    base: &str,
+    conflicted: &[String],
+) -> Result<Vec<CommitPull>, String> {
+    let shas = deps
+        .git
+        .commits_touching(dir, pre_rebase_rev, &format!("origin/{base}"), conflicted)
+        .map_err(|err| err.to_string())?;
+    let mut pulls: Vec<CommitPull> = Vec::new();
+    for sha in shas {
+        for pull in deps
+            .gh
+            .commit_pulls(dir, &sha)
+            .map_err(|err| err.to_string())?
+        {
+            if !pulls.iter().any(|seen| seen.number == pull.number) {
+                pulls.push(pull);
+            }
+        }
+    }
+    Ok(pulls)
+}
+
+/// Formats `pulls` as one `- PR #N: title` entry each, with the body
+/// indented beneath it. Bodies share `limit` bytes evenly; a longer body
+/// keeps its start and ends with a trim marker.
+fn render_upstream_context(pulls: &[CommitPull], limit: usize) -> String {
+    if pulls.is_empty() {
+        return NO_UPSTREAM_PRS.to_string();
+    }
+    let per_body = limit / pulls.len();
+    let entries: Vec<String> = pulls
+        .iter()
+        .map(|pull| {
+            let mut entry = format!("- PR #{}: {}\n", pull.number, pull.title.trim());
+            let body = trim_body(pull.body.trim(), per_body);
+            for line in body.lines() {
+                if !line.is_empty() {
+                    entry.push_str("  ");
+                }
+                entry.push_str(line);
+                entry.push('\n');
+            }
+            entry
+        })
+        .collect();
+    format!(
+        "Pull requests merged into the base that changed the conflicted files:\n\n{}",
+        entries.join("\n")
+    )
+}
+
+/// Keeps the first `limit` bytes of `body` (cut back to a char boundary),
+/// marking how much was dropped.
+fn trim_body(body: &str, limit: usize) -> String {
+    if body.len() <= limit {
+        return body.to_string();
+    }
+    let mut end = limit;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[... {} bytes trimmed ...]",
+        body[..end].trim_end(),
+        body.len() - end
+    )
 }
 
 /// Locates a local checkout of `branch`, trying candidates in priority
@@ -589,7 +710,22 @@ fn run_conflict_session(
             .to_string(),
         },
     };
-    let prompt = conflict_prompt(&template, key, branch, base);
+    let conflicted = deps.git.conflicted_files(dir)?;
+    // Only a template that uses the placeholder pays for the git and gh
+    // lookups.
+    let context = if template.contains("{upstream_context}") {
+        upstream_context(
+            deps,
+            dir,
+            pre_rebase_rev,
+            base,
+            &conflicted,
+            UPSTREAM_CONTEXT_LIMIT_BYTES,
+        )
+    } else {
+        String::new()
+    };
+    let prompt = conflict_prompt(&template, key, branch, base, &context);
     let admitted = admit_conflict_session(deps, &prepared.repo_root, out)?;
     let run_id = start_conflict_run(deps, key, Some(branch), dir, &prepared.repo_root);
     let prompt = with_registration(run_id, key, prompt);
@@ -601,6 +737,7 @@ fn run_conflict_session(
         prepared,
         dir,
         pre_rebase_rev,
+        conflicted.len(),
         run_id,
         out,
     );
@@ -659,6 +796,7 @@ fn open_and_poll_conflict_session(
     prepared: &PreparedMerge,
     dir: &Path,
     pre_rebase_rev: &str,
+    conflicted_count: usize,
     run_id: Option<i64>,
     out: &mut dyn Write,
 ) -> Result<ConflictOutcome, MergeError> {
@@ -670,11 +808,9 @@ fn open_and_poll_conflict_session(
         inside_tmux,
     } = &session;
 
-    let conflicted = deps.git.conflicted_files(dir)?;
     writeln!(
         out,
-        "conflicts in {} files; opening agent session (window {target}:{window})",
-        conflicted.len()
+        "conflicts in {conflicted_count} files; opening agent session (window {target}:{window})"
     )?;
     if !inside_tmux {
         writeln!(out, "attach: tmux attach -t {target}")?;
@@ -1500,6 +1636,30 @@ fn batch_ticket_list(
         .join("\n")
 }
 
+/// Renders the batch prompt's `{upstream_context}` placeholder: one
+/// `<KEY> upstream context:` section per ticket, each built like a single
+/// ticket's [`upstream_context`], sharing [`UPSTREAM_CONTEXT_LIMIT_BYTES`].
+fn batch_upstream_context(
+    deps: &MergeDeps<'_>,
+    tickets: &[(PreparedMerge, PendingConflict)],
+) -> Result<String, MergeError> {
+    let limit = UPSTREAM_CONTEXT_LIMIT_BYTES / tickets.len().max(1);
+    let mut sections = Vec::new();
+    for (prepared, conflict) in tickets {
+        let conflicted = deps.git.conflicted_files(&conflict.dir)?;
+        let context = upstream_context(
+            deps,
+            &conflict.dir,
+            &conflict.pre_rebase_rev,
+            &prepared.base,
+            &conflicted,
+            limit,
+        );
+        sections.push(format!("{} upstream context:\n{context}", prepared.key));
+    }
+    Ok(sections.join("\n\n"))
+}
+
 /// Opens the one agent window shared by every set-aside ticket, then polls
 /// them all. Returns one flag per ticket, in order (`true` if its rebase
 /// resolved), plus the tmux session the shared window was opened in.
@@ -1531,6 +1691,14 @@ fn run_batch_conflict_session(
         .to_string(),
     };
     let prompt = template.replace("{ticket_list}", &batch_ticket_list(strategy, tickets));
+    let prompt = if prompt.contains("{upstream_context}") {
+        prompt.replace(
+            "{upstream_context}",
+            &batch_upstream_context(deps, tickets)?,
+        )
+    } else {
+        prompt
+    };
 
     // The window opens in the first ticket's checkout; the prompt names
     // every other ticket's directory explicitly.
@@ -3027,12 +3195,130 @@ mod tests {
     #[test]
     fn conflict_prompt_substitutes_every_placeholder() {
         let rendered = conflict_prompt(
-            "resolve {key} on {branch} onto {base}",
+            "resolve {key} on {branch} onto {base}\n{upstream_context}",
             "PROJ-1",
             "proj-1-fix",
             "main",
+            "- PR #12: Split config",
         );
-        assert_eq!(rendered, "resolve PROJ-1 on proj-1-fix onto main");
+        assert_eq!(
+            rendered,
+            "resolve PROJ-1 on proj-1-fix onto main\n- PR #12: Split config"
+        );
+    }
+
+    // --- upstream context ---
+
+    fn commit_pull(number: u64, title: &str, body: &str) -> CommitPull {
+        CommitPull {
+            number,
+            title: title.to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn render_upstream_context_lists_each_pr_with_its_indented_body() {
+        let rendered = render_upstream_context(
+            &[
+                commit_pull(12, "Split config", "Why:\nit grew"),
+                commit_pull(13, "No body", ""),
+            ],
+            UPSTREAM_CONTEXT_LIMIT_BYTES,
+        );
+
+        assert_eq!(
+            rendered,
+            "Pull requests merged into the base that changed the conflicted files:\n\n\
+             - PR #12: Split config\n  Why:\n  it grew\n\n\
+             - PR #13: No body\n"
+        );
+    }
+
+    #[test]
+    fn render_upstream_context_trims_bodies_to_share_the_size_cap() {
+        let long = "x".repeat(10_000);
+        let pulls = [commit_pull(1, "a", &long), commit_pull(2, "b", &long)];
+
+        let rendered = render_upstream_context(&pulls, 2_000);
+
+        assert!(rendered.len() < 2_500, "{}", rendered.len());
+        assert_eq!(
+            rendered.matches("bytes trimmed ...]").count(),
+            2,
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_upstream_context_with_no_pulls_says_so() {
+        assert_eq!(
+            render_upstream_context(&[], UPSTREAM_CONTEXT_LIMIT_BYTES),
+            NO_UPSTREAM_PRS
+        );
+    }
+
+    #[test]
+    fn conflict_prompt_lists_the_upstream_prs_that_touched_the_conflicted_files() {
+        let mut fx = resolving_conflict_fixture();
+        fx.merge_cfg.prompt = Some("CONTEXT\n{upstream_context}".to_string());
+        fx.git = std::mem::take(&mut fx.git)
+            .with_commits_touching_result(Ok(vec!["s1".to_string(), "s2".to_string()]));
+        fx.gh = std::mem::take(&mut fx.gh)
+            .with_commit_pulls("s1", Ok(vec![commit_pull(12, "Split config", "Why")]))
+            .with_commit_pulls(
+                "s2",
+                Ok(vec![
+                    commit_pull(12, "Split config", "Why"),
+                    commit_pull(13, "Rename section", ""),
+                ]),
+            );
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert_eq!(
+            fx.git.commits_touching_calls(),
+            vec![(
+                "aaa".to_string(),
+                "origin/main".to_string(),
+                vec!["a.rs".to_string()]
+            )]
+        );
+        let prompt = conflict_prompt_file(&fx, "PROJ-1");
+        assert_eq!(
+            prompt.matches("PR #12: Split config").count(),
+            1,
+            "{prompt}"
+        );
+        assert!(prompt.contains("PR #13: Rename section"), "{prompt}");
+        assert!(!prompt.contains("{upstream_context}"), "{prompt}");
+    }
+
+    #[test]
+    fn conflict_session_still_opens_when_the_upstream_lookup_fails() {
+        let mut fx = resolving_conflict_fixture();
+        fx.merge_cfg.prompt = Some("CONTEXT\n{upstream_context}".to_string());
+        fx.git =
+            std::mem::take(&mut fx.git).with_commits_touching_result(Ok(vec!["s1".to_string()]));
+        fx.gh = std::mem::take(&mut fx.gh).with_commit_pulls(
+            "s1",
+            Err(GhError::Command {
+                command: "gh api commits/pulls".to_string(),
+                exit_code: Some(1),
+                stderr: "HTTP 502".to_string(),
+            }),
+        );
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        let prompt = conflict_prompt_file(&fx, "PROJ-1");
+        assert!(
+            prompt.contains("Upstream pull request context is unavailable"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("HTTP 502"), "{prompt}");
     }
 
     // --- happy path, no rebase needed ---
@@ -4814,6 +5100,34 @@ mod tests {
             prompt.contains("PROJ-1") && prompt.contains("PROJ-2"),
             "{prompt}"
         );
+    }
+
+    #[test]
+    fn batch_conflict_prompt_substitutes_upstream_context_per_ticket() {
+        let mut fx = batch_fixture(&[BatchTicket::Conflict { resolves: true }; 2]);
+        fx.merge_cfg.batch_conflict_prompt =
+            Some("CUSTOM BATCH\n{ticket_list}\n{upstream_context}".to_string());
+        fx.git =
+            std::mem::take(&mut fx.git).with_commits_touching_result(Ok(vec!["s1".to_string()]));
+        fx.gh = std::mem::take(&mut fx.gh)
+            .with_commit_pulls("s1", Ok(vec![commit_pull(12, "Split config", "Why")]));
+
+        let (result, _out) = run_batch(&fx.deps(), &keys(2));
+
+        result.expect("batch should succeed");
+        let prompt = batch_prompt(&fx);
+        assert!(!prompt.contains("{upstream_context}"), "{prompt}");
+        assert!(prompt.contains("PROJ-1 upstream context:\n"), "{prompt}");
+        assert!(prompt.contains("PROJ-2 upstream context:\n"), "{prompt}");
+        assert_eq!(
+            prompt.matches("PR #12: Split config").count(),
+            2,
+            "{prompt}"
+        );
+        let calls = fx.git.commits_touching_calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].0, "old-1");
+        assert_eq!(calls[1].0, "old-2");
     }
 
     #[test]

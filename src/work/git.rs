@@ -2821,7 +2821,12 @@ mod tests {
         let fake = FakeGitOps::new().with_commits_touching_result(Ok(vec!["abc".to_string()]));
 
         let shas = fake
-            .commits_touching(Path::new("/wt"), "pre", "origin/main", &["a.rs".to_string()])
+            .commits_touching(
+                Path::new("/wt"),
+                "pre",
+                "origin/main",
+                &["a.rs".to_string()],
+            )
             .unwrap();
 
         assert_eq!(shas, vec!["abc"]);
@@ -2833,10 +2838,12 @@ mod tests {
                 vec!["a.rs".to_string()]
             )]
         );
-        assert!(FakeGitOps::new()
-            .commits_touching(Path::new("/wt"), "a", "b", &[])
-            .unwrap()
-            .is_empty());
+        assert!(
+            FakeGitOps::new()
+                .commits_touching(Path::new("/wt"), "a", "b", &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // --- ShellGitOps integration tests against a real temp git repo ---
@@ -2908,10 +2915,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(shas, vec![tip, first_a]);
-        assert!(ops
-            .commits_touching(dir, "lane", "main", &[])
-            .unwrap()
-            .is_empty());
+        assert!(
+            ops.commits_touching(dir, "lane", "main", &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
