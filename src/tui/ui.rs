@@ -1049,6 +1049,9 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
                     auto_review_style(import),
                 ));
             }
+            if row.awaiting_reply {
+                spans.push(Span::styled("  chat?", theme::AWAITING_INPUT));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -1157,6 +1160,9 @@ fn draw_overview_columns(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 if let Some(import) = &row.review_import {
                     detail.push_str(&format!("  gh {import}"));
+                }
+                if row.awaiting_reply {
+                    detail.push_str("  chat?");
                 }
                 ListItem::new(vec![
                     Line::from(vec![
@@ -1425,18 +1431,86 @@ fn draw_run_detail_window(frame: &mut Frame, app: &App, runner: &dyn AgentRunner
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let chat_height = detail.chat.as_ref().map_or(0, chat_panel_height);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(header_grid_height(detail)),
             Constraint::Length(MIDDLE_ROW_HEIGHT),
+            Constraint::Length(chat_height),
             Constraint::Min(0),
         ])
         .split(inner);
 
     draw_header_grid(frame, rows[0], detail);
     draw_middle_row(frame, rows[1], detail);
-    draw_events_panel(frame, rows[2], detail, app.run_detail_scroll, runner);
+    if let Some(chat) = &detail.chat {
+        draw_chat_panel(frame, rows[2], chat);
+    }
+    draw_events_panel(frame, rows[3], detail, app.run_detail_scroll, runner);
+}
+
+/// The most chat messages the run detail window shows; older ones scroll
+/// off the top, so the panel never crowds out the event timeline.
+const CHAT_PANEL_MAX_MESSAGES: usize = 6;
+
+/// The chat panel's height: one row per shown message (at least one, for
+/// the placeholder) plus the top and bottom border.
+fn chat_panel_height(chat: &crate::work::thatch_chat::LaneChat) -> u16 {
+    chat.messages.len().clamp(1, CHAT_PANEL_MAX_MESSAGES) as u16 + 2
+}
+
+/// The chat panel's content (GitHub issue #223): the newest
+/// [`CHAT_PANEL_MAX_MESSAGES`] messages, oldest first, each as
+/// `HH:MM:SS -> peer: body` for one the lane sent and `HH:MM:SS <- peer:
+/// body` for one it received. Times are thatch's UTC timestamps; bodies
+/// are flattened to one line.
+fn chat_panel_lines(chat: &crate::work::thatch_chat::LaneChat) -> Vec<Line<'static>> {
+    if chat.messages.is_empty() {
+        return vec![Line::from(Span::styled("no messages", theme::DIM))];
+    }
+    let skip = chat.messages.len().saturating_sub(CHAT_PANEL_MAX_MESSAGES);
+    chat.messages
+        .iter()
+        .skip(skip)
+        .map(|message| {
+            let (arrow, peer) = if message.from == chat.name {
+                ("->", &message.to)
+            } else {
+                ("<-", &message.from)
+            };
+            let time = message.at.get(11..19).unwrap_or(&message.at);
+            let body = message
+                .body
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            Line::from(vec![
+                Span::styled(format!("{time} {arrow} "), theme::DIM),
+                Span::styled(format!("{peer}: "), theme::CARD_KEY),
+                Span::raw(body),
+            ])
+        })
+        .collect()
+}
+
+/// Draws the chat panel: bordered, titled `"Chat {name}"`, with an
+/// `(awaiting reply)` marker while the lane has an unanswered message (see
+/// [`crate::work::thatch_chat::awaiting_reply`]).
+fn draw_chat_panel(frame: &mut Frame, area: Rect, chat: &crate::work::thatch_chat::LaneChat) {
+    let mut title = vec![Span::styled(
+        format!("Chat {}", chat.name),
+        theme::SECTION_HEADER,
+    )];
+    if chat.awaiting_reply() {
+        title.push(Span::styled(" (awaiting reply)", theme::AWAITING_INPUT));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(title));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(chat_panel_lines(chat)), inner);
 }
 
 /// The run-detail window's title: `Run {id}: {ticket}` for the common `lane`
@@ -4477,6 +4551,7 @@ mod tests {
             agent_usage: vec![],
             mem_current_bytes: None,
             mem_peak_bytes: None,
+            chat: None,
         };
         let app = App {
             show_run_detail: true,
@@ -4520,6 +4595,7 @@ mod tests {
             agent_usage: vec![],
             mem_current_bytes: None,
             mem_peak_bytes: None,
+            chat: None,
         }
     }
 
@@ -4756,6 +4832,120 @@ mod tests {
         assert!(!text.contains("Agent usage"));
     }
 
+    fn chat_message(
+        id: i64,
+        at: &str,
+        from: &str,
+        to: &str,
+        body: &str,
+    ) -> crate::work::thatch_chat::ChatMessage {
+        crate::work::thatch_chat::ChatMessage {
+            id,
+            at: at.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+            body: body.to_string(),
+            broadcast: false,
+            read: false,
+        }
+    }
+
+    #[test]
+    fn run_detail_overlay_renders_the_lanes_chat_with_time_and_peer() {
+        let detail = crate::tui::app::RunDetail {
+            chat: Some(crate::work::thatch_chat::LaneChat {
+                name: "lane-00007".to_string(),
+                messages: vec![
+                    chat_message(
+                        1,
+                        "2026-11-19T10:00:05Z",
+                        "lane-00007",
+                        "coord-00001",
+                        "which base?",
+                    ),
+                    chat_message(
+                        2,
+                        "2026-11-19T10:02:09Z",
+                        "coord-00001",
+                        "lane-00007",
+                        "main",
+                    ),
+                ],
+            }),
+            ..run_detail_fixture()
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Chat lane-00007"));
+        assert!(
+            !text.contains("awaiting reply"),
+            "the lane's question was answered"
+        );
+        assert!(
+            text.contains("10:00:05 -> coord-00001: which base?"),
+            "{text}"
+        );
+        assert!(text.contains("10:02:09 <- coord-00001: main"), "{text}");
+    }
+
+    #[test]
+    fn run_detail_overlay_titles_the_chat_awaiting_reply_when_unanswered() {
+        let detail = crate::tui::app::RunDetail {
+            chat: Some(crate::work::thatch_chat::LaneChat {
+                name: "lane-00007".to_string(),
+                messages: vec![chat_message(
+                    1,
+                    "2026-11-19T10:00:05Z",
+                    "lane-00007",
+                    "coord-00001",
+                    "which base?",
+                )],
+            }),
+            ..run_detail_fixture()
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Chat lane-00007 (awaiting reply)"), "{text}");
+    }
+
+    #[test]
+    fn run_detail_overlay_with_an_empty_chat_says_no_messages() {
+        let detail = crate::tui::app::RunDetail {
+            chat: Some(crate::work::thatch_chat::LaneChat {
+                name: "lane-00007".to_string(),
+                messages: vec![],
+            }),
+            ..run_detail_fixture()
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Chat lane-00007"));
+        assert!(text.contains("no messages"));
+    }
+
+    #[test]
+    fn run_detail_overlay_without_chat_has_no_chat_section() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(run_detail_fixture()),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("Chat "));
+    }
+
     #[test]
     fn run_detail_overlay_with_no_tool_events_has_no_tools_line() {
         let app = App {
@@ -4791,6 +4981,7 @@ mod tests {
             agent_usage: vec![],
             mem_current_bytes: None,
             mem_peak_bytes: None,
+            chat: None,
         }
     }
 
@@ -5017,6 +5208,7 @@ mod tests {
             auto_review_round: None,
             review_import: None,
             fix_rounds: 0,
+            awaiting_reply: false,
         }
     }
 
@@ -5117,6 +5309,36 @@ mod tests {
         };
         let text = buffer_text(&render_with_size(&app, 240, 24));
         assert!(text.contains("gh fix"), "{text}");
+    }
+
+    #[test]
+    fn overview_rows_show_a_chat_badge_while_awaiting_a_reply_in_both_layouts() {
+        let row = OverviewRow {
+            awaiting_reply: true,
+            ..overview_row("github:me/alpha", "GH-1", Stage::NeedsInput)
+        };
+        let app = overview_app(vec![row.clone()]);
+        let text = buffer_text(&render_with_size(&app, 120, 24));
+        let line = text.lines().nth(line_of(&text, "GH-1").unwrap()).unwrap();
+        assert!(line.contains("chat?"), "{line}");
+
+        let app = App {
+            overview_layout: OverviewLayout::Columns,
+            ..overview_app(vec![row])
+        };
+        let text = buffer_text(&render_with_size(&app, 240, 24));
+        assert!(text.contains("chat?"), "{text}");
+    }
+
+    #[test]
+    fn overview_rows_have_no_chat_badge_when_not_awaiting_a_reply() {
+        let app = overview_app(vec![overview_row(
+            "github:me/alpha",
+            "GH-1",
+            Stage::Running,
+        )]);
+        let text = buffer_text(&render_with_size(&app, 120, 24));
+        assert!(!text.contains("chat?"), "{text}");
     }
 
     #[test]

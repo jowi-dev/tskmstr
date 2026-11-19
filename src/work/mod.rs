@@ -11,6 +11,7 @@ pub mod auto_review;
 pub mod autopilot;
 pub mod bugbot;
 pub mod build_slots;
+pub mod chat_wake;
 pub mod ci_fix;
 pub mod comment_store;
 pub mod copy_dirs;

@@ -229,6 +229,12 @@ mod tests {
         fn capture_pane(&self, _: &str, _: &str) -> Result<String, TmuxError> {
             Err(Self::error())
         }
+        fn send_keys(&self, _: &str, _: &str, _: &str) -> Result<(), TmuxError> {
+            Err(Self::error())
+        }
+        fn session_attached(&self, _: &str) -> Result<bool, TmuxError> {
+            Err(Self::error())
+        }
         fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
             Ok(Vec::new())
         }
