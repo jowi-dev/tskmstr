@@ -4476,6 +4476,7 @@ mod tests {
             agent_usage: vec![],
             mem_current_bytes: None,
             mem_peak_bytes: None,
+            chat: None,
         };
         let app = App {
             show_run_detail: true,
@@ -4519,6 +4520,7 @@ mod tests {
             agent_usage: vec![],
             mem_current_bytes: None,
             mem_peak_bytes: None,
+            chat: None,
         }
     }
 
@@ -4790,6 +4792,7 @@ mod tests {
             agent_usage: vec![],
             mem_current_bytes: None,
             mem_peak_bytes: None,
+            chat: None,
         }
     }
 
