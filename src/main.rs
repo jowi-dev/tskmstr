@@ -959,6 +959,26 @@ fn run_work(
                 models: &models,
                 spawner: &spawner,
             };
+            // `--unattended` runs the `tm ready <KEY>` decision first and
+            // fails closed when it cannot be made (GitHub issue #254).
+            let ready_gate = |key: &str| -> Result<(), String> {
+                let cfg = full_config
+                    .as_ref()
+                    .ok_or_else(|| "no tskmstr config loaded".to_string())?;
+                let provider = ticket_provider.as_deref().ok_or_else(|| {
+                    format!(
+                        "no ticket provider: {}",
+                        ticket_provider_error.as_deref().unwrap_or("not configured")
+                    )
+                })?;
+                let mut buf = Vec::new();
+                with_ready_context(cfg, provider, |ready| {
+                    tskmstr::cli::ready::check(ready, key, &mut buf)
+                })
+                .map_err(|err| err.to_string())?;
+                print!("{}", String::from_utf8_lossy(&buf));
+                Ok(())
+            };
             let run_deps = tskmstr::cli::work::RunDeps {
                 gh: &gh,
                 spawner: &spawner,
@@ -988,6 +1008,7 @@ fn run_work(
                 usage: &usage,
                 usage_prober: &usage_prober,
                 usage_gate,
+                ready_gate: unattended.then_some(&ready_gate),
             };
             let request = tskmstr::work::run::RunLaneRequest {
                 ticket,
@@ -2325,6 +2346,40 @@ fn ready_audit_gate<'a>(
     }
 }
 
+/// Builds the real [`tskmstr::cli::ready::ReadyContext`] (a `gh` client,
+/// the lane-base containment check, the audit gate, the in-flight runs and
+/// the parent-epic lookup) over `jira` and runs `f` with it. Shared by
+/// `tm ready` and `tm work run --unattended`'s ready gate (GitHub issue
+/// #254) so both make the same decision.
+fn with_ready_context<R>(
+    config: &Config,
+    jira: &dyn TicketProvider,
+    f: impl FnOnce(&tskmstr::cli::ready::ReadyContext<'_>) -> R,
+) -> R {
+    let gh = ShellGhCli::new();
+    let git = ShellGitOps::new();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let containment = tskmstr::blocker_stacking::BaseContainment::new(
+        &git,
+        &cwd,
+        ready_lane_bases(config, &git, &cwd),
+    );
+    let audit_store = open_ready_audit_store(config);
+    let ctx = tskmstr::cli::ready::ReadyContext {
+        jira,
+        gh: &gh,
+        review_bots: &config.review_bots,
+        in_flight: ready_in_flight(config),
+        in_base: &|sha| containment.contains(sha),
+        audit: ready_audit_gate(config, &audit_store),
+        epics: tskmstr::blocker_stacking::ParentEpics::from_provider(
+            jira,
+            config.inherit_epic_blockers,
+        ),
+    };
+    f(&ctx)
+}
+
 /// `tm ready` (no key): needs a Jira client + config, same as the
 /// `TicketCmd::Transition` arm above, plus a `gh` client and the configured
 /// `review_bots` for the best-effort bot-findings/stackability annotations
@@ -2345,33 +2400,14 @@ fn run_ready(
     );
     let config = config::load(paths)?;
     let jira = ticket_provider_for(&config, keychain, env_token)?;
-    let gh = ShellGhCli::new();
-    let git = ShellGitOps::new();
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let containment = tskmstr::blocker_stacking::BaseContainment::new(
-        &git,
-        &cwd,
-        ready_lane_bases(&config, &git, &cwd),
-    );
-    let audit_store = open_ready_audit_store(&config);
-    let ctx = tskmstr::cli::ready::ReadyContext {
-        jira: jira.as_ref(),
-        gh: &gh,
-        review_bots: &config.review_bots,
-        in_flight: ready_in_flight(&config),
-        in_base: &|sha| containment.contains(sha),
-        audit: ready_audit_gate(&config, &audit_store),
-        epics: tskmstr::blocker_stacking::ParentEpics::from_provider(
-            jira.as_ref(),
-            config.inherit_epic_blockers,
-        ),
-    };
     let mut stdout = std::io::stdout();
-    if json {
-        tskmstr::cli::ready::list_json(&ctx, &mut stdout)?;
-    } else {
-        tskmstr::cli::ready::list(&ctx, &mut stdout)?;
-    }
+    with_ready_context(&config, jira.as_ref(), |ctx| {
+        if json {
+            tskmstr::cli::ready::list_json(ctx, &mut stdout)
+        } else {
+            tskmstr::cli::ready::list(ctx, &mut stdout)
+        }
+    })?;
     Ok(())
 }
 
@@ -2457,30 +2493,12 @@ fn run_ready_check(key: String) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let gh = ShellGhCli::new();
-    let git = ShellGitOps::new();
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let containment = tskmstr::blocker_stacking::BaseContainment::new(
-        &git,
-        &cwd,
-        ready_lane_bases(&config, &git, &cwd),
-    );
-    let audit_store = open_ready_audit_store(&config);
-    let ctx = tskmstr::cli::ready::ReadyContext {
-        jira: jira.as_ref(),
-        gh: &gh,
-        review_bots: &config.review_bots,
-        in_flight: ready_in_flight(&config),
-        in_base: &|sha| containment.contains(sha),
-        audit: ready_audit_gate(&config, &audit_store),
-        epics: tskmstr::blocker_stacking::ParentEpics::from_provider(
-            jira.as_ref(),
-            config.inherit_epic_blockers,
-        ),
-    };
     let mut stdout = std::io::stdout();
 
-    match tskmstr::cli::ready::check(&ctx, &key, &mut stdout) {
+    let outcome = with_ready_context(&config, jira.as_ref(), |ctx| {
+        tskmstr::cli::ready::check(ctx, &key, &mut stdout)
+    });
+    match outcome {
         Ok(tskmstr::cli::ready::ReadyOutcome::Ready) => ExitCode::SUCCESS,
         Ok(tskmstr::cli::ready::ReadyOutcome::Stackable) => ExitCode::from(READY_EXIT_STACKABLE),
         Err(err @ tskmstr::cli::ready::ReadyCliError::NotAudited { .. }) => {
@@ -2522,11 +2540,7 @@ const MERGE_EXIT_CONFLICTS: u8 = 2;
 /// [`tskmstr::work::merge::BatchMergeReport::exit_code`] (same three
 /// codes; a failure outranks a hand-back). A single key always takes the
 /// unchanged `run_merge` path.
-fn run_merge_cmd(
-    keys: Vec<String>,
-    allow_red_base: bool,
-    auto_merge_run: Option<i64>,
-) -> ExitCode {
+fn run_merge_cmd(keys: Vec<String>, allow_red_base: bool, auto_merge_run: Option<i64>) -> ExitCode {
     if auto_merge_run.is_some() && keys.len() != 1 {
         eprintln!("--auto-merge-run takes exactly one ticket key");
         return ExitCode::FAILURE;

@@ -1331,6 +1331,12 @@ from the fallback chain unless `allow_paid_fallback` is set. It walks
 the runners the same way the dispatcher does, and refuses, rather than
 warns, only when every runner fails memory or usage admission.
 
+Before anything else, an unattended run makes the same decision as `tm
+ready <KEY>` and refuses, naming the reason, unless the ticket is ready or
+stackable. A ticket that needs an audit, or is blocked, never launches
+unattended, whoever calls it. The refusal happens before any admission
+check, worktree, branch, run row or window is created (GitHub issue #254).
+
 An unattended lane runs interactively, in the ticket's `work` window, so
 you can attach to it like any other lane (GitHub issue #184). Its prompt
 ends by asking the agent to write a done marker once its PR is open, or
