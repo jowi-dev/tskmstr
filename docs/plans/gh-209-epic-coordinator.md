@@ -82,8 +82,8 @@ finishes the lane's row. Memory admission and `max_lanes` apply to every
 blocker stacking and inherited epic blockers, but not the full `tm ready`
 decision (the audit gate in particular). The prompt requires `tm ready` to
 return 0 or 3 before each launch. Making `tm work run --unattended` refuse a
-ticket `tm ready` would not launch is a follow-up, filed separately; it
-would close the gap for the dispatcher's own launches too.
+ticket `tm ready` would not launch is follow-up #254; it would close the
+gap for every unattended launch.
 
 ## Supervision: thatch as the voice
 
@@ -188,6 +188,6 @@ at the board and real tickets, so it happens after this change merges:
 ## Not in this change
 
 - the board start/stop key;
-- `tm work run --unattended` enforcing the full `tm ready` decision;
+- `tm work run --unattended` enforcing the full `tm ready` decision (#254);
 - upstreaming a dispatch-agnostic `thatch-coordination` to thatch;
 - the dogfood run itself.
