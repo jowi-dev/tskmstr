@@ -375,15 +375,9 @@ pub fn roster_args(host_ids: &[String]) -> Vec<String> {
 /// each looked-up host id (thatch echoes it as `host_id`) to its chat name.
 /// Lines that are not roster rows, or rows without `host_id`, are skipped.
 pub fn parse_roster(stdout: &str) -> BTreeMap<String, String> {
-    #[derive(serde::Deserialize)]
-    struct Row {
-        name: String,
-        host_id: Option<String>,
-    }
-    stdout
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Row>(line.trim()).ok())
-        .filter_map(|row| row.host_id.map(|id| (id, row.name)))
+    parse_mailboxes(stdout)
+        .into_iter()
+        .map(|(id, mailbox)| (id, mailbox.name))
         .collect()
 }
 
@@ -391,13 +385,83 @@ pub fn parse_roster(stdout: &str) -> BTreeMap<String, String> {
 /// empty, `thatch` is not installed, or the lookup fails: chat is an extra,
 /// so a thatch problem never breaks the view asking for it.
 pub fn chat_names(runner: &dyn ThatchRunner, host_ids: &[String]) -> BTreeMap<String, String> {
+    mailboxes(runner, host_ids)
+        .into_iter()
+        .map(|(id, mailbox)| (id, mailbox.name))
+        .collect()
+}
+
+/// One session's roster row as the chat wake reads it (GitHub issue #224).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mailbox {
+    /// The session's thatch chat name.
+    pub name: String,
+    /// thatch's `host_kind`: `mcp` for a Claude Code session, `opencode`
+    /// for an opencode one.
+    pub host_kind: String,
+    /// How many messages to the session it has not read yet.
+    pub unread: u64,
+}
+
+impl Mailbox {
+    /// Whether the session reads its mail only when its next prompt
+    /// arrives, so an idle one needs tm to type that prompt. True for
+    /// thatch's `mcp` rows (Claude Code). thatch's opencode plugin wakes
+    /// its own sessions when mail lands, so those are left alone.
+    pub fn reads_at_next_prompt(&self) -> bool {
+        self.host_kind == "mcp"
+    }
+}
+
+/// Parse `thatch chat list --json --host-id ...` output into a map from
+/// each looked-up host id to its [`Mailbox`]. Lines that are not roster
+/// rows, or rows without `host_id`, are skipped.
+pub fn parse_mailboxes(stdout: &str) -> BTreeMap<String, Mailbox> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        name: String,
+        host_id: Option<String>,
+        #[serde(default)]
+        host_kind: String,
+        #[serde(default)]
+        unread: u64,
+    }
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Row>(line.trim()).ok())
+        .filter_map(|row| {
+            let mailbox = Mailbox {
+                name: row.name,
+                host_kind: row.host_kind,
+                unread: row.unread,
+            };
+            row.host_id.map(|id| (id, mailbox))
+        })
+        .collect()
+}
+
+/// Map agent session ids to their [`Mailbox`] in one roster call. Empty
+/// when `host_ids` is empty, `thatch` is not installed, or the lookup
+/// fails.
+pub fn mailboxes(runner: &dyn ThatchRunner, host_ids: &[String]) -> BTreeMap<String, Mailbox> {
     if host_ids.is_empty() || !runner.available() {
         return BTreeMap::new();
     }
     runner
         .run(&roster_args(host_ids))
-        .map(|stdout| parse_roster(&stdout))
+        .map(|stdout| parse_mailboxes(&stdout))
         .unwrap_or_default()
+}
+
+/// The id of the newest unread message addressed to `name` in `messages`,
+/// or `None` when it has none there. The chat wake records it so one batch
+/// of mail wakes a lane once.
+pub fn newest_unread_to(name: &str, messages: &[ChatMessage]) -> Option<i64> {
+    messages
+        .iter()
+        .filter(|message| message.to == name && !message.read)
+        .map(|message| message.id)
+        .max()
 }
 
 /// The arguments for one `thatch chat tail --once` snapshot of the last
@@ -468,8 +532,9 @@ pub fn parse_tail(stdout: &str) -> Vec<ChatMessage> {
     messages
 }
 
-/// Run one tail snapshot, empty on any failure.
-fn tail(runner: &dyn ThatchRunner, filter: Option<(&str, &str)>) -> Vec<ChatMessage> {
+/// Run one tail snapshot (the last [`TAIL_LIMIT`] messages, narrowed by
+/// `filter` as in [`tail_args`]), empty on any failure.
+pub fn tail(runner: &dyn ThatchRunner, filter: Option<(&str, &str)>) -> Vec<ChatMessage> {
     runner
         .run(&tail_args(filter))
         .map(|stdout| parse_tail(&stdout))
@@ -672,6 +737,50 @@ Broadcast from jowi-dev to 2 of 4 registered sessions (projects: jowi-dev/tskmst
     fn parse_roster_skips_rows_without_a_host_id_and_junk_lines() {
         let stdout = "[thatch] a banner line\n{\"name\":\"x\",\"session_id\":\"s\"}\n";
         assert!(parse_roster(stdout).is_empty());
+    }
+
+    #[test]
+    fn parse_mailboxes_reads_each_rows_unread_count_and_host_kind() {
+        let boxes = parse_mailboxes(ROSTER);
+        assert_eq!(
+            boxes.get("sess-a"),
+            Some(&Mailbox {
+                name: "npc-4-00008".to_string(),
+                host_kind: "mcp".to_string(),
+                unread: 0,
+            })
+        );
+        assert_eq!(boxes.get("ses_raw").map(|b| b.unread), Some(2));
+        assert_eq!(boxes.len(), 2);
+    }
+
+    #[test]
+    fn only_mcp_sessions_wait_for_their_next_prompt_to_read_mail() {
+        let boxes = parse_mailboxes(ROSTER);
+        assert!(boxes["sess-a"].reads_at_next_prompt());
+        assert!(
+            !boxes["ses_raw"].reads_at_next_prompt(),
+            "thatch's opencode plugin wakes opencode sessions itself"
+        );
+    }
+
+    #[test]
+    fn mailboxes_is_empty_without_thatch_and_never_runs_it() {
+        let runner = FakeThatchRunner::missing();
+        assert!(mailboxes(&runner, &["sess-a".to_string()]).is_empty());
+        assert!(runner.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn newest_unread_to_picks_the_latest_unread_message_addressed_to_the_lane() {
+        let messages = [
+            msg(1, "t1", "boss", "lane", "old", true),
+            msg(2, "t2", "boss", "lane", "new", false),
+            msg(3, "t3", "lane", "boss", "mine", false),
+            msg(4, "t4", "boss", "other", "not ours", false),
+        ];
+        assert_eq!(newest_unread_to("lane", &messages), Some(2));
+        assert_eq!(newest_unread_to("nobody", &messages), None);
     }
 
     #[test]
