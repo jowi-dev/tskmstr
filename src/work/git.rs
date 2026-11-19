@@ -200,10 +200,16 @@ pub trait GitOps {
     /// Rebase the current branch in the working tree at `dir` onto `onto`
     /// (`git rebase <onto>`).
     ///
-    /// On a clean rebase, returns `Ok(RebaseOutcome::Completed)`. On a
-    /// non-zero exit, checks whether a rebase is now in progress on disk
-    /// (via the same detection [`GitOps::rebase_in_progress`] uses): if so,
-    /// returns `Ok(RebaseOutcome::Conflicted)` and **leaves the rebase in
+    /// The rebase runs with git's rerere ("reuse recorded resolution")
+    /// turned on for that command only: a conflict resolved once before is
+    /// resolved and staged again automatically. When rerere resolves every
+    /// conflict in a stop, the rebase is continued (`git rebase
+    /// --continue`) without returning.
+    ///
+    /// On a clean rebase, returns `Ok(RebaseOutcome::Completed)`. When the
+    /// rebase stops with conflicts rerere did not resolve (or on any other
+    /// stop that continuing does not get past), returns
+    /// `Ok(RebaseOutcome::Conflicted)` and **leaves the rebase in
     /// progress on disk** — the caller is responsible for inspecting
     /// [`GitOps::conflicted_files`] and eventually resolving, continuing, or
     /// aborting the rebase. If no rebase is in progress despite the
@@ -599,21 +605,39 @@ impl GitOps for ShellGitOps {
     }
 
     fn rebase_onto(&self, dir: &Path, onto: &str) -> Result<RebaseOutcome, GitError> {
-        let output = run_git(dir, &rebase_onto_args(onto), "git rebase")?;
+        let command = "git rebase";
+        let mut output = run_git_rebase(dir, &rebase_onto_args(onto), command)?;
 
-        if output.status.success() {
-            return Ok(RebaseOutcome::Completed);
+        // Each pass handles one stop. rerere may already have resolved and
+        // staged every conflict in it, in which case tm continues the
+        // rebase itself; any conflict left unresolved goes to the caller.
+        loop {
+            if output.status.success() {
+                return Ok(RebaseOutcome::Completed);
+            }
+            if !self.rebase_in_progress(dir)? {
+                return Err(GitError::Command {
+                    command: command.to_string(),
+                    exit_code: output.status.code(),
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                });
+            }
+            if !self.conflicted_files(dir)?.is_empty() {
+                return Ok(RebaseOutcome::Conflicted);
+            }
+
+            let head_before = self.rev_parse(dir, "HEAD")?;
+            output = run_git_rebase(dir, &rebase_continue_args(), command)?;
+            if !output.status.success()
+                && self.rebase_in_progress(dir)?
+                && self.conflicted_files(dir)?.is_empty()
+                && self.rev_parse(dir, "HEAD")? == head_before
+            {
+                // The stop was not a conflict rerere resolved (continuing
+                // made no progress), so leave it for the caller.
+                return Ok(RebaseOutcome::Conflicted);
+            }
         }
-
-        if self.rebase_in_progress(dir)? {
-            return Ok(RebaseOutcome::Conflicted);
-        }
-
-        Err(GitError::Command {
-            command: "git rebase".to_string(),
-            exit_code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        })
     }
 
     fn rebase_in_progress(&self, dir: &Path) -> Result<bool, GitError> {
@@ -881,9 +905,42 @@ fn is_ancestor_args(ancestor: &str, descendant: &str) -> Vec<String> {
     ]
 }
 
+/// Config overrides for every rebase tm runs: record each conflict
+/// resolution and replay it (staged, via `autoupdate`) when the same
+/// conflict appears again. Passed with `-c` so the user's git config is
+/// never changed. The recorded resolutions live in the common git
+/// directory's `rr-cache`, so every worktree of a repository shares them.
+const RERERE_CONFIG_ARGS: [&str; 4] = ["-c", "rerere.enabled=true", "-c", "rerere.autoupdate=true"];
+
+/// Run a `git rebase` command at `dir` with [`RERERE_CONFIG_ARGS`] and
+/// `GIT_EDITOR=true`, so `--continue` never waits on a commit message
+/// editor.
+fn run_git_rebase(
+    dir: &Path,
+    args: &[String],
+    command: &str,
+) -> Result<std::process::Output, GitError> {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(RERERE_CONFIG_ARGS)
+        .args(args)
+        .env("GIT_EDITOR", "true")
+        .output()
+        .map_err(|err| GitError::Spawn {
+            command: command.to_string(),
+            message: err.to_string(),
+        })
+}
+
 /// Build the argument list for `git rebase <onto>`.
 fn rebase_onto_args(onto: &str) -> Vec<String> {
     vec!["rebase".to_string(), onto.to_string()]
+}
+
+/// Build the argument list for `git rebase --continue`.
+fn rebase_continue_args() -> Vec<String> {
+    vec!["rebase".to_string(), "--continue".to_string()]
 }
 
 /// Build the argument list for `git push --force-with-lease origin
@@ -3101,5 +3158,116 @@ mod tests {
             .status()
             .unwrap();
         assert!(!ops.rebase_in_progress(tmp.path()).unwrap());
+    }
+
+    /// Run `git -C <dir> <args>` in a test, asserting success, and return
+    /// trimmed stdout.
+    fn git_ok(dir: &Path, args: &[&str]) -> String {
+        let output = StdCommand::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_EDITOR", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// A repo where `feature-branch` and `main` both rewrite README.md from
+    /// the same base, so rebasing `feature-branch` onto `main` conflicts.
+    /// Leaves `feature-branch` checked out and returns its tip.
+    fn conflicting_branches(dir: &Path) -> String {
+        git_init(dir);
+        commit_file(dir, "README.md", "base\n", "base content");
+        checkout_new_branch(dir, "feature-branch");
+        commit_file(dir, "README.md", "feature change\n", "feature edit");
+        git_ok(dir, &["checkout", "-q", "main"]);
+        commit_file(dir, "README.md", "main change\n", "main edit");
+        git_ok(dir, &["checkout", "-q", "feature-branch"]);
+        git_ok(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// Resolve the in-progress README.md conflict the way a conflict
+    /// session would: edit, stage, and continue with plain `git` (no
+    /// rerere flags of its own).
+    fn resolve_readme_and_continue(dir: &Path) {
+        std::fs::write(dir.join("README.md"), "resolved\n").unwrap();
+        git_ok(dir, &["add", "README.md"]);
+        git_ok(dir, &["rebase", "--continue"]);
+    }
+
+    #[test]
+    fn shell_git_ops_rebase_onto_replays_recorded_resolution_without_stopping() {
+        let tmp = TempDir::new().unwrap();
+        let pre_rebase = conflicting_branches(tmp.path());
+
+        let ops = ShellGitOps::new();
+        assert_eq!(
+            ops.rebase_onto(tmp.path(), "main").unwrap(),
+            RebaseOutcome::Conflicted
+        );
+        resolve_readme_and_continue(tmp.path());
+
+        // Retry the same rebase from the original tip, as a stale-base
+        // retry or a rerun after an abort would.
+        git_ok(tmp.path(), &["reset", "-q", "--hard", &pre_rebase]);
+        let outcome = ops.rebase_onto(tmp.path(), "main").unwrap();
+
+        assert_eq!(outcome, RebaseOutcome::Completed);
+        assert!(!ops.rebase_in_progress(tmp.path()).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("README.md")).unwrap(),
+            "resolved\n"
+        );
+        assert_eq!(
+            git_ok(tmp.path(), &["rev-parse", "HEAD~1"]),
+            git_ok(tmp.path(), &["rev-parse", "main"])
+        );
+    }
+
+    #[test]
+    fn shell_git_ops_rebase_onto_stops_only_on_conflicts_rerere_did_not_resolve() {
+        let tmp = TempDir::new().unwrap();
+        let pre_rebase = conflicting_branches(tmp.path());
+        let ops = ShellGitOps::new();
+        assert_eq!(
+            ops.rebase_onto(tmp.path(), "main").unwrap(),
+            RebaseOutcome::Conflicted
+        );
+        resolve_readme_and_continue(tmp.path());
+
+        // Back to the original branch plus a second commit that conflicts
+        // with a new upstream change nobody has resolved yet.
+        git_ok(tmp.path(), &["reset", "-q", "--hard", &pre_rebase]);
+        commit_file(tmp.path(), "other.txt", "feature other\n", "feature other");
+        git_ok(tmp.path(), &["checkout", "-q", "main"]);
+        commit_file(tmp.path(), "other.txt", "main other\n", "main other");
+        git_ok(tmp.path(), &["checkout", "-q", "feature-branch"]);
+
+        let outcome = ops.rebase_onto(tmp.path(), "main").unwrap();
+
+        assert_eq!(outcome, RebaseOutcome::Conflicted);
+        assert_eq!(
+            ops.conflicted_files(tmp.path()).unwrap(),
+            vec!["other.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn shell_git_ops_rebase_onto_leaves_repo_git_config_untouched() {
+        let tmp = TempDir::new().unwrap();
+        conflicting_branches(tmp.path());
+        let config_before = std::fs::read_to_string(tmp.path().join(".git/config")).unwrap();
+
+        let ops = ShellGitOps::new();
+        ops.rebase_onto(tmp.path(), "main").unwrap();
+
+        let config_after = std::fs::read_to_string(tmp.path().join(".git/config")).unwrap();
+        assert_eq!(config_before, config_after);
     }
 }
