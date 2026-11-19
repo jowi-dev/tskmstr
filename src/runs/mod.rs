@@ -3131,7 +3131,8 @@ impl RunStore {
                 (SELECT e.detail FROM run_events e
                     WHERE e.run_id = r.id AND e.kind = 'review_import'
                     ORDER BY e.at DESC, e.id DESC LIMIT 1)
-                    AS review_import
+                    AS review_import,
+                r.session_id
              FROM runs r
              ORDER BY r.started_at DESC, r.id DESC";
 
@@ -3157,6 +3158,8 @@ impl RunStore {
                 auto_review_round: row.get(12)?,
                 pr_closed: row.get(13)?,
                 review_import: row.get(14)?,
+                session_id: row.get(15)?,
+                awaiting_reply: false,
                 awaiting_input,
                 state_age_secs: match last_event_age {
                     Some(age) if awaiting_input => age,
@@ -9771,6 +9774,19 @@ mod tests {
             run.heartbeat_age_secs, None,
             "an ended run has no heartbeat age"
         );
+    }
+
+    #[test]
+    fn overview_runs_carries_the_session_id_and_no_chat_signal() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "GH-7", None);
+        store.update_session_id(id, "sess-1").unwrap();
+
+        let run = &store.overview_runs().unwrap()[0];
+
+        assert_eq!(run.session_id.as_deref(), Some("sess-1"));
+        assert!(!run.awaiting_reply, "only the overview loader sets it");
     }
 
     #[test]
