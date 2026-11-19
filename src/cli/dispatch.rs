@@ -213,6 +213,10 @@ fn tick_json(scope: &str, outcome: &TickOutcome) -> serde_json::Value {
             "skipped": report.skipped.map(skip_name),
             "notified": report.notified,
             "ci_fixes": report.ci_fixes.iter().map(ci_fix_json).collect::<Vec<_>>(),
+            "chat_wakes": report.chat_wakes.iter().map(|wake| json!({
+                "ticket": wake.ticket,
+                "run_id": wake.run_id,
+            })).collect::<Vec<_>>(),
             "error": null,
         }),
         TickOutcome::Failed(err) => json!({
@@ -222,6 +226,7 @@ fn tick_json(scope: &str, outcome: &TickOutcome) -> serde_json::Value {
             "skipped": null,
             "notified": [],
             "ci_fixes": [],
+            "chat_wakes": [],
             "error": err,
         }),
     }
@@ -292,6 +297,13 @@ fn write_tick_text(scope: &str, outcome: &TickOutcome, out: &mut dyn Write) -> i
     }
     for action in &report.ci_fixes {
         writeln!(out, "{scope}: {}", ci_fix_text(action))?;
+    }
+    for wake in &report.chat_wakes {
+        writeln!(
+            out,
+            "{scope}: woke {} (run {}) for unread chat mail",
+            wake.ticket, wake.run_id
+        )?;
     }
     for title in &report.notified {
         writeln!(out, "{scope}: notified: {title}")?;
@@ -617,6 +629,10 @@ mod tests {
                     error: "rate limited".to_string(),
                 },
             ],
+            chat_wakes: vec![crate::work::chat_wake::ChatWake {
+                run_id: 41,
+                ticket: "GH-9".to_string(),
+            }],
         }
     }
 
@@ -658,6 +674,7 @@ mod tests {
              github:o/one: ci-fix GH-4 capped (bcd2345)\n\
              github:o/one: ci-fix GH-5 launch failed: no such file\n\
              github:o/one: ci-fix GH-6 checks unavailable: rate limited\n\
+             github:o/one: woke GH-9 (run 41) for unread chat mail\n\
              github:o/one: notified: tm: GH-0 is awaiting your review\n\
              github:o/two: skipped: another host is ticking this scope\n\
              github:o/idle: nothing to launch\n\
@@ -728,6 +745,7 @@ mod tests {
                         {"ticket": "GH-5", "action": "launch_failed", "sha": "cde3456", "error": "no such file"},
                         {"ticket": "GH-6", "action": "checks_unavailable", "sha": null, "error": "rate limited"},
                     ],
+                    "chat_wakes": [{"ticket": "GH-9", "run_id": 41}],
                     "error": null,
                 },
                 {
@@ -737,6 +755,7 @@ mod tests {
                     "skipped": null,
                     "notified": [],
                     "ci_fixes": [],
+                    "chat_wakes": [],
                     "error": "no repo recorded for github:o/two; run `tm dispatch on` inside it once",
                 },
             ])
@@ -823,6 +842,7 @@ mod tests {
                 now: 1_000_000,
                 notifier: &crate::work::notify::NoNotifier,
                 ci: None,
+                chat_wake: None,
             };
             let lanes = [LaneChoice {
                 name: "backend".to_string(),
@@ -837,6 +857,7 @@ mod tests {
                 max_fix_rounds: 3,
                 stall_notify_mins: 30,
                 fix_failing_ci: false,
+                wake_on_chat_mail: false,
                 lanes: &lanes,
                 runners: &["claude"],
                 memory: &memory,

@@ -503,6 +503,10 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             launcher: &ci_launcher,
         };
         let notifier = tskmstr::work::notify::DesktopNotifier::detect();
+        let wake = tskmstr::work::chat_wake::WakeDeps {
+            tmux: &tskmstr::work::tmux::ShellTmuxOps,
+            thatch: &tskmstr::work::thatch_chat::ShellThatchRunner,
+        };
         let deps = tskmstr::work::dispatch::TickDeps {
             store: self.store,
             lock: self.lock,
@@ -513,6 +517,7 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             now: unix_now(),
             notifier: &notifier,
             ci: Some(&ci),
+            chat_wake: Some(&wake),
         };
         let cfg = tskmstr::work::dispatch::TickConfig {
             scope,
@@ -521,6 +526,7 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             max_fix_rounds: config.dispatch.max_fix_rounds,
             stall_notify_mins: config.dispatch.stall_notify_mins,
             fix_failing_ci: config.dispatch.fix_failing_ci,
+            wake_on_chat_mail: config.work.wake_on_chat_mail,
             lanes: &lanes,
             runners: &runners,
             memory: &config.work.memory,
@@ -3184,6 +3190,10 @@ impl AutopilotTicker {
             launcher: &ci_launcher,
         };
         let notifier = tskmstr::work::notify::DesktopNotifier::detect();
+        let wake = tskmstr::work::chat_wake::WakeDeps {
+            tmux: &tskmstr::work::tmux::ShellTmuxOps,
+            thatch: &tskmstr::work::thatch_chat::ShellThatchRunner,
+        };
         let deps = dispatch::TickDeps {
             store: &store,
             lock: &lock,
@@ -3194,6 +3204,7 @@ impl AutopilotTicker {
             now: unix_now(),
             notifier: &notifier,
             ci: Some(&ci),
+            chat_wake: Some(&wake),
         };
         let cfg = dispatch::TickConfig {
             scope: &scope,
@@ -3202,6 +3213,7 @@ impl AutopilotTicker {
             max_fix_rounds: config.dispatch.max_fix_rounds,
             stall_notify_mins: config.dispatch.stall_notify_mins,
             fix_failing_ci: config.dispatch.fix_failing_ci,
+            wake_on_chat_mail: config.work.wake_on_chat_mail,
             lanes: &lanes,
             runners: &runners,
             memory: &config.work.memory,

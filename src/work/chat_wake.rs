@@ -46,6 +46,14 @@ pub const WAKE_EVENT: &str = "chat_wake";
 /// What a wake types into the lane's pane.
 pub const WAKE_PROMPT: &str = "You have unread thatch chat mail; read it and continue.";
 
+/// What [`sweep`] types into panes with and reads mail through.
+pub struct WakeDeps<'a> {
+    /// Types the prompt into the lane's pane.
+    pub tmux: &'a dyn TmuxOps,
+    /// Reads unread counts and messages.
+    pub thatch: &'a dyn ThatchRunner,
+}
+
 /// One lane [`sweep`] woke.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatWake {

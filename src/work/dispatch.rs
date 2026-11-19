@@ -37,7 +37,11 @@
 //!    detached through a [`ci_fix::CiFixLauncher`]. A fix pass is not a
 //!    lane, so it counts against neither `max_lanes` nor the daily cap;
 //!    `tm review ci-fix` applies admission itself.
-//! 8. Sends the desktop notifications the scope owes
+//! 8. With `[work] wake_on_chat_mail` on (the default), runs the chat wake
+//!    ([`chat_wake::sweep`], GitHub issue #224): types a one-line prompt
+//!    into each idle Claude Code lane that has new unread thatch chat
+//!    mail, so the agent reads it.
+//! 9. Sends the desktop notifications the scope owes
 //!    ([`crate::work::notify`]): tickets that entered awaiting review or hit
 //!    the fix-round cap, and a refusal streak older than
 //!    `stall_notify_mins`. Each transition notifies once.
@@ -62,6 +66,7 @@ use crate::work::admission::{
     AdmissionRefusal, RouteRefusal, RunnerRefusal, UsageProber, UsageRefusal, route_unattended,
 };
 use crate::work::auto_review::RoundVerdict;
+use crate::work::chat_wake;
 use crate::work::ci_fix::{self, CiFixAction};
 use crate::work::detach::DetachSpawner;
 use crate::work::notify::{self, Notifier};
@@ -287,6 +292,8 @@ pub struct TickConfig<'a> {
     /// `[dispatch] fix_failing_ci`: run the CI-fix sweep (GitHub issue
     /// #226).
     pub fix_failing_ci: bool,
+    /// `[work] wake_on_chat_mail`: run the chat wake (GitHub issue #224).
+    pub wake_on_chat_mail: bool,
     /// `[dispatch] stall_notify_mins`: how long refusals for one reason
     /// last before a stall notification.
     pub stall_notify_mins: u64,
@@ -327,6 +334,10 @@ pub struct TickDeps<'a> {
     /// What the CI-fix sweep reads PR checks with and launches through.
     /// `None` runs no sweep, whatever [`TickConfig::fix_failing_ci`] says.
     pub ci: Option<&'a ci_fix::SweepDeps<'a>>,
+    /// What the chat wake types into panes with and reads mail through.
+    /// `None` wakes nothing, whatever [`TickConfig::wake_on_chat_mail`]
+    /// says.
+    pub chat_wake: Option<&'a chat_wake::WakeDeps<'a>>,
 }
 
 /// Why a tick did nothing at all.
@@ -471,6 +482,8 @@ pub struct TickReport {
     pub notified: Vec<String>,
     /// What the CI-fix sweep did, one entry per ticket it acted on.
     pub ci_fixes: Vec<CiFixAction>,
+    /// The idle lanes the chat wake typed a prompt into.
+    pub chat_wakes: Vec<chat_wake::ChatWake>,
 }
 
 /// Errors that stop a tick outright.
@@ -587,6 +600,10 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
 
     if let Some(ci) = deps.ci.filter(|_| cfg.fix_failing_ci) {
         report.ci_fixes = ci_fix::sweep(ci, &runs, cfg.scope, cfg.max_fix_rounds)?;
+    }
+
+    if let Some(wake) = deps.chat_wake.filter(|_| cfg.wake_on_chat_mail) {
+        report.chat_wakes = chat_wake::sweep(deps.store, wake.tmux, wake.thatch, &runs, cfg.scope)?;
     }
 
     let mut notices = notify::ticket_notices(&runs, cfg.scope, cfg.max_fix_rounds);
@@ -870,6 +887,9 @@ mod tests {
         stall_notify_mins: u64,
         fix_failing_ci: bool,
         notifier: Recorder,
+        wake_on_chat_mail: bool,
+        tmux: crate::work::tmux::FakeTmuxOps,
+        thatch: crate::work::thatch_chat::FakeThatchRunner,
     }
 
     impl Fixture {
@@ -895,6 +915,9 @@ mod tests {
                 stall_notify_mins: 30,
                 fix_failing_ci: false,
                 notifier: Recorder::default(),
+                wake_on_chat_mail: true,
+                tmux: crate::work::tmux::FakeTmuxOps::new(),
+                thatch: crate::work::thatch_chat::FakeThatchRunner::missing(),
             }
         }
 
@@ -940,6 +963,10 @@ mod tests {
             let source = FakeCandidates(candidates.to_vec(), Cell::new(None));
             let pressure = self.pressure;
             let pressure_fn = move || pressure;
+            let wake = chat_wake::WakeDeps {
+                tmux: &self.tmux,
+                thatch: &self.thatch,
+            };
             let deps = TickDeps {
                 store: &self.store,
                 lock: &lock,
@@ -950,6 +977,7 @@ mod tests {
                 now: self.now,
                 notifier: &self.notifier,
                 ci,
+                chat_wake: Some(&wake),
             };
             let cfg = TickConfig {
                 scope: SCOPE,
@@ -958,6 +986,7 @@ mod tests {
                 max_fix_rounds: self.max_fix_rounds,
                 stall_notify_mins: self.stall_notify_mins,
                 fix_failing_ci: self.fix_failing_ci,
+                wake_on_chat_mail: self.wake_on_chat_mail,
                 lanes: &self.lanes,
                 runners: &self.runners,
                 memory: &self.memory,
@@ -1028,6 +1057,80 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    // --- Chat wake (GitHub issue #224) ---
+
+    /// A running lane for `ticket`, idle at its prompt in tmux session `s`
+    /// window `work`, registered as agent session `sess-1`.
+    fn idle_lane(store: &RunStore, ticket: &str) -> i64 {
+        let id = start(store, ticket, "lane");
+        crate::work::hibernate::record_launch(
+            store,
+            id,
+            &crate::work::hibernate::LaunchRecord {
+                window: "work".to_string(),
+                resume: crate::agent::ResumeSpec {
+                    program: "claude".to_string(),
+                    resume_flag: "--resume".to_string(),
+                    args: Vec::new(),
+                    env_remove: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        store.update_session_id(id, "sess-1").unwrap();
+        store.update_tmux_session(id, "s").unwrap();
+        store.add_event(id, "await", None).unwrap();
+        id
+    }
+
+    /// thatch reporting one unread message (id 3) for agent session `sess-1`.
+    fn mail_for_sess_1() -> crate::work::thatch_chat::FakeThatchRunner {
+        crate::work::thatch_chat::FakeThatchRunner::returning(concat!(
+            r#"{"name":"npc-1","session_id":"x","host_kind":"mcp","unread":1,"host_id":"sess-1"}"#,
+            "\n",
+            r#"{"event":"sent","at":"2026-11-19T00:00:00Z","id":3,"from":"boss","to":"npc-1","body":"hi"}"#,
+            "\n",
+        ))
+    }
+
+    #[test]
+    fn a_tick_wakes_an_idle_lane_with_unread_chat_mail() {
+        let mut fx = Fixture::new();
+        fx.thatch = mail_for_sess_1();
+        let id = idle_lane(&fx.store, "GH-1");
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let report = fx.tick(&[], &launcher);
+
+        assert_eq!(
+            report.chat_wakes,
+            vec![chat_wake::ChatWake {
+                run_id: id,
+                ticket: "GH-1".to_string(),
+            }]
+        );
+        assert!(fx.tmux.calls().iter().any(|call| matches!(
+            call,
+            crate::work::tmux::TmuxCall::SendKeys { name, window, .. }
+                if name == "s" && window == "work"
+        )));
+    }
+
+    #[test]
+    fn with_wake_on_chat_mail_off_thatch_is_never_asked() {
+        let mut fx = Fixture::new();
+        fx.thatch = mail_for_sess_1();
+        fx.wake_on_chat_mail = false;
+        idle_lane(&fx.store, "GH-1");
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let report = fx.tick(&[], &launcher);
+
+        assert!(report.chat_wakes.is_empty());
+        assert!(fx.thatch.calls.borrow().is_empty());
+        assert!(fx.tmux.calls().is_empty());
     }
 
     // --- CI-fix sweep (GitHub issue #226) ---
