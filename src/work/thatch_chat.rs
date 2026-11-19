@@ -149,15 +149,16 @@ impl ThatchRunner for FakeThatchRunner {
 /// saves several `thatch` spawns per reload.
 pub const CHAT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// When a cached call ran, and what it returned.
+type CachedResult = (std::time::Instant, Result<String, ThatchError>);
+
 /// [`ThatchRunner`] that reuses the result of a read-only call (`chat list`,
 /// `chat tail`) made with the same arguments within `ttl`. Every other
 /// call, such as `chat broadcast`, always runs.
 pub struct CachedThatchRunner {
     inner: Box<dyn ThatchRunner>,
     ttl: std::time::Duration,
-    cache: RefCell<
-        std::collections::HashMap<Vec<String>, (std::time::Instant, Result<String, ThatchError>)>,
-    >,
+    cache: RefCell<std::collections::HashMap<Vec<String>, CachedResult>>,
     inner_calls: std::cell::Cell<usize>,
 }
 
