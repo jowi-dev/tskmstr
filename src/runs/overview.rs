@@ -485,7 +485,7 @@ pub fn active_scope_runs(runs: &[OverviewRun], window_secs: i64) -> Vec<Overview
 
 /// Whether a run with `status` is still live: it can still change on its
 /// own or is waiting on the operator to resume it.
-fn is_live(status: RunStatus) -> bool {
+pub fn is_live(status: RunStatus) -> bool {
     matches!(
         status,
         RunStatus::Running | RunStatus::Queued | RunStatus::Hibernated
