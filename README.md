@@ -1298,12 +1298,17 @@ it. A tick:
    lane PR whose checks finished red (see "Fixing failing CI" below). A
    fix pass is not a lane, so it counts against neither `max_lanes` nor
    `max_launches_per_day`.
-8. **Sends desktop notifications** (GitHub issue #121,
+8. **Starts an automerge**, when `auto_merge` is not `off`: one detached
+   `tm merge` for a lane PR whose review is complete, unless the repo
+   already has a merge running (see "Merging automatically" below). A
+   merge is not a lane either.
+9. **Sends desktop notifications** (GitHub issue #121,
    `src/work/notify.rs`) when:
    - a ticket enters "awaiting review": its PR is open, the bots have
      reviewed, and nothing is running;
    - a ticket hits the fix-round cap: auto-review stopped at its round cap,
      or the ticket has `max_fix_rounds` fix passes;
+   - an automerge did not land;
    - the dispatcher has refused for the same reason code for longer than
      `stall_notify_mins`;
    - a lane base branch (each lane's `base_branch`, or the repo's
@@ -1359,6 +1364,7 @@ max_launches_per_day = 20   # default; launches per repo in any rolling 24 hours
 stall_notify_mins = 30      # default; refusing this long for one reason notifies
 max_fix_rounds = 3          # default; automatic fix passes per ticket, every source
 fix_failing_ci = false      # default; start a fix pass when a lane PR's CI fails
+auto_merge = "off"          # default; "approved" or "reviewed" runs tm merge on its own
 ```
 
 #### Running autopilot from the TUI
@@ -2512,6 +2518,54 @@ the lane for review, and sends the fix-cap notification.
 ```toml
 [dispatch]
 # fix_failing_ci = false    # needs autopilot on for the repo
+```
+
+### Merging automatically
+
+**With `[dispatch] auto_merge`, autopilot runs `tm merge` on its own once a
+ticket's review is complete** (GitHub issue #243). It is `"off"` by
+default and only runs while autopilot is on for the repo. The two other
+values say when a review counts as complete:
+
+- **`"approved"`** merges a PR at the overview's Ready to merge: an
+  explicit GitHub approval, no conflicts, and green checks.
+- **`"reviewed"`** also merges a PR at Awaiting review: the review bots and
+  auto-review are done, any cleanup has finished, and nothing is running.
+  **This merges with no human approval at all.** Use it only in a repo
+  where you trust auto-review and CI to stand in for a reviewer.
+
+A PR with a failing check is never merged this way; `fix_failing_ci` owns
+it.
+
+**One merge runs per repo at a time.** Each merge rebases onto the base
+the previous one changed, so a dispatch tick starts nothing while the
+repo has an automerge or a `tm merge` conflict session running. When
+several PRs qualify, the lowest-numbered one goes first.
+
+**One merge runs per head commit.** Before it starts, tm records an
+`auto_merge started <sha> run <id>` event on the lane run, so later ticks
+leave that commit alone. A merge that fails is not retried until the PR's
+head changes, for example after a fix pass pushes.
+
+Each automerge is an `auto-merge` run: `tm dispatch` spawns `tm merge
+<KEY>` detached in the repo, logging to
+`~/.local/state/tskmstr/auto-merge/<key>.log`. Because it is `tm merge`,
+every gate `tm merge` applies holds for it too: the wait for green checks
+on the pushed head, `verify_command`, and the conflict session. The run
+ends `done` when the PR merged. Anything else ends it `failed`, with the
+reason as its blocker, and flags the ticket's lane run for review. That
+covers a conflict session that was handed back, checks still running at
+`checks_timeout_secs`, and any refusal or error. A failed or interrupted
+automerge sends one desktop notification.
+
+`tm dispatch tick` prints the merge it started, and `tm dispatch status`
+shows each repo's newest automerge: running, merged, or failed with its
+reason. The overview shows a running automerge as Running and a failed
+one as Stuck, like any other run.
+
+```toml
+[dispatch]
+# auto_merge = "off"        # or "approved", or "reviewed" (no human approval)
 ```
 
 ### Merging from the board
