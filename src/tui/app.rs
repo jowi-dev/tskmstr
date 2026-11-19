@@ -3750,11 +3750,12 @@ fn cycle_run_kind_filter(mut app: App) -> (App, Vec<Cmd>) {
 }
 
 /// Handle [`Msg::CycleRunScopeFilter`]: like [`cycle_run_kind_filter`], over
-/// the runs' recorded scopes. Legacy unscoped rows (`scope = ""`) are not a
-/// meaningful bucket, so `distinct_run_values` drops them from the cycle —
-/// they are visible only while no scope filter is active.
+/// the runs' recorded scopes. Unscoped rows ([`crate::runs::is_unscoped`])
+/// are not a meaningful bucket, so the cycle skips them; they are visible
+/// only while no scope filter is active.
 fn cycle_run_scope_filter(mut app: App) -> (App, Vec<Cmd>) {
-    let scopes = distinct_run_values(&app, |card| &card.scope);
+    let mut scopes = distinct_run_values(&app, |card| &card.scope);
+    scopes.retain(|scope| !crate::runs::is_unscoped(scope));
     app.runs_scope_filter = next_cycle_value(&scopes, app.runs_scope_filter.as_deref());
     app.status_line = match &app.runs_scope_filter {
         Some(scope) => format!("showing scope: {scope}"),
@@ -7983,15 +7984,17 @@ mod tests {
         assert_eq!(app.runs_kind_filter, None);
     }
 
-    /// Legacy pre-scoping rows have `scope = ""`; an empty scope is not a
-    /// meaningful bucket to filter on, so the cycle skips it — unscoped rows
-    /// are only visible with no scope filter active.
+    /// Unscoped rows (`""` or [`crate::runs::LEGACY_UNSCOPED`]) are not a
+    /// meaningful bucket to filter on, so the cycle skips them; they are only
+    /// visible with no scope filter active.
     #[test]
     fn cycle_run_scope_filter_skips_unscoped_rows() {
         let legacy = run_card(1, "GH-1", crate::runs::RunStatus::Running);
+        let mut sentinel = run_card(3, "GH-3", crate::runs::RunStatus::Running);
+        sentinel.scope = crate::runs::LEGACY_UNSCOPED.to_string();
         let mut scoped = run_card(2, "GH-2", crate::runs::RunStatus::Running);
         scoped.scope = "github:a/b".to_string();
-        let app = runs_app(vec![legacy, scoped], 1, 0);
+        let app = runs_app(vec![legacy, sentinel, scoped], 1, 0);
 
         let (app, _) = update(app, Msg::CycleRunScopeFilter);
         assert_eq!(app.runs_scope_filter.as_deref(), Some("github:a/b"));
