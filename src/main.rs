@@ -3386,12 +3386,14 @@ fn autopilot_deps(
         },
         std::time::Duration::from_secs(config.dispatch.tick_secs),
     );
+    let repo_root = targets.first().map(|target| target.repo_root.clone());
     if !targets.is_empty() {
         host.set_targets(targets);
     }
     tskmstr::tui::event::AutopilotDeps {
         host: Some(host),
         max_lanes: config.dispatch.max_lanes,
+        repo_root,
     }
 }
 

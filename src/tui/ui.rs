@@ -103,6 +103,7 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
         Screen::Runs => draw_runs_board(frame, app, body),
         Screen::Overview => draw_overview(frame, app, body),
         Screen::Retro => draw_retro_list(frame, app, body),
+        Screen::MergeQueue => draw_merge_queue(frame, app, body),
         _ => draw_board_columns(frame, app, body),
     }
 
@@ -123,7 +124,7 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
                 draw_run_detail_window(frame, app, runner);
             }
         }
-        Screen::Retro => {}
+        Screen::Retro | Screen::MergeQueue => {}
     }
 
     draw_status_bar(
@@ -346,7 +347,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  e epic  E epics  A assign  p priority  a audit  Y mark audited  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  W walkthrough  F fix  M merge  Space queue  R retro  P autopilot  i or / search  C broadcast  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  e epic  E epics  A assign  p priority  a audit  Y mark audited  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  W walkthrough  F fix  M merge  Space batch  + merge queue  Q queue view  R retro  P autopilot  i or / search  C broadcast  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -362,8 +363,11 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
         Screen::Retro => {
             "j/k move  d defect  c clean  r refresh  o browser  Esc back  ? help  q quit"
         }
+        Screen::MergeQueue => {
+            "j/k move  Enter/Space grab-drop  x remove  E clear merge epic  r refresh  Esc back  q quit"
+        }
         Screen::Overview => {
-            "h/l/j/k: move  s: attach  v: view run  L: logs  B: board  V: vdiff  F: fix  M: merge  Space: queue  c: columns/queue  P: autopilot  Tab: watch  r: refresh  q: quit"
+            "h/l/j/k: move  s: attach  v: view run  L: logs  B: board  V: vdiff  F: fix  M: merge  Space: batch  +: merge queue  Q: queue view  c: columns/queue  P: autopilot  Tab: watch  r: refresh  q: quit"
         }
     }
 }
@@ -827,6 +831,79 @@ fn draw_rank_list(frame: &mut Frame, app: &App, area: Rect) {
     if !app.rank_tickets.is_empty() {
         state.select(Some(app.rank_selected.min(app.rank_tickets.len() - 1)));
     }
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// [`Screen::MergeQueue`] (GitHub issue #247): per scope, a header naming
+/// the scope and its merge epic, then its queued tickets in merge order,
+/// each with how it got there (`manual`/`autopilot`) and what it is doing
+/// ([`crate::work::auto_merge::RowState`]). Only ticket rows are
+/// selectable; the grabbed row carries the same `><` marker as
+/// [`Screen::Rank`].
+fn draw_merge_queue(frame: &mut Frame, app: &App, area: Rect) {
+    let view = &app.merge_queue_view;
+    let title = if view.is_grabbed() {
+        "Merge queue (grabbed - j/k move, Enter/Space drop, Esc cancel)"
+    } else {
+        "Merge queue"
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    if let Some(err) = &view.error {
+        let text = format!("could not read the merge queue: {err}");
+        frame.render_widget(Paragraph::new(text).block(block), area);
+        return;
+    }
+    if view.scopes.is_empty() {
+        let text = "No merge queue here yet. Press + on a ticket to queue it.";
+        frame.render_widget(Paragraph::new(text).block(block), area);
+        return;
+    }
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut selected_item = None;
+    let mut flat_index = 0;
+    for scope in &view.scopes {
+        let epic = match &scope.merge_epic {
+            Some(epic) => format!("  merge epic {epic}"),
+            None => "  no merge epic".to_string(),
+        };
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(scope.scope.clone(), theme::CARD_KEY),
+            Span::styled(epic, theme::DIM),
+        ])));
+        if scope.rows.is_empty() {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "     nothing queued",
+                theme::DIM,
+            ))));
+        }
+        for (index, row) in scope.rows.iter().enumerate() {
+            let selected = flat_index == view.selected;
+            if selected {
+                selected_item = Some(items.len());
+            }
+            let marker = if selected && view.is_grabbed() {
+                Span::styled("><", theme::GRABBED_MARKER)
+            } else {
+                Span::raw("  ")
+            };
+            items.push(ListItem::new(Line::from(vec![
+                marker,
+                Span::styled(
+                    format!(" {:>3}. {}", index + 1, row.ticket),
+                    theme::CARD_KEY,
+                ),
+                Span::raw(format!("  {:<9}  {}", row.source.as_str(), row.state)),
+            ])));
+            flat_index += 1;
+        }
+    }
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default();
+    state.select(selected_item);
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -1968,12 +2045,13 @@ fn draw_help_overlay(frame: &mut Frame) {
         // The column is at the overlay's 17 inner rows on a 24-row
         // terminal, so `C` shares the `c` line.
         Line::from("c/C     create / broadcast"),
-        Line::from("v       view run"),
-        Line::from("L       run logs"),
+        // Shares a row with `L`: the column is at its 17-row budget.
+        Line::from("v/L     view run / run logs"),
         // Shares a row with `V`: the column is at its 17-row budget.
         Line::from("V / W   vdiff / walkthrough"),
         Line::from("F       apply review fixes"),
-        Line::from("M/Space merge PR / merge queue"),
+        Line::from("M/Space merge PR / merge batch"),
+        Line::from("+/Q     merge queue / view"),
         Line::from("E       toggle epics view"),
         Line::from("R       retro verdict"),
         Line::from("P       toggle autopilot"),
@@ -2033,14 +2111,16 @@ fn draw_filter_picker(frame: &mut Frame, app: &App) {
 /// (GitHub issue #199): `All epics`, `No epic`, then each epic on the loaded
 /// cards as `KEY  Title`. The active choice is marked with a leading `*`,
 /// like [`draw_filter_picker`]. The board scope's autopilot priority epic
-/// (GitHub issue #237), set with `P`, is marked `(autopilot)`, apart from
-/// the view filter.
+/// (GitHub issue #237), set with `P`, is marked `(autopilot)`, and its
+/// merge epic (GitHub issue #247), set with `m`, `(merge)`, apart from the
+/// view filter.
 fn draw_epic_picker(frame: &mut Frame, app: &App) {
     let area = centered_rect(50, 50, frame.area());
     frame.render_widget(Clear, area);
 
     let options = app.epic_options();
     let autopilot_epic = app.autopilot_epic();
+    let merge_epic = app.merge_epic();
     let items: Vec<ListItem> = options
         .iter()
         .map(|option| {
@@ -2055,6 +2135,11 @@ fn draw_epic_picker(frame: &mut Frame, app: &App) {
             {
                 spans.push(Span::styled("  (autopilot)", theme::ACTIVE_FILTER_MARKER));
             }
+            if let EpicFilter::Epic(epic) = option
+                && merge_epic == Some(epic.key.as_str())
+            {
+                spans.push(Span::styled("  (merge)", theme::ACTIVE_FILTER_MARKER));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -2063,7 +2148,7 @@ fn draw_epic_picker(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(bold_title("Filter: epic  P autopilot")),
+                .title(bold_title("Filter: epic  P autopilot  m merge")),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
@@ -2273,7 +2358,7 @@ fn draw_batch_merge_confirm(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, area);
 
     let mut lines = vec![
-        Line::from("Merge the queued tickets in one tm merge run?"),
+        Line::from("Merge the batched tickets in one tm merge run?"),
         Line::from(""),
     ];
     lines.extend(
@@ -2287,7 +2372,7 @@ fn draw_batch_merge_confirm(frame: &mut Frame, app: &App) {
     let paragraph = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(bold_title("Merge queue")),
+            .title(bold_title("Merge batch")),
     );
     frame.render_widget(paragraph, area);
 }
@@ -2592,7 +2677,9 @@ mod tests {
             "W walkthrough",
             "F fix",
             "M merge",
-            "Space queue",
+            "Space batch",
+            "+ merge queue",
+            "Q queue view",
             "R retro",
             "i or / search",
             "C broadcast",
@@ -2718,6 +2805,7 @@ mod tests {
         };
         app.autopilot = vec![crate::work::autopilot::AutopilotStatus {
             priority_epic: Some("PROJ-90".to_string()),
+            merge_epic: None,
             ..autopilot_status("s", true, None)
         }];
         let text = buffer_text(&render_with_size(&app, 120, 30));
@@ -2780,7 +2868,13 @@ mod tests {
             ..App::new()
         };
         let text = buffer_text(&render_with_size(&app, 80, 24));
-        for phrase in ["broadcast", "merge queue", "retro", "autopilot"] {
+        for phrase in [
+            "broadcast",
+            "merge batch",
+            "merge queue",
+            "retro",
+            "autopilot",
+        ] {
             assert!(
                 text.contains(phrase),
                 "help overlay should show `{phrase}` on a 24-row terminal:\n{text}"
@@ -3099,6 +3193,7 @@ mod tests {
             "vdiff",
             "fixes",
             "merge",
+            "merge batch",
             "merge queue",
             "retro",
             "walkthrough",
@@ -3807,9 +3902,9 @@ mod tests {
             ..App::new()
         };
         let text = buffer_text(&render(&app));
-        assert!(text.contains("Merge queue"), "{text}");
+        assert!(text.contains("Merge batch"), "{text}");
         assert!(
-            text.contains("Merge the queued tickets in one tm merge run?"),
+            text.contains("Merge the batched tickets in one tm merge run?"),
             "{text}"
         );
         assert!(text.contains("PROJ-9"), "{text}");
@@ -5148,6 +5243,7 @@ mod tests {
             blocked_age_secs: None,
             last_launch_age_secs: None,
             priority_epic: None,
+            merge_epic: None,
         }
     }
 
@@ -5301,11 +5397,64 @@ mod tests {
         assert!(hint_for(Screen::Runs, false).contains("Tab: overview"));
     }
 
+    /// GitHub issue #247: the merge queue view lists each scope's merge
+    /// epic and rows in order with their source and state.
+    #[test]
+    fn merge_queue_view_lists_rows_with_source_and_state() {
+        use crate::runs::merge_queue::QueueSource;
+        use crate::tui::merge_queue::{MergeQueueView, QueueRow, ScopeQueue};
+        use crate::work::auto_merge::RowState;
+        let app = App {
+            screen: Screen::MergeQueue,
+            merge_queue_view: MergeQueueView {
+                scopes: vec![ScopeQueue {
+                    scope: "github:o/r".to_string(),
+                    merge_epic: Some("GH-100".to_string()),
+                    rows: vec![
+                        QueueRow {
+                            ticket: "GH-2".to_string(),
+                            source: QueueSource::Manual,
+                            state: RowState::Waiting(Some("checks pending".to_string())),
+                        },
+                        QueueRow {
+                            ticket: "GH-1".to_string(),
+                            source: QueueSource::Autopilot,
+                            state: RowState::Held("conflicts".to_string()),
+                        },
+                    ],
+                }],
+                ..MergeQueueView::default()
+            },
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        for phrase in [
+            "Merge queue",
+            "github:o/r",
+            "merge epic GH-100",
+            "1. GH-2",
+            "manual",
+            "waiting: checks pending",
+            "2. GH-1",
+            "autopilot",
+            "held: conflicts",
+        ] {
+            assert!(text.contains(phrase), "missing `{phrase}`:\n{text}");
+        }
+    }
+
     /// GitHub issue #88.
     #[test]
     fn overview_hint_names_the_write_actions() {
         let hint = hint_for(Screen::Overview, false);
-        for key in ["V: vdiff", "F: fix", "M: merge", "Space: queue"] {
+        for key in [
+            "V: vdiff",
+            "F: fix",
+            "M: merge",
+            "Space: batch",
+            "+: merge queue",
+            "Q: queue view",
+        ] {
             assert!(hint.contains(key), "{hint}");
         }
     }
