@@ -526,7 +526,9 @@ next" across every repo. Watch is per **run**; the overview is per
 row, placed in the most urgent stage its runs reach and sorted by that
 stage, oldest first within it:
 
-- **needs input**: a running session awaiting input, or a hibernated one
+- **needs input**: a running session awaiting input, a hibernated one, or a
+  running session waiting on a thatch chat reply (tagged `chat?`; see
+  "Lane chat" below)
 - **awaiting review** (GitHub issue #119): the machine is done and it is
   your turn. A run recorded the PR, the latest `tm pr watch` finished clean
   (or with findings whose bugbot-cleanup session has finished), nothing is
@@ -1759,6 +1761,34 @@ prompt.
 `C` needs `thatch` on `PATH` and a GitHub `origin` remote. Without either,
 pressing `C` says which is missing in the status line instead of opening the
 input.
+
+### Lane chat
+
+When a run's agent session has joined thatch's cross-session chat, the run
+detail window (`v` in `tm runs watch`, the overview, and the board) shows a
+**Chat** panel under the usage and checklist panels. It lists the session's
+latest sent and received messages, oldest first:
+
+```
+10:00:05 -> coord-00001: which base should I stack on?
+10:02:09 <- coord-00001: main
+```
+
+`->` is a message the lane sent and `<-` one it received; times are thatch's
+UTC timestamps. The panel title is the session's chat name, marked `(awaiting
+reply)` while the lane has sent a peer a message the peer has not answered
+yet. A reply from that peer clears it; a message from someone else does not.
+
+The overview raises the same signal: a running lane awaiting a reply moves
+to **needs input** and its row shows `chat?` until the answer arrives.
+
+tm reads chat through thatch's CLI only (ADR-0011). It maps the run's
+recorded session id to a chat name with `thatch chat list --json --host-id
+<session id>` and lists messages with `thatch chat tail --once`, caching
+each answer for 5 seconds so the views' half-second refresh doesn't spawn
+`thatch` every time. This view is read-only: it never sends a message. With
+no `thatch` on `PATH`, or a session that never joined chat, the panel and
+the badge simply don't appear.
 
 ### Assigning a ticket from the board
 
