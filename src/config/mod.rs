@@ -675,8 +675,10 @@ pub struct RawCreateConfig {
 pub struct RawMergeConfig {
     /// Prompt fed to the launched conflict-resolution session. Defaults to
     /// a built-in conflict prompt when unset. Supports `{key}`, `{branch}`,
-    /// and `{base}` placeholders, substituted with the ticket key, the
-    /// branch being merged, and the branch it's being merged onto.
+    /// `{base}`, and `{upstream_context}` placeholders, substituted with the
+    /// ticket key, the branch being merged, the branch it's being merged
+    /// onto, and the pull requests merged into that base that changed the
+    /// conflicted files (GitHub issue #246).
     pub prompt: Option<String>,
     /// Path to a prompt file whose contents become the session's opening
     /// prompt in place of [`RawMergeConfig::prompt`]. Setting both `prompt`
@@ -695,9 +697,11 @@ pub struct RawMergeConfig {
     /// Prompt template for the single combined conflict-resolution session
     /// a batch `tm merge KEY1 KEY2 ...` opens when two or more of its
     /// tickets stop on rebase conflicts. Defaults to the runner's built-in
-    /// batch template when unset. Supports one placeholder,
-    /// `{ticket_list}`, substituted with a newline-separated list of each
-    /// conflicting ticket's key, branch, base, and checkout directory.
+    /// batch template when unset. Supports `{ticket_list}`, substituted with
+    /// a newline-separated list of each conflicting ticket's key, branch,
+    /// base, and checkout directory, and `{upstream_context}`, one section
+    /// per ticket listing the pull requests that changed its conflicted
+    /// files.
     ///
     /// Independent of [`RawMergeConfig::prompt`]/
     /// [`RawMergeConfig::prompt_file`], which stay single-ticket only:
@@ -1476,12 +1480,13 @@ pub struct CreateConfig {
 /// Configures the agent conflict-resolution session that `tm merge` opens
 /// when a rebase hits conflicts. `prompt`/`prompt_file` override the
 /// built-in conflict prompt — the prompt text supports `{key}` (the ticket
-/// key), `{branch}` (the branch being merged), and `{base}` (the branch it's
-/// being merged onto) placeholders. `model` is that session's own model
+/// key), `{branch}` (the branch being merged), `{base}` (the branch it's
+/// being merged onto), and `{upstream_context}` (the upstream pull requests
+/// that changed the conflicted files) placeholders. `model` is that session's own model
 /// key, ahead of `[work] default_model` (see `crate::work::model`).
 /// `batch_conflict_prompt` overrides the built-in template for the combined
-/// session a multi-key `tm merge` opens (its one placeholder is
-/// `{ticket_list}`). `consolidate_memories` turns the post-merge
+/// session a multi-key `tm merge` opens (its placeholders are
+/// `{ticket_list}` and `{upstream_context}`). `consolidate_memories` turns the post-merge
 /// memory-consolidation session on or off. `strategy` picks how the branch
 /// catches up with its base (see [`MergeStrategy`]). `wait_for_checks`,
 /// `checks_timeout_secs`, and `verify_command` gate the merge on the PR's

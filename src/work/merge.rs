@@ -663,7 +663,8 @@ fn format_ts(unix_secs: i64) -> String {
 /// [`AgentRunner::default_merge_conflict_prompt_template`]) and writes the
 /// rendered prompt file before making any tmux call, so a bad `prompt_file`
 /// path or a `state_dir` write failure never leaves a half-opened session
-/// behind.
+/// behind. A template using `{upstream_context}` gets the upstream pull
+/// requests that changed the conflicted files ([`upstream_context`]).
 ///
 /// The session is launched the same way an interactive lane run is
 /// ([`crate::work::interactive::launch_interactive_run`]'s command
