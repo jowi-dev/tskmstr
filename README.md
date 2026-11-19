@@ -2566,6 +2566,21 @@ these stages:
    in-progress on disk, `tm merge` exits `2`, and it prints exactly how to
    pick it back up — `tmux attach -t <target>` to keep resolving, or
    `git -C <dir> rebase --abort` to bail out.
+
+   Every rebase `tm merge` runs turns on git's **rerere** ("reuse
+   recorded resolution") for that command only, by passing
+   `-c rerere.enabled=true -c rerere.autoupdate=true`; your git config is
+   not changed. A conflict resolved once is resolved again automatically
+   the next time it appears: a rerun after an abort, the stale-base retry
+   in stage 4, or another ticket in a batch that hits the same upstream
+   change. When rerere resolves every conflict in a stop, `tm merge`
+   continues the rebase itself and opens no conflict window. A window
+   opens only for conflicts rerere did not resolve. Recorded resolutions
+   live in the repository's shared git directory (`rr-cache`), so all of
+   its worktrees use them. Once that directory exists, git also turns
+   rerere on for your own rebases and merges in that repository. A wrong
+   recorded resolution repeats too: clear it with
+   `git rerere forget <path>` while the conflict is in progress.
 4. **Merge.** `gh pr merge`, using the repository's default merge method —
    the same "first enabled of merge commit, squash, rebase" order the
    board's `M` key and GitHub's own merge button use. No per-invocation
