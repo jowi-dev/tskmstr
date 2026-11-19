@@ -2598,8 +2598,10 @@ these stages:
 2. **Auto-rebase onto a moved base.** If `origin/<base>` (the PR's base
    branch, e.g. `main`) isn't yet an ancestor of the PR branch, `tm merge`
    rebases the branch onto it. A clean rebase is force-pushed
-   (`--force-with-lease`) automatically. A checkout with uncommitted
-   changes is refused rather than rebased out from under you.
+   (`--force-with-lease`) automatically. If `[work.merge] verify_command`
+   is set (for example `cargo test`), it runs in the checkout first, and a
+   non-zero exit stops the merge with nothing pushed. A checkout with
+   uncommitted changes is refused rather than rebased out from under you.
    `[work.merge] strategy` changes how the branch catches up (see
    "Choosing a merge strategy" below): `squash` squashes it into one
    commit before the rebase, and `merge` merges the base into it instead
@@ -2630,14 +2632,31 @@ these stages:
    rerere on for your own rebases and merges in that repository. A wrong
    recorded resolution repeats too: clear it with
    `git rerere forget <path>` while the conflict is in progress.
-4. **Merge.** `gh pr merge`, using the repository's default merge method —
+4. **Wait for green checks, then merge.** A rebased head is a commit CI
+   has never seen: the PR's old green checks belong to the old head. So
+   before merging, `tm merge` polls the PR's checks every 15 seconds,
+   printing progress, until every check on the head it pushed has passed.
+   It ignores checks GitHub still reports for the old head, and when the
+   PR had checks before the push it waits for them to start on the new
+   one. A PR with no checks at all merges straight away. The same gate
+   applies when nothing was pushed, so a rerun after a timeout never
+   merges a head that is still running or red. A failing check stops the
+   merge: the PR stays open, the branch stays pushed, the failing checks
+   are named, and `tm merge` exits `1`. Checks still running after
+   `[work.merge] checks_timeout_secs` (default 30 minutes) hand the ticket
+   back unmerged with exit `2`; rerun `tm merge <KEY>` once they finish.
+   An interactive `tm merge` now takes as long as CI does. Turn the gate
+   off with `[work.merge] wait_for_checks = false`.
+
+   The merge itself is `gh pr merge`, using the repository's default merge method —
    the same "first enabled of merge commit, squash, rebase" order the
    board's `M` key and GitHub's own merge button use. No per-invocation
    override in v1. If GitHub rejects the merge because the branch is
    behind its base (branch protection's "require branches to be up to
    date", or the base moving mid-merge), `tm merge` fetches, rebases the
-   checkout onto the current `origin/<base>`, force-pushes with lease, and
-   retries the merge once. Conflicts in that rebase go through the same
+   checkout onto the current `origin/<base>`, runs `verify_command`,
+   force-pushes with lease, waits for the checks on that head the same
+   way, and retries the merge once. Conflicts in that rebase go through the same
    conflict session as stage 3 (and hand back the same way, exit `2`). A
    second rejection, or a stale-base rejection with no local checkout to
    rebase, is an error. Other rejections are never retried.
@@ -2700,8 +2719,10 @@ these stages:
 
 Exit codes: `0` merged (steps 4-10 all attempted; cleanup/base-sync
 warnings don't change this), `2` a conflict session never resolved (step
-3, or the step 4 retry), `1` any other error (no open PR, a diverged branch, a dirty worktree,
-a `gh`/`git` failure, a red base without `--allow-red-base`).
+3, or the step 4 retry) or the checks were still running at the timeout
+(step 4), `1` any other error (no open PR, a diverged branch, a dirty
+worktree, a failing check, a failing `verify_command`, a red base without
+`--allow-red-base`, a `gh`/`git` failure).
 
 V1 boundaries, matched to the board's `M` key and worth knowing before you
 rely on this:
@@ -2733,7 +2754,8 @@ or more keys, tm works in two phases:
 1. **Unattended merges.** Tickets are processed strictly in the order
    given, one at a time; parallel rebases would race on the repo. Each runs
    stages 1-2 above. A ticket that rebases cleanly, or needs no rebase,
-   goes straight through stages 4-7 without waiting on anything else. A
+   goes straight through stages 4-7, including stage 4's wait for its own
+   checks, before the next ticket starts. A
    ticket that stops on conflicts is set aside with its rebase left in
    progress on disk. A ticket that errors, for example one with no open PR,
    is reported and the batch moves on.
@@ -2752,9 +2774,10 @@ The batch ends with one memory-consolidation session (stage 10) naming
 every branch it merged, not one session per branch. A batch spanning
 several repos gets one session per repo.
 
-The batch ends with a summary of what merged, what was handed back, and
-what failed. The exit code is `1` if any ticket failed, else `2` if any was
-handed back, else `0`.
+The batch ends with a summary of what merged, what was handed back, whose
+checks were still pending, and what failed. The exit code is `1` if any
+ticket failed (a failing check counts), else `2` if any was handed back or
+still had checks pending, else `0`.
 
 Two boundaries worth knowing:
 
@@ -2770,11 +2793,12 @@ Two boundaries worth knowing:
   handed back. A ticket still rejected after the retry is reported as
   failed; rerun `tm merge <KEY>` for it.
 
-### `[work.merge]`: conflict-resolution session settings
+### `[work.merge]`: merge settings
 
 Both the board's `M` key and `tm merge <KEY>` share this section. It
-configures the agent session a rebase conflict opens (stage 3 above) and
-the post-merge memory session (stage 10); it never gates whether merging is available at all, unlike `[work.audit]`'s
+configures the agent session a rebase conflict opens (stage 3 above), the
+checks gate and `verify_command` (stages 2 and 4), and the post-merge
+memory session (stage 10); it never gates whether merging is available at all, unlike `[work.audit]`'s
 `dir`. Every field is optional:
 
 ```toml
@@ -2785,6 +2809,9 @@ the post-merge memory session (stage 10); it never gates whether merging is avai
 # batch_conflict_prompt = "..."               # optional; combined session for `tm merge KEY1 KEY2 ...`
 # consolidate_memories = false                # optional; default true, see stage 10
 # strategy = "squash"                         # optional; "rebase" (default), "squash", or "merge"
+# wait_for_checks = false                     # optional; default true, see stage 4
+# checks_timeout_secs = 1800                  # optional; default 1800 (30 minutes)
+# verify_command = "cargo test"               # optional; runs before every push, see stage 2
 ```
 
 `prompt_file` and `prompt` are mutually exclusive — setting both is a
@@ -2808,6 +2835,15 @@ which stay single-ticket only, so setting it alongside either is fine.
 `consolidate_memories` turns off the post-merge memory-consolidation
 session (stage 10). It is on by default. That session uses `model` the
 same way the conflict sessions do.
+
+`wait_for_checks` and `checks_timeout_secs` control stage 4's wait for
+green checks: on by default, handing the ticket back after 30 minutes.
+`verify_command` is a shell command (run with `sh -c`) that runs in the
+branch's checkout after a rebase and before every push. Its output goes
+to `merge-<KEY>-verify.log` in tm's run-state directory, which `tm merge`
+names when it starts the command and again if it fails. It catches breakage before CI does, so the conflict agent
+doesn't need to run the full suite after every commit. A non-zero exit
+stops the merge with nothing pushed. Unset, nothing runs.
 
 #### Choosing a merge strategy
 
