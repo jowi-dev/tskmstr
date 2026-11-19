@@ -218,6 +218,14 @@ pub trait TmuxOps {
     /// history, not a full transcript.
     fn capture_pane(&self, name: &str, window: &str) -> Result<String, TmuxError>;
 
+    /// Type `text` into window `window` of session `name`, then press Enter
+    /// (`tmux send-keys -t <name>:<window> -l -- <text>`, then a separate
+    /// `send-keys ... Enter`). The text is sent literally, so tmux never
+    /// reads a word of it as a key name. Enter goes in its own call so an
+    /// agent's input box reads it as a submit rather than part of a paste.
+    /// Wakes an idle lane that has unread chat mail (GitHub issue #224).
+    fn send_keys(&self, name: &str, window: &str, text: &str) -> Result<(), TmuxError>;
+
     /// List all running tmux sessions
     /// (`tmux list-sessions -F '#{session_name}|#{session_path}'`).
     ///
@@ -535,6 +543,26 @@ fn capture_pane_args(name: &str, window: &str) -> Vec<String> {
     ]
 }
 
+fn send_text_args(name: &str, window: &str, text: &str) -> Vec<String> {
+    vec![
+        "send-keys".to_string(),
+        "-t".to_string(),
+        format!("{name}:{window}"),
+        "-l".to_string(),
+        "--".to_string(),
+        text.to_string(),
+    ]
+}
+
+fn send_enter_args(name: &str, window: &str) -> Vec<String> {
+    vec![
+        "send-keys".to_string(),
+        "-t".to_string(),
+        format!("{name}:{window}"),
+        "Enter".to_string(),
+    ]
+}
+
 /// Parses `tmux display-message -p '#{pane_pid}'` output; anything that is
 /// not a pid is `None` rather than an error.
 fn parse_pane_pid(stdout: &str) -> Option<u32> {
@@ -790,6 +818,13 @@ impl TmuxOps for ShellTmuxOps {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    fn send_keys(&self, name: &str, window: &str, text: &str) -> Result<(), TmuxError> {
+        let output = run("tmux send-keys", &send_text_args(name, window, text))?;
+        require_success("tmux send-keys", &output)?;
+        let output = run("tmux send-keys", &send_enter_args(name, window))?;
+        require_success("tmux send-keys", &output)
+    }
+
     fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
         // `work.ml` reads via `Unix.open_process_in` and never inspects the
         // child's exit status (and redirects stderr to /dev/null), so a
@@ -962,6 +997,15 @@ pub enum TmuxCall {
         name: String,
         /// Window name.
         window: String,
+    },
+    /// `send_keys(name, window, text)`.
+    SendKeys {
+        /// Session name.
+        name: String,
+        /// Window name.
+        window: String,
+        /// The text typed before Enter.
+        text: String,
     },
     /// `list_sessions()`.
     ListSessions,
@@ -1185,6 +1229,15 @@ impl TmuxOps for FakeTmuxOps {
             Some(err) => Err(err.clone()),
             None => Ok(format!("{name}:{window} scrollback\n")),
         }
+    }
+
+    fn send_keys(&self, name: &str, window: &str, text: &str) -> Result<(), TmuxError> {
+        self.calls.borrow_mut().push(TmuxCall::SendKeys {
+            name: name.to_string(),
+            window: window.to_string(),
+            text: text.to_string(),
+        });
+        Ok(())
     }
 
     fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
@@ -1901,6 +1954,39 @@ mod tests {
         assert_eq!(
             capture_pane_args("tm-proj-proj-1", "work"),
             vec!["capture-pane", "-p", "-S", "-", "-t", "tm-proj-proj-1:work"]
+        );
+    }
+
+    #[test]
+    fn send_keys_types_the_text_literally_then_presses_enter_separately() {
+        assert_eq!(
+            send_text_args("tm-proj-proj-1", "work", "-read your mail"),
+            vec![
+                "send-keys",
+                "-t",
+                "tm-proj-proj-1:work",
+                "-l",
+                "--",
+                "-read your mail"
+            ]
+        );
+        assert_eq!(
+            send_enter_args("tm-proj-proj-1", "work"),
+            vec!["send-keys", "-t", "tm-proj-proj-1:work", "Enter"]
+        );
+    }
+
+    #[test]
+    fn fake_send_keys_is_recorded() {
+        let fake = FakeTmuxOps::new();
+        fake.send_keys("s", "work", "hello").unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![TmuxCall::SendKeys {
+                name: "s".to_string(),
+                window: "work".to_string(),
+                text: "hello".to_string(),
+            }]
         );
     }
 
