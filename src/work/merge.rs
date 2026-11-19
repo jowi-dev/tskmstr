@@ -196,6 +196,23 @@ pub enum MergeError {
         dir: PathBuf,
     },
 
+    /// The PR's base branch head commit has a failed check, so merging (or
+    /// rebasing onto it) would build on a broken base (GitHub issue #242).
+    /// `--allow-red-base` skips this gate.
+    #[error(
+        "{base} is red at {}: failing checks: {}. Fix {base} first, or rerun with --allow-red-base to merge anyway",
+        short_sha(sha),
+        failing.join(", ")
+    )]
+    BaseRed {
+        /// The PR's base branch.
+        base: String,
+        /// The base branch's head commit.
+        sha: String,
+        /// The names of the failed checks on that commit, in GitHub's order.
+        failing: Vec<String>,
+    },
+
     /// `origin/<branch>` no longer exists — the remote branch may have been
     /// deleted.
     #[error("origin/{branch} no longer exists; it may have been deleted upstream")]
@@ -282,6 +299,51 @@ pub struct MergeDeps<'a> {
     /// [`crate::runs::pid::kill_pid`], the same `SIGKILL` sender idle
     /// hibernation uses.
     pub kill_pid: &'a dyn Fn(u32),
+    /// `tm merge --allow-red-base`: skip the red-base gate (see
+    /// [`MergeError::BaseRed`]), for the operator merging the fix for the
+    /// broken base itself.
+    pub allow_red_base: bool,
+}
+
+/// The first 12 characters of a commit SHA, for messages.
+pub fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
+/// Refuses the merge when the head commit of the PR's base branch has a
+/// failed check (GitHub issue #242). Pending checks do not block. A failure
+/// to read the checks only warns: the gate protects against building on a
+/// known-broken base, and an unreadable base is not known to be broken.
+fn ensure_base_not_red(
+    deps: &MergeDeps<'_>,
+    repo_root: &Path,
+    base: &str,
+    out: &mut dyn Write,
+) -> Result<(), MergeError> {
+    if deps.allow_red_base {
+        return Ok(());
+    }
+    match deps.gh.commit_checks(repo_root, base) {
+        Ok(checks) => {
+            let failing: Vec<String> = checks.failing().map(|c| c.name.clone()).collect();
+            if failing.is_empty() {
+                Ok(())
+            } else {
+                Err(MergeError::BaseRed {
+                    base: base.to_string(),
+                    sha: checks.sha,
+                    failing,
+                })
+            }
+        }
+        Err(err) => {
+            writeln!(
+                out,
+                "warning: could not read {base}'s checks ({err}); merging without the red-base check"
+            )?;
+            Ok(())
+        }
+    }
 }
 
 /// Substitutes `{key}`, `{branch}`, and `{base}` in `template`, producing
@@ -1551,6 +1613,7 @@ fn prepare_merge(
     let branch = pr.head_ref_name.clone();
     let base = pr.base_ref_name.clone();
     writeln!(out, "found PR #{number} ({branch} -> {base})")?;
+    ensure_base_not_red(deps, &repo_root, &base, out)?;
 
     let checkout_dir = resolve_checkout_dir(
         deps.git,
@@ -2104,7 +2167,7 @@ fn cleanup_ticket_session(
 mod tests {
     use super::*;
     use crate::agent::claude::ClaudeRunner;
-    use crate::github::gh_cli::FakeGhCli;
+    use crate::github::gh_cli::{CheckResult, CommitChecks, FakeGhCli};
     use crate::github::pr::PrInfo;
     use crate::jira::fake::FakeJiraClient;
     use crate::runs::{RunStore, StartRun};
@@ -2175,6 +2238,7 @@ mod tests {
         work_default_model: Option<String>,
         models: crate::config::ModelsConfig,
         status_on_merge: Option<String>,
+        allow_red_base: bool,
         _worktree_dirs: Vec<tempfile::TempDir>,
         _state_dir: tempfile::TempDir,
         state_dir: PathBuf,
@@ -2227,6 +2291,7 @@ mod tests {
                 work_default_model: None,
                 models: crate::config::ModelsConfig::default(),
                 status_on_merge: None,
+                allow_red_base: false,
                 _worktree_dirs: Vec::new(),
                 _state_dir: state_tmp,
                 state_dir,
@@ -2292,6 +2357,7 @@ mod tests {
                 state_dir: &self.state_dir,
                 sessions_dir: &self.sessions_dir,
                 kill_pid: &*self.kill_pid,
+                allow_red_base: self.allow_red_base,
             }
         }
     }
@@ -2300,6 +2366,123 @@ mod tests {
         let mut out = Vec::new();
         let result = run_merge(deps, key, &mut out);
         (result, String::from_utf8(out).unwrap())
+    }
+
+    // --- red base gate (GitHub issue #242) ---
+
+    fn check(name: &str, state: crate::github::gh_cli::ChecksState) -> CheckResult {
+        CheckResult {
+            name: name.to_string(),
+            state,
+            run_id: None,
+            job_id: None,
+            details_url: None,
+            conclusion: None,
+        }
+    }
+
+    fn red_main() -> CommitChecks {
+        use crate::github::gh_cli::ChecksState;
+        CommitChecks {
+            sha: "0123456789abcdef".to_string(),
+            checks: vec![
+                check("test", ChecksState::Failing),
+                check("lint", ChecksState::Passing),
+                check("build", ChecksState::Failing),
+            ],
+        }
+    }
+
+    #[test]
+    fn red_base_refuses_before_fetching_and_names_the_commit_and_checks() {
+        let mut fx = up_to_date_fixture();
+        fx.gh = std::mem::replace(&mut fx.gh, FakeGhCli::new())
+            .with_commit_checks("main", Ok(red_main()));
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, MergeError::BaseRed { .. }), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("main"), "{message}");
+        assert!(message.contains("0123456789ab"), "{message}");
+        assert!(message.contains("test, build"), "{message}");
+        assert!(!message.contains("lint"), "{message}");
+        assert!(message.contains("--allow-red-base"), "{message}");
+        assert_eq!(fx.gh.commit_checks_calls(), vec!["main".to_string()]);
+        assert!(fx.git.call_log().is_empty(), "{:?}", fx.git.call_log());
+        assert!(fx.gh.pr_merge_calls().is_empty());
+    }
+
+    #[test]
+    fn allow_red_base_skips_the_gate() {
+        let mut fx = up_to_date_fixture();
+        fx.gh = std::mem::replace(&mut fx.gh, FakeGhCli::new())
+            .with_commit_checks("main", Ok(red_main()));
+        fx.allow_red_base = true;
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{result:?}");
+        assert!(fx.gh.commit_checks_calls().is_empty());
+        assert_eq!(fx.gh.pr_merge_calls(), vec![(PathBuf::from("/repo"), 7)]);
+    }
+
+    #[test]
+    fn pending_base_proceeds() {
+        use crate::github::gh_cli::ChecksState;
+        let mut fx = up_to_date_fixture();
+        fx.gh = std::mem::replace(&mut fx.gh, FakeGhCli::new()).with_commit_checks(
+            "main",
+            Ok(CommitChecks {
+                sha: "abc".to_string(),
+                checks: vec![
+                    check("test", ChecksState::Pending),
+                    check("lint", ChecksState::Passing),
+                ],
+            }),
+        );
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{result:?}");
+        assert_eq!(fx.gh.commit_checks_calls(), vec!["main".to_string()]);
+    }
+
+    #[test]
+    fn unreadable_base_checks_warn_and_proceed() {
+        let mut fx = up_to_date_fixture();
+        fx.gh = std::mem::replace(&mut fx.gh, FakeGhCli::new()).with_commit_checks(
+            "main",
+            Err(GhError::Command {
+                command: "gh api graphql".to_string(),
+                exit_code: Some(1),
+                stderr: "HTTP 502".to_string(),
+            }),
+        );
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{result:?}");
+        assert!(
+            out.contains("warning: could not read main's checks"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn batch_records_a_red_base_ticket_as_failed() {
+        let mut fx = up_to_date_fixture();
+        fx.gh = std::mem::replace(&mut fx.gh, FakeGhCli::new())
+            .with_commit_checks("main", Ok(red_main()));
+
+        let (result, _out) = run_batch(&fx.deps(), &["PROJ-1".to_string()]);
+
+        let report = result.unwrap();
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, "PROJ-1");
+        assert!(report.failed[0].1.contains("--allow-red-base"));
+        assert!(fx.gh.pr_merge_calls().is_empty());
     }
 
     // --- conflict_prompt ---

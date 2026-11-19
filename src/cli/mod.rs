@@ -104,11 +104,18 @@ pub enum Command {
     /// conflict-resolution session never resolved (the rebase is left in
     /// progress on disk — see the printed attach/abort commands), `1` any
     /// other error. A batch with both a failure and a hand-back exits `1`.
+    ///
+    /// Refuses (exit `1`, before any rebase) when the head commit of the
+    /// PR's base branch has a failed CI check; pending checks do not block.
     Merge {
         /// Ticket key(s) whose open pull request to merge, e.g. `PROJ-372`
         /// (case-insensitive). Give several to merge them as a batch.
         #[arg(required = true, num_args = 1..)]
         keys: Vec<String>,
+        /// Merge even when the base branch's head commit has a failed CI
+        /// check, e.g. to land the fix for a broken base.
+        #[arg(long)]
+        allow_red_base: bool,
     },
     /// List tickets assigned to you that are ready to pick up, or check
     /// whether a specific ticket is ready.
@@ -2425,7 +2432,29 @@ mod tests {
     fn parses_merge_with_key() {
         let cli = Cli::try_parse_from(["tm", "merge", "proj-20"]).expect("should parse");
         match cli.command {
-            Some(Command::Merge { keys }) => assert_eq!(keys, vec!["proj-20"]),
+            Some(Command::Merge {
+                keys,
+                allow_red_base,
+            }) => {
+                assert_eq!(keys, vec!["proj-20"]);
+                assert!(!allow_red_base);
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_merge_with_allow_red_base() {
+        let cli = Cli::try_parse_from(["tm", "merge", "proj-20", "--allow-red-base"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Merge {
+                keys,
+                allow_red_base,
+            }) => {
+                assert_eq!(keys, vec!["proj-20"]);
+                assert!(allow_red_base);
+            }
             other => panic!("expected Merge, got {other:?}"),
         }
     }
@@ -2435,7 +2464,7 @@ mod tests {
         let cli = Cli::try_parse_from(["tm", "merge", "proj-20", "PROJ-3", "proj-7"])
             .expect("should parse");
         match cli.command {
-            Some(Command::Merge { keys }) => {
+            Some(Command::Merge { keys, .. }) => {
                 assert_eq!(keys, vec!["proj-20", "PROJ-3", "proj-7"]);
             }
             other => panic!("expected Merge, got {other:?}"),
