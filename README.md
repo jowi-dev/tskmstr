@@ -1780,6 +1780,7 @@ latest sent and received messages, oldest first:
 UTC timestamps. The panel title is the session's chat name, marked `(awaiting
 reply)` while the lane has sent a peer a message the peer has not answered
 yet. A reply from that peer clears it; a message from someone else does not.
+A broadcast the lane sent never marks it: an announcement expects no reply.
 
 The overview raises the same signal: a running lane awaiting a reply moves
 to **needs input** and its row shows `chat?` until the answer arrives.

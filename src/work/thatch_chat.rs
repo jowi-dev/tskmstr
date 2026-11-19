@@ -569,11 +569,16 @@ pub fn lane_chat(runner: &dyn ThatchRunner, session_id: &str) -> Option<LaneChat
 /// Whether `name` sent a message that its recipient has not answered: for
 /// some peer, the last message between the two (in `messages`, oldest
 /// first) went from `name` to that peer. A reply from a different peer
-/// does not count as an answer.
+/// does not count as an answer. Broadcasts `name` sent are skipped: an
+/// announcement such as "PR is up" expects no reply, and thatch records one
+/// copy per recipient, so counting them would wait on every recipient.
 pub fn awaiting_reply(name: &str, messages: &[ChatMessage]) -> bool {
     let mut last_from_lane: BTreeMap<&str, bool> = BTreeMap::new();
     for message in messages {
         if message.from == name {
+            if message.broadcast {
+                continue;
+            }
             last_from_lane.insert(message.to.as_str(), true);
         } else if message.to == name {
             last_from_lane.insert(message.from.as_str(), false);
@@ -892,6 +897,28 @@ Broadcast from jowi-dev to 2 of 4 registered sessions (projects: jowi-dev/tskmst
         let messages = vec![
             msg(1, "t1", "lane", "coord", "which base?", true),
             msg(2, "t2", "human", "lane", "rebase", false),
+        ];
+        assert!(awaiting_reply("lane", &messages));
+    }
+
+    #[test]
+    fn a_broadcast_the_lane_sent_does_not_raise_awaiting_reply() {
+        let announce = |id, to: &str| ChatMessage {
+            broadcast: true,
+            ..msg(id, "t1", "lane", to, "PR is up", false)
+        };
+        let messages = vec![announce(1, "coord"), announce(2, "human")];
+        assert!(!awaiting_reply("lane", &messages));
+    }
+
+    #[test]
+    fn a_broadcast_after_a_direct_question_keeps_awaiting_reply() {
+        let messages = vec![
+            msg(1, "t1", "lane", "coord", "which base?", false),
+            ChatMessage {
+                broadcast: true,
+                ..msg(2, "t2", "lane", "coord", "PR is up", false)
+            },
         ];
         assert!(awaiting_reply("lane", &messages));
     }
