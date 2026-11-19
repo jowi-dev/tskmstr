@@ -67,8 +67,13 @@ fn main() -> ExitCode {
         keys,
         allow_red_base,
         auto_merge_run,
+        queue,
+        unqueue,
     } = command
     {
+        if queue || unqueue {
+            return run_merge_queue_cmd(&keys, unqueue);
+        }
         return run_merge_cmd(keys, allow_red_base, auto_merge_run);
     }
 
@@ -333,6 +338,7 @@ fn run_dispatch(
         DispatchCmd::Tick { scope, json } => {
             let targets = tskmstr::cli::dispatch::tick_targets(
                 &store.autopilot_scopes()?,
+                &store.merge_queue_scopes()?,
                 &selector(scope),
                 current.as_ref(),
             )?;
@@ -511,11 +517,13 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             log_dir: tskmstr::work::dispatch::auto_merge_log_dir(&self.home),
             spawner: &tskmstr::work::detach::RealDetachSpawner,
         };
+        let epic_tickets = |epic: &str| epic_ticket_keys(provider.as_ref(), epic);
         let merge = tskmstr::work::auto_merge::SweepDeps {
             store: self.store,
             gh: &gh,
             repo_dir,
             launcher: &merge_launcher,
+            epic_tickets: &epic_tickets,
         };
         let notifier = tskmstr::work::notify::DesktopNotifier::detect();
         let wake = tskmstr::work::chat_wake::WakeDeps {
@@ -2571,6 +2579,47 @@ fn run_ready_check(key: String) -> ExitCode {
 /// one.
 const MERGE_EXIT_CONFLICTS: u8 = 2;
 
+/// `tm merge --queue KEY...` / `--unqueue KEY...` (GitHub issue #247):
+/// adds the keys to, or removes them from, the current repo's merge queue.
+/// Exits 1 outside a tskmstr repo, on a store failure, or when `--unqueue`
+/// named a ticket that was not queued.
+fn run_merge_queue_cmd(keys: &[String], unqueue: bool) -> ExitCode {
+    let Some(repo) = dispatch_current_repo() else {
+        eprintln!("not in a tskmstr repo: run `tm merge --queue` inside the repo");
+        return ExitCode::FAILURE;
+    };
+    let result = tskmstr::runs::RunStore::open(&resolve_run_db_path())
+        .map_err(tskmstr::cli::dispatch::DispatchCliError::from)
+        .and_then(|store| {
+            let mut stdout = std::io::stdout();
+            if unqueue {
+                tskmstr::cli::merge_queue::unqueue(&store, &repo.scope, keys, &mut stdout)
+            } else {
+                tskmstr::cli::merge_queue::queue(&store, &repo, keys, &mut stdout).map(|()| true)
+            }
+        });
+    match result {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The keys of `epic`'s child tickets, for the automerge sweep's merge
+/// epic (GitHub issue #247).
+fn epic_ticket_keys(
+    provider: &dyn tskmstr::ticketing::provider::TicketProvider,
+    epic: &str,
+) -> Result<Vec<String>, String> {
+    provider
+        .children(epic)
+        .map(|issues| issues.into_iter().map(|issue| issue.key).collect())
+        .map_err(|err| err.to_string())
+}
+
 /// `tm merge <KEY>`: build real dependencies and run
 /// [`tskmstr::work::merge::run_merge`], mapping its
 /// [`tskmstr::work::merge::MergeFlowOutcome`] to an exit code (`0` merged,
@@ -3346,11 +3395,13 @@ impl AutopilotTicker {
             log_dir: dispatch::auto_merge_log_dir(&self.home),
             spawner: &tskmstr::work::detach::RealDetachSpawner,
         };
+        let epic_tickets = |epic: &str| epic_ticket_keys(jira.as_ref(), epic);
         let merge = tskmstr::work::auto_merge::SweepDeps {
             store: &store,
             gh: &gh,
             repo_dir: &target.repo_root,
             launcher: &merge_launcher,
+            epic_tickets: &epic_tickets,
         };
         let notifier = tskmstr::work::notify::DesktopNotifier::detect();
         let wake = tskmstr::work::chat_wake::WakeDeps {
@@ -3425,12 +3476,14 @@ fn autopilot_deps(
         },
         std::time::Duration::from_secs(config.dispatch.tick_secs),
     );
+    let repo_root = targets.first().map(|target| target.repo_root.clone());
     if !targets.is_empty() {
         host.set_targets(targets);
     }
     tskmstr::tui::event::AutopilotDeps {
         host: Some(host),
         max_lanes: config.dispatch.max_lanes,
+        repo_root,
     }
 }
 

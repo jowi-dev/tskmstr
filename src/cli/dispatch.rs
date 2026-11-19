@@ -12,9 +12,11 @@
 //!
 //! Every command takes a scope selector: the current repo by default,
 //! `--scope S`, or `--all` (every scope with an `autopilot` row). `tick
-//! --all` only visits scopes that are on, and each tick re-reads the flag
-//! under the scope lock, so `off --all` stops the next tick from launching
-//! anything. The lock is the one the TUI host takes too.
+//! --all` visits scopes that are on, plus scopes with queued merges (GitHub
+//! issue #247), and each tick re-reads the flag under the scope lock, so
+//! `off --all` stops the next tick from launching anything; a scope that is
+//! off only drains the merges queued by hand. The lock is the one the TUI
+//! host takes too.
 //!
 //! `src/main.rs` builds the real per-scope dependencies behind
 //! [`ScopeTicker`]; this module only selects scopes and prints results.
@@ -95,12 +97,15 @@ pub enum DispatchCliError {
     NoCurrentRepo,
 }
 
-/// The scopes `tm dispatch tick` visits for `selector`. `--all` takes only
-/// the scopes that are on; the tick itself re-checks the flag under the
-/// lock. A named scope that is the current repo's uses the current
-/// checkout; any other uses the repo runs.db recorded for it.
+/// The scopes `tm dispatch tick` visits for `selector`. `--all` takes the
+/// scopes that are on, plus those in `queued` (scopes with queued merges,
+/// [`RunStore::merge_queue_scopes`]), whose queue drains with autopilot
+/// off; the tick itself re-checks the flag under the lock. A named scope
+/// that is the current repo's uses the current checkout; any other uses the
+/// repo runs.db recorded for it.
 pub fn tick_targets(
     rows: &[AutopilotScope],
+    queued: &[String],
     selector: &ScopeSelector,
     current: Option<&CurrentRepo>,
 ) -> Result<Vec<Target>, DispatchCliError> {
@@ -130,7 +135,7 @@ pub fn tick_targets(
         }
         ScopeSelector::All => rows
             .iter()
-            .filter(|row| row.enabled)
+            .filter(|row| row.enabled || queued.contains(&row.scope))
             .map(|row| Target {
                 scope: row.scope.clone(),
                 repo_dir: row.repo_dir.as_ref().map(PathBuf::from),
@@ -281,6 +286,10 @@ fn auto_merge_json(action: &AutoMergeAction) -> serde_json::Value {
         AutoMergeAction::LaunchFailed { ticket, sha, error } => {
             (Some(ticket), "launch_failed", Some(sha), None, Some(error))
         }
+        AutoMergeAction::Queued { ticket, sha } => (Some(ticket), "queued", Some(sha), None, None),
+        AutoMergeAction::Dropped { ticket, reason } => {
+            (Some(ticket), "dropped", None, None, Some(reason))
+        }
         AutoMergeAction::CheckFailed { ticket, error } => (
             Some(ticket).filter(|t| !t.is_empty()),
             "prs_unavailable",
@@ -307,6 +316,13 @@ fn auto_merge_text(action: &AutoMergeAction) -> String {
         AutoMergeAction::LaunchFailed { ticket, error, .. } => {
             format!("automerge {ticket} launch failed: {error}")
         }
+        AutoMergeAction::Queued { ticket, sha } => format!(
+            "automerge {ticket} queued ({})",
+            sha.chars().take(7).collect::<String>()
+        ),
+        AutoMergeAction::Dropped { ticket, reason } => {
+            format!("automerge {ticket} left the queue: {reason}")
+        }
         AutoMergeAction::CheckFailed { ticket, error } if ticket.is_empty() => {
             format!("automerge PRs unavailable: {error}")
         }
@@ -325,7 +341,19 @@ fn write_tick_text(scope: &str, outcome: &TickOutcome, out: &mut dyn Write) -> i
         Some(Skip::Locked) => {
             return writeln!(out, "{scope}: skipped: another host is ticking this scope");
         }
-        Some(Skip::Disabled) => return writeln!(out, "{scope}: skipped: autopilot is off"),
+        Some(Skip::Disabled) if report.auto_merges.is_empty() => {
+            return writeln!(out, "{scope}: skipped: autopilot is off");
+        }
+        Some(Skip::Disabled) => {
+            writeln!(
+                out,
+                "{scope}: autopilot is off; draining queued merges only"
+            )?;
+            for action in &report.auto_merges {
+                writeln!(out, "{scope}: {}", auto_merge_text(action))?;
+            }
+            return Ok(());
+        }
         None => {}
     }
     for launch in &report.launched {
@@ -463,6 +491,7 @@ pub fn status(store: &RunStore, now: i64, out: &mut dyn Write) -> Result<(), Dis
         if let Some(merge) = newest_merge {
             writeln!(out, "  {}", auto_merge_status(store, merge)?)?;
         }
+        super::merge_queue::write_queue(store, &row.scope, &runs, out)?;
     }
     Ok(())
 }
@@ -603,14 +632,14 @@ mod tests {
 
     #[test]
     fn the_current_selector_needs_a_current_repo() {
-        let err = tick_targets(&[], &ScopeSelector::Current, None).unwrap_err();
+        let err = tick_targets(&[], &[], &ScopeSelector::Current, None).unwrap_err();
         assert!(matches!(err, DispatchCliError::NoCurrentRepo));
     }
 
     #[test]
     fn the_current_selector_ticks_the_current_checkout() {
         let here = current(ONE, "/repos/one");
-        let targets = tick_targets(&[], &ScopeSelector::Current, Some(&here)).unwrap();
+        let targets = tick_targets(&[], &[], &ScopeSelector::Current, Some(&here)).unwrap();
         assert_eq!(
             targets,
             vec![Target {
@@ -627,7 +656,7 @@ mod tests {
             row(TWO, false, Some("/repos/two")),
             row("github:o/three", true, None),
         ];
-        let targets = tick_targets(&rows, &ScopeSelector::All, None).unwrap();
+        let targets = tick_targets(&rows, &[], &ScopeSelector::All, None).unwrap();
         assert_eq!(
             targets,
             vec![
@@ -644,6 +673,22 @@ mod tests {
     }
 
     #[test]
+    fn all_also_visits_a_scope_that_is_off_with_queued_merges() {
+        let rows = [
+            row(ONE, false, Some("/repos/one")),
+            row(TWO, false, Some("/repos/two")),
+        ];
+        let targets = tick_targets(&rows, &[TWO.to_string()], &ScopeSelector::All, None).unwrap();
+        assert_eq!(
+            targets,
+            vec![Target {
+                scope: TWO.to_string(),
+                repo_dir: Some(PathBuf::from("/repos/two")),
+            }]
+        );
+    }
+
+    #[test]
     fn a_named_scope_prefers_the_current_checkout_then_the_recorded_repo() {
         let rows = [
             row(ONE, true, Some("/old/one")),
@@ -651,8 +696,18 @@ mod tests {
         ];
         let here = current(ONE, "/repos/one");
 
-        let mine = tick_targets(&rows, &ScopeSelector::Scope(ONE.to_string()), Some(&here));
-        let other = tick_targets(&rows, &ScopeSelector::Scope(TWO.to_string()), Some(&here));
+        let mine = tick_targets(
+            &rows,
+            &[],
+            &ScopeSelector::Scope(ONE.to_string()),
+            Some(&here),
+        );
+        let other = tick_targets(
+            &rows,
+            &[],
+            &ScopeSelector::Scope(TWO.to_string()),
+            Some(&here),
+        );
 
         assert_eq!(mine.unwrap()[0].repo_dir, Some(PathBuf::from("/repos/one")));
         assert_eq!(
@@ -826,6 +881,34 @@ mod tests {
 
         assert!(ok);
         assert_eq!(out, "github:o/one: skipped: autopilot is off\n");
+    }
+
+    #[test]
+    fn a_disabled_tick_still_prints_its_automerges() {
+        let ticker = CannedTicker {
+            reports: vec![(
+                ONE,
+                Ok(TickReport {
+                    skipped: Some(Skip::Disabled),
+                    auto_merges: vec![AutoMergeAction::Started {
+                        ticket: "GH-3".to_string(),
+                        sha: "abcdef0123".to_string(),
+                        run_id: 8,
+                    }],
+                    ..TickReport::default()
+                }),
+            )],
+            calls: RefCell::new(Vec::new()),
+        };
+        let out = text(|out| {
+            tick(&[target(ONE, Some("/r"))], &ticker, false, out).unwrap();
+        });
+
+        assert_eq!(
+            out,
+            "github:o/one: autopilot is off; draining queued merges only\n\
+             github:o/one: automerge GH-3 started (abcdef0, run 8)\n"
+        );
     }
 
     #[test]
@@ -1007,6 +1090,7 @@ mod tests {
     fn tick_all(store: &RunStore, ticker: &CoreTicker) -> String {
         let targets = tick_targets(
             &store.autopilot_scopes().unwrap(),
+            &store.merge_queue_scopes().unwrap(),
             &ScopeSelector::All,
             None,
         )
@@ -1308,6 +1392,23 @@ mod tests {
 
         assert!(
             out.ends_with(&format!("  last automerge: GH-3 merged (run {merged})\n")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn status_lists_the_merge_queue_of_a_scope_that_is_off() {
+        let (_dir, store) = store();
+        store.record_autopilot_repo(ONE, "/repos/one").unwrap();
+        store
+            .enqueue_merge(ONE, "GH-5", crate::runs::merge_queue::QueueSource::Manual)
+            .unwrap();
+
+        let out = text(|out| status(&store, 0, out).unwrap());
+
+        assert!(out.starts_with("github:o/one: off,"), "{out}");
+        assert!(
+            out.ends_with("  merge queue:\n    1. GH-5 (manual) waiting\n"),
             "{out}"
         );
     }
