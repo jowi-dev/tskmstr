@@ -27,6 +27,7 @@ use thiserror::Error;
 
 pub mod cpu;
 pub mod footprint;
+pub mod merge_queue;
 pub mod overview;
 pub mod pid;
 pub mod pricing;
@@ -278,6 +279,28 @@ const MIGRATIONS: &[&str] = &[
     // orders its candidates the same way. NULL when none is chosen.
     r#"
     ALTER TABLE autopilot ADD COLUMN priority_epic TEXT;
+    "#,
+    // GitHub issue #247: the merge queue the automerge sweep drains, one
+    // row per (scope, ticket), first to merge at the lowest `position`.
+    // `source` is `manual` or `autopilot`. `head_sha` is the PR head the
+    // last merge started on; a non-NULL `held` is why it did not land, and
+    // holds the row until the head changes. `waiting` is why the last
+    // sweep passed over the row ("checks pending"), for display; NULL once
+    // it starts merging or before any sweep looked. `merge_epic` limits what the
+    // sweep enqueues on its own; NULL when none is chosen.
+    r#"
+    CREATE TABLE merge_queue (
+      scope    TEXT    NOT NULL,
+      ticket   TEXT    NOT NULL,
+      position INTEGER NOT NULL,
+      source   TEXT    NOT NULL,
+      head_sha TEXT,
+      held     TEXT,
+      waiting  TEXT,
+      added_at TEXT    NOT NULL,
+      PRIMARY KEY (scope, ticket)
+    );
+    ALTER TABLE autopilot ADD COLUMN merge_epic TEXT;
     "#,
 ];
 
@@ -4192,7 +4215,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_20() {
+    fn open_migrates_a_fresh_db_to_user_version_21() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -4200,7 +4223,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
