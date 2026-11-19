@@ -281,6 +281,10 @@ fn auto_merge_json(action: &AutoMergeAction) -> serde_json::Value {
         AutoMergeAction::LaunchFailed { ticket, sha, error } => {
             (Some(ticket), "launch_failed", Some(sha), None, Some(error))
         }
+        AutoMergeAction::Queued { ticket, sha } => (Some(ticket), "queued", Some(sha), None, None),
+        AutoMergeAction::Dropped { ticket, reason } => {
+            (Some(ticket), "dropped", None, None, Some(reason))
+        }
         AutoMergeAction::CheckFailed { ticket, error } => (
             Some(ticket).filter(|t| !t.is_empty()),
             "prs_unavailable",
@@ -306,6 +310,13 @@ fn auto_merge_text(action: &AutoMergeAction) -> String {
         ),
         AutoMergeAction::LaunchFailed { ticket, error, .. } => {
             format!("automerge {ticket} launch failed: {error}")
+        }
+        AutoMergeAction::Queued { ticket, sha } => format!(
+            "automerge {ticket} queued ({})",
+            sha.chars().take(7).collect::<String>()
+        ),
+        AutoMergeAction::Dropped { ticket, reason } => {
+            format!("automerge {ticket} left the queue: {reason}")
         }
         AutoMergeAction::CheckFailed { ticket, error } if ticket.is_empty() => {
             format!("automerge PRs unavailable: {error}")

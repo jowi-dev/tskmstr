@@ -1535,6 +1535,7 @@ mod tests {
             gh: &gh,
             repo_dir: Path::new("/repo"),
             launcher: &merge_launcher,
+            epic_tickets: &|_| Ok(Vec::new()),
         };
         let launcher = FakeLauncher::new(&fx.store);
 
@@ -1544,8 +1545,10 @@ mod tests {
         assert!(
             matches!(
                 &report.auto_merges[..],
-                [auto_merge::AutoMergeAction::Started { ticket, sha, .. }]
-                    if ticket == "GH-1" && sha == "abc1234"
+                [
+                    auto_merge::AutoMergeAction::Queued { .. },
+                    auto_merge::AutoMergeAction::Started { ticket, sha, .. },
+                ] if ticket == "GH-1" && sha == "abc1234"
             ),
             "{:?}",
             report.auto_merges
@@ -1564,6 +1567,7 @@ mod tests {
             gh: &gh,
             repo_dir: Path::new("/repo"),
             launcher: &merge_launcher,
+            epic_tickets: &|_| Ok(Vec::new()),
         };
         let launcher = FakeLauncher::new(&fx.store);
 
