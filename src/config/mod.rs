@@ -579,6 +579,15 @@ pub struct RawWorkConfig {
     /// cleanup) waits for memory or usage admission before giving up
     /// (GitHub issue #149). Defaults to 60.
     pub admission_wait_mins: Option<u64>,
+    /// Directories copied from the main checkout into each new worktree
+    /// (GitHub issue #255), e.g. `copy_dirs = ["deps"]`, so a lane starts
+    /// with its dependencies instead of downloading them again. Paths are
+    /// relative to the checkout root and may not leave it. On macOS the
+    /// copy is a copy-on-write clone that uses no extra disk until a file is
+    /// rewritten. A repo list replaces the global one as a whole. Unset or
+    /// empty provisions worktrees exactly as before. See
+    /// [`crate::work::copy_dirs`].
+    pub copy_dirs: Option<Vec<String>>,
 }
 
 /// Raw, partially-specified `[work.audit]` subsection as parsed directly from
@@ -1324,6 +1333,9 @@ pub struct WorkConfig {
     pub manual: ManualConfig,
     /// Validated memory-admission settings. See [`MemoryConfig`].
     pub memory: MemoryConfig,
+    /// See [`RawWorkConfig::copy_dirs`]. Empty when unset in both global
+    /// and repo config.
+    pub copy_dirs: Vec<String>,
 }
 
 /// Validated memory-admission settings from [`RawWorkConfig::memory_budget_gb`],
@@ -1823,6 +1835,16 @@ pub enum ConfigError {
     )]
     InvalidFixThreshold {
         /// The unrecognized value as written in config.
+        value: String,
+    },
+
+    /// A `[work] copy_dirs` entry was empty, absolute, or climbed out of
+    /// the checkout with `..`.
+    #[error(
+        "invalid [work] copy_dirs entry `{value}`; expected a relative path inside the checkout"
+    )]
+    InvalidCopyDir {
+        /// The offending path.
         value: String,
     },
 
@@ -2720,6 +2742,13 @@ fn merge_work(
     let repo = repo.unwrap_or_default();
 
     let memory = merge_memory(&global, &repo)?;
+    let copy_dirs = repo.copy_dirs.or(global.copy_dirs).unwrap_or_default();
+    if let Some(bad) = copy_dirs
+        .iter()
+        .find(|dir| !crate::work::copy_dirs::is_contained_relative_path(dir))
+    {
+        return Err(ConfigError::InvalidCopyDir { value: bad.clone() });
+    }
     let worktree_root = repo.worktree_root.or(global.worktree_root);
     let default_model = repo.default_model.or(global.default_model);
     let default_max_turns = repo.default_max_turns.or(global.default_max_turns);
@@ -2815,6 +2844,7 @@ fn merge_work(
         auto_review,
         manual,
         memory,
+        copy_dirs,
     })
 }
 
@@ -5762,6 +5792,7 @@ mod tests {
             memory_budget_gb: None,
             lane_memory_estimate_gb: None,
             admission_wait_mins: None,
+            copy_dirs: None,
         };
         let repo = RawWorkConfig {
             build_slots: None,
@@ -5784,6 +5815,7 @@ mod tests {
             memory_budget_gb: None,
             lane_memory_estimate_gb: None,
             admission_wait_mins: None,
+            copy_dirs: None,
         };
         let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
         // Overridden field wins.
@@ -7059,6 +7091,47 @@ mod tests {
             global: global_path,
             repo: None,
         })
+    }
+
+    #[test]
+    fn copy_dirs_is_empty_by_default() {
+        let cfg = load_global_work("").expect("should load");
+        assert!(cfg.work.copy_dirs.is_empty());
+    }
+
+    #[test]
+    fn copy_dirs_parses_a_list_of_relative_paths() {
+        let cfg = load_global_work("copy_dirs = [\"deps\", \"assets/node_modules\"]")
+            .expect("should load");
+        assert_eq!(
+            cfg.work.copy_dirs,
+            vec!["deps".to_string(), "assets/node_modules".to_string()]
+        );
+    }
+
+    #[test]
+    fn copy_dirs_rejects_paths_that_escape_the_worktree() {
+        for bad in ["../deps", "/deps", ""] {
+            let err = load_global_work(&format!("copy_dirs = [\"{bad}\"]")).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidCopyDir { .. }),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_copy_dirs_replace_global_as_a_whole_list() {
+        let global = RawWorkConfig {
+            copy_dirs: Some(vec!["deps".to_string()]),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            copy_dirs: Some(vec![]),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
+        assert!(cfg.copy_dirs.is_empty());
     }
 
     #[test]

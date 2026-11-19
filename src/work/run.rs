@@ -34,7 +34,9 @@
 //!    `wt_name` as the initial branch from the resolved base. If
 //!    `<repo_root>/.env.local` exists, [`GitOps::provision_worktree`]
 //!    symlinks it into the new worktree and this prints `work.ml`'s
-//!    "Linked .env.local from main repo" message.
+//!    "Linked .env.local from main repo" message. Directories listed in
+//!    `[work] copy_dirs` are then copied from the main checkout (see
+//!    [`crate::work::copy_dirs`]).
 //! 5. Fetch `origin` in the worktree ([`GitOps::fetch_origin`]), so the base
 //!    ref this run's branch is about to be cut from (step 6) is current —
 //!    `work.ml` does this immediately after provisioning-if-missing, before
@@ -1271,11 +1273,15 @@ pub fn prepare_run_lane(
 
     if !wt_path.exists() {
         let base = resolve_base(deps.git)?;
-        let linked = deps
-            .git
-            .provision_worktree(&repo_root, &wt_path, &wt_name, Some(&base))?;
-        if linked {
-            writeln!(out, "Linked .env.local from main repo")?;
+        for message in crate::work::copy_dirs::provision_worktree(
+            deps.git,
+            &repo_root,
+            &wt_path,
+            &wt_name,
+            Some(&base),
+            &config.copy_dirs,
+        )? {
+            writeln!(out, "{message}")?;
         }
     }
 
@@ -2620,6 +2626,7 @@ mod tests {
             auto_review: crate::config::AutoReviewConfig::default(),
             manual: crate::config::ManualConfig::default(),
             memory: crate::config::MemoryConfig::default(),
+            copy_dirs: Vec::new(),
         }
     }
 

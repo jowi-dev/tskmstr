@@ -12,6 +12,7 @@ pub mod bugbot;
 pub mod build_slots;
 pub mod ci_fix;
 pub mod comment_store;
+pub mod copy_dirs;
 pub mod create;
 pub mod detach;
 pub mod dispatch;
