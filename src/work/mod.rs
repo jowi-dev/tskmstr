@@ -13,6 +13,7 @@ pub mod build_slots;
 pub mod chat_wake;
 pub mod ci_fix;
 pub mod comment_store;
+pub mod coordinator;
 pub mod create;
 pub mod detach;
 pub mod dispatch;
