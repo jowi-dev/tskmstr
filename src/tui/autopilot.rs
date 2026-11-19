@@ -35,7 +35,7 @@ pub fn toggle(mut app: App) -> (App, Vec<Cmd>) {
             }
         },
         Screen::Overview => match app.selected_overview_row() {
-            Some(row) if !row.key.scope.is_empty() => row.key.scope.clone(),
+            Some(row) if !crate::runs::is_unscoped(&row.key.scope) => row.key.scope.clone(),
             Some(_) => {
                 app.status_line = "autopilot: this row has no scope".to_string();
                 return (app, Vec::new());
@@ -199,12 +199,12 @@ pub fn summary_for(app: &App, scope: &str) -> Option<String> {
         .map(|status| status.summary(app.autopilot_errors.get(scope).map(String::as_str)))
 }
 
-/// The distinct, non-empty scopes of `rows`, sorted.
+/// The distinct scopes of `rows` that name a project, sorted.
 fn overview_scopes(rows: &[OverviewRow]) -> Vec<String> {
     let mut scopes: Vec<String> = rows
         .iter()
         .map(|row| row.key.scope.clone())
-        .filter(|scope| !scope.is_empty())
+        .filter(|scope| !crate::runs::is_unscoped(scope))
         .collect();
     scopes.sort();
     scopes.dedup();
@@ -217,7 +217,9 @@ fn overview_scopes(rows: &[OverviewRow]) -> Vec<String> {
 fn overview_targets(rows: &[OverviewRow]) -> Vec<AutopilotTarget> {
     let mut targets: Vec<AutopilotTarget> = Vec::new();
     for row in rows {
-        if row.key.scope.is_empty() || targets.iter().any(|t| t.scope == row.key.scope) {
+        if crate::runs::is_unscoped(&row.key.scope)
+            || targets.iter().any(|t| t.scope == row.key.scope)
+        {
             continue;
         }
         if let Some(root) = row.repo_root.path() {
@@ -339,12 +341,14 @@ mod tests {
 
     #[test]
     fn p_on_an_unscoped_or_missing_overview_row_does_nothing() {
-        let (app, cmds) = update(
-            overview_app(vec![row("", "GH-1", None)], 0),
-            Msg::ToggleAutopilot,
-        );
-        assert!(cmds.is_empty());
-        assert!(app.status_line.contains("no scope"));
+        for scope in ["", crate::runs::LEGACY_UNSCOPED] {
+            let (app, cmds) = update(
+                overview_app(vec![row(scope, "GH-1", None)], 0),
+                Msg::ToggleAutopilot,
+            );
+            assert!(cmds.is_empty());
+            assert!(app.status_line.contains("no scope"));
+        }
 
         let (app, cmds) = update(overview_app(Vec::new(), 0), Msg::ToggleAutopilot);
         assert!(cmds.is_empty());
@@ -547,6 +551,21 @@ mod tests {
                 .iter()
                 .any(|cmd| matches!(cmd, Cmd::LoadAutopilotStatus { .. }))
         );
+    }
+
+    #[test]
+    fn overview_scopes_and_targets_skip_legacy_unscoped_rows() {
+        let rows = vec![
+            row(crate::runs::LEGACY_UNSCOPED, "GH-1", Some("/r/legacy")),
+            row("github:o/a", "GH-2", Some("/r/a")),
+        ];
+
+        assert_eq!(overview_scopes(&rows), vec!["github:o/a"]);
+        let targets: Vec<String> = overview_targets(&rows)
+            .into_iter()
+            .map(|t| t.scope)
+            .collect();
+        assert_eq!(targets, vec!["github:o/a"]);
     }
 
     #[test]

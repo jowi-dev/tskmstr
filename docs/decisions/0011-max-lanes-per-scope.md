@@ -24,10 +24,13 @@ place. GitHub issue #170 tracks it.
    whose run scope matches the scope it is ticking. The query is
    `RunStore::running_lane_tickets`.
 
-2. **Legacy unscoped runs count for every scope.** Rows with `scope = ''`
+2. **Legacy unscoped runs count for no scope.** Rows with `scope = ''`
    predate scoped runs, so tm cannot tell which project they belong to.
-   They count toward every scope's cap, the same rule `in_hand` and the
-   other scoped run queries follow.
+   They originally counted toward every scope's cap. GitHub issue #263
+   reversed that: the runs.db migration to version 21 gives each one a real
+   scope where it can and `legacy:unscoped` otherwise, and that sentinel
+   matches no scope, in this count, `in_hand`, and every other scoped run
+   query.
 
 3. **A lane-cap refusal names the lanes it counted.** `Refusal::MaxLanes`
    carries the counted tickets, and its message lists them, for example

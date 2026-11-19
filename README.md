@@ -274,7 +274,7 @@ tm auth status
 | `tm usage statusline [-- <command...>]` | Claude Code statusline shim: save the stdin payload's `rate_limits` as usage snapshots (at most every 30s), then run `<command...>` with the same stdin and print its output unchanged. Recording errors never change the output or exit code (`TM_DEBUG=1` prints them on stderr). See "Usage snapshots" below |
 | `tm dispatch tick [--scope S \| --all] [--json]` | Run one autopilot dispatch pass for the current repo, one scope, or every scope that is on. Exits `0` even when a scope is off, locked, or refused by a gate; `1` only when a scope can't tick. See "Running autopilot without a TUI" below |
 | `tm dispatch on\|off [--scope S \| --all]` | Turn autopilot on or off. `on` inside a repo also records the repo for `tick --all`; `off --all` is the kill switch |
-| `tm dispatch status` | Per scope: on or off, running lanes, last tick, time since the last launch, and the refusal blocking it now (with how long it has lasted) |
+| `tm dispatch status` | Per scope: on or off, running lanes, last tick, time since the last launch, and the refusal blocking it now (with how long it has lasted), or why it has nothing to launch |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `auto-review`, `review-watch`, `bugbot-cleanup`, `merge-conflict`, `setup`, `walkthrough`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
@@ -1263,6 +1263,9 @@ it. A tick:
      lane that ended without a PR waits for a human instead of looping);
    - a run recorded a PR that no run recorded merged or closed;
    - its newest auto-review round hit the round cap.
+
+   Only runs recorded under this scope count. GitHub keys restart at
+   `GH-1` in every repo, so another repo's `GH-3` never holds this one's.
 4. **Orders them** by how many other candidates each one unblocks, most
    first. Ties keep the tracker's rank order. When the scope has a
    **priority epic** (GitHub issue #237, set from the board's `e` picker),
@@ -1401,8 +1404,7 @@ autopilot on · lanes 2/2 (GH-7, GH-8) · launched 12m ago · not launching: 2 l
 - **lanes**: this repo's lane runs running now, against `max_lanes` from
   the config you started the TUI from, followed by their tickets. The
   count is the one `max_lanes` caps and `tm dispatch status` prints, so a
-  legacy lane without a scope, or one the board's filter hides, is still
-  named.
+  lane the board's filter hides is still named.
 - **launched**: how long ago this repo last launched a lane. It is left out
   when the repo has never launched one.
 - the last part is the newest tick's refusal, from `dispatch_events`, and
@@ -1459,11 +1461,19 @@ github:o/r: on, 1 lanes running (GH-5), last tick 2026-10-19T14:03:22Z, last lau
   blocked for 45m: not launching: 1 lanes running (GH-5), [dispatch] max_lanes is 1
 ```
 
-The lane count is the one `max_lanes` caps: this scope's running lanes,
-plus legacy lanes recorded before runs carried a scope. The board's
-`lanes` count reads the same rows, so the two always agree.
+The lane count is the one `max_lanes` caps: this scope's running lanes.
+The board's `lanes` count reads the same rows, so the two always agree.
 
-The `blocked` line appears only while the newest tick refused.
+The `blocked` line appears only while the newest tick refused. While the
+newest tick launched nothing and refused nothing, an `idle` line says why
+instead, naming the run that holds each in-hand ticket:
+
+```
+  idle for 2h: nothing to launch: every ready ticket is in hand: GH-3 (lane already attempted, run 412)
+```
+
+or `nothing to launch: no ready tickets`. `tick` prints the same text, and
+`--json` carries it as `"idle"`.
 `tick` prints one line per launch, naming the runner the lane landed on,
 for example `github:o/r: launched GH-1 in lane backend on opencode`. A
 stacked launch adds `(stacked on <base>)`. With `--json`, each launch

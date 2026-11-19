@@ -1349,8 +1349,8 @@ pub struct DispatchConfig {
     pub max_fix_rounds: u32,
     /// The most lane runs the autopilot dispatcher lets run at once in one
     /// scope (`crate::work::dispatch::tick`). Every running lane in the
-    /// ticking scope counts, however it was launched, plus legacy unscoped
-    /// lanes; lanes in other scopes do not (GitHub issue #170, ADR-0011).
+    /// ticking scope counts, however it was launched; lanes in other scopes
+    /// do not (GitHub issue #170, ADR-0011).
     /// Defaults to [`DEFAULT_DISPATCH_MAX_LANES`].
     pub max_lanes: usize,
     /// The most lanes the autopilot dispatcher launches for one scope in

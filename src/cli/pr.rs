@@ -1372,7 +1372,7 @@ mod tests {
         let run_store = open_run_store(db_dir.path());
         let existing_id = run_store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: "jira:https://example.atlassian.net:PROJ".to_string(),
                 ticket: "PROJ-372".to_string(),
                 lane: "review-watch".to_string(),
                 worktree: "/irrelevant".to_string(),
@@ -1437,7 +1437,7 @@ mod tests {
         let run_store = open_run_store(db_dir.path());
         run_store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: "jira:https://example.atlassian.net:PROJ".to_string(),
                 ticket: "AX-408".to_string(),
                 lane: "axiom".to_string(),
                 worktree: "/worktrees/axiom-ax-408".to_string(),

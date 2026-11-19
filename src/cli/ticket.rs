@@ -3075,7 +3075,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -3109,7 +3109,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "PROJ-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -3130,7 +3130,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = open_run_store(dir.path());
         store
-            .record_audit("", "PROJ-372", "ready", Some("looks good"))
+            .record_audit(
+                "jira:https://example.atlassian.net:PROJ",
+                "PROJ-372",
+                "ready",
+                Some("looks good"),
+            )
             .unwrap();
         let status = AuditStoreStatus::Open(&store);
         let mut out = Vec::new();
@@ -3138,7 +3143,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -3161,7 +3166,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -3185,7 +3190,7 @@ mod tests {
         let err = audit_read(
             &jira,
             &status,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "not-a-key!",
             &no_session_env(),
             &no_sessions_dir(),
@@ -3210,7 +3215,7 @@ mod tests {
         let err = audit_read(
             &jira,
             &status,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-404",
             &no_session_env(),
             &no_sessions_dir(),
@@ -3236,7 +3241,7 @@ mod tests {
 
         audit_record(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             "ready",
             Some("looks good"),
@@ -3266,7 +3271,7 @@ mod tests {
 
         let err = audit_record(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "not-a-key!",
             "ready",
             None,
@@ -3290,7 +3295,7 @@ mod tests {
 
         retro(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             crate::runs::RetroVerdict::Clean,
             None,
@@ -3318,7 +3323,7 @@ mod tests {
 
         retro(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             crate::runs::RetroVerdict::Defect,
             Some(crate::runs::RetroSeverity::Major),
@@ -3347,7 +3352,7 @@ mod tests {
 
         let err = retro(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "not-a-key!",
             crate::runs::RetroVerdict::Clean,
             None,
@@ -3369,7 +3374,7 @@ mod tests {
 
         let err = retro(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "PROJ-372",
             crate::runs::RetroVerdict::Clean,
             None,
@@ -3395,7 +3400,7 @@ mod tests {
 
         let err = retro(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "PROJ-372",
             crate::runs::RetroVerdict::Defect,
             None,
@@ -3561,7 +3566,7 @@ mod tests {
 
         retro(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "PROJ-372",
             crate::runs::RetroVerdict::Defect,
             Some(crate::runs::RetroSeverity::Major),
@@ -3594,7 +3599,7 @@ mod tests {
         let store = open_run_store(dir.path());
         let run_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: "jira:https://example.atlassian.net:PROJ".to_string(),
                 ticket: "PROJ-372".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt".to_string(),
@@ -3620,7 +3625,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -3644,7 +3649,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -3666,7 +3671,7 @@ mod tests {
         let store = open_run_store(dir.path());
         store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: "jira:https://example.atlassian.net:PROJ".to_string(),
                 ticket: "PROJ-372".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt".to_string(),
@@ -3682,7 +3687,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -3708,7 +3713,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             &env,
             markers_dir.path(),
@@ -3735,7 +3740,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -3756,14 +3761,22 @@ mod tests {
 
         // Simulate the read-mode registration that would have happened
         // earlier in the same Claude Code session.
-        register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-372").unwrap();
+        register_session(
+            &store,
+            Some(crate::runs::TEST_SCOPE),
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-372",
+        )
+        .unwrap();
         let marker = markers_dir.path().join("sess-1");
         assert!(marker.exists());
 
         let mut out = Vec::new();
         audit_record(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             "ready",
             None,
@@ -3796,7 +3809,7 @@ mod tests {
             audit_read(
                 &jira,
                 &status,
-                "",
+                "jira:https://example.atlassian.net:PROJ",
                 "proj-372",
                 &env,
                 markers_dir.path(),
@@ -3809,7 +3822,7 @@ mod tests {
         read(&mut out);
         audit_record(
             &store,
-            "",
+            "jira:https://example.atlassian.net:PROJ",
             "proj-372",
             "ready",
             None,

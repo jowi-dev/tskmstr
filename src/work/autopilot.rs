@@ -188,9 +188,9 @@ pub struct AutopilotStatus {
     pub scope: String,
     /// The scope's runs.db autopilot flag.
     pub enabled: bool,
-    /// The tickets of the scope's lane runs running now, legacy unscoped
-    /// ones included, oldest first: what `max_lanes` caps and what `tm
-    /// dispatch status` counts (see [`RunStore::running_lane_tickets`]).
+    /// The tickets of the scope's lane runs running now, oldest first: what
+    /// `max_lanes` caps and what `tm dispatch status` counts (see
+    /// [`RunStore::running_lane_tickets`]).
     pub running_lanes: Vec<String>,
     /// `[dispatch] max_lanes`.
     pub max_lanes: usize,
@@ -213,9 +213,8 @@ impl AutopilotStatus {
     /// lanes 1/2 (AX-809) · launched 12m ago · not launching: … (5m)`. The
     /// priority epic shows whether autopilot is on or off, since it is set
     /// independently of the flag. The lanes count
-    /// names the tickets it counts, so a lane the view doesn't list (a
-    /// legacy unscoped one, or one the board's filter hides) is not a
-    /// phantom (GitHub issue #171). The trailing age is how long the refusal
+    /// names the tickets it counts, so a lane the view doesn't list (one the
+    /// board's filter hides) is not a phantom (GitHub issue #171). The trailing age is how long the refusal
     /// has lasted. A tick error, when given, replaces the refusal.
     pub fn summary(&self, tick_error: Option<&str>) -> String {
         let epic = match &self.priority_epic {

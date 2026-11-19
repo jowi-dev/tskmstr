@@ -1643,7 +1643,7 @@ mod tests {
 
     fn start_params(ticket: &str) -> StartRun {
         StartRun {
-            scope: String::new(),
+            scope: crate::runs::TEST_SCOPE.to_string(),
             ticket: ticket.to_string(),
             lane: "backend".to_string(),
             worktree: "/tmp/wt".to_string(),
@@ -2536,7 +2536,13 @@ mod tests {
             )
             .unwrap();
         store
-            .record_retro("", "PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
+            .record_retro(
+                crate::runs::TEST_SCOPE,
+                "PROJ-1",
+                crate::runs::RetroVerdict::Clean,
+                None,
+                None,
+            )
             .unwrap();
 
         let defect_id = store.start_run(&start_params("PROJ-2")).unwrap();
@@ -2552,7 +2558,7 @@ mod tests {
             .unwrap();
         store
             .record_retro(
-                "",
+                crate::runs::TEST_SCOPE,
                 "PROJ-2",
                 crate::runs::RetroVerdict::Defect,
                 Some(crate::runs::RetroSeverity::Major),
@@ -2563,7 +2569,7 @@ mod tests {
         // PROJ-3 shipped a defect but has no recorded run at all.
         store
             .record_retro(
-                "",
+                crate::runs::TEST_SCOPE,
                 "PROJ-3",
                 crate::runs::RetroVerdict::Defect,
                 Some(crate::runs::RetroSeverity::Minor),
@@ -2599,7 +2605,7 @@ mod tests {
 
         let lane_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt".to_string(),
@@ -2622,7 +2628,7 @@ mod tests {
 
         let audit_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt2".to_string(),
@@ -2644,7 +2650,13 @@ mod tests {
             .unwrap();
 
         store
-            .record_retro("", "PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
+            .record_retro(
+                crate::runs::TEST_SCOPE,
+                "PROJ-1",
+                crate::runs::RetroVerdict::Clean,
+                None,
+                None,
+            )
             .unwrap();
 
         let mut out = Vec::new();
@@ -5062,7 +5074,7 @@ mod tests {
 
         register(
             &store,
-            None,
+            Some(crate::runs::TEST_SCOPE),
             markers_dir.path(),
             &env,
             "bugbot-cleanup",
@@ -5081,7 +5093,7 @@ mod tests {
 
         register(
             &store,
-            None,
+            Some(crate::runs::TEST_SCOPE),
             markers_dir.path(),
             &env,
             "bugbot-cleanup",
@@ -5107,7 +5119,7 @@ mod tests {
 
         let pre_id = store
             .start_run(&StartRun {
-                scope: String::new(),
+                scope: crate::runs::TEST_SCOPE.to_string(),
                 ticket: "PROJ-1".to_string(),
                 lane: "bugbot-cleanup".to_string(),
                 worktree: "/repo/axiom".to_string(),
@@ -5123,7 +5135,7 @@ mod tests {
 
         register(
             &store,
-            None,
+            Some(crate::runs::TEST_SCOPE),
             markers_dir.path(),
             &env,
             "bugbot-cleanup",

@@ -1233,9 +1233,10 @@ fn stage_label(stage: Stage) -> &'static str {
 
 /// A scope's short project name for the overview: the repo of a
 /// `github:owner/repo` scope, the project key of a `jira:url:KEY` scope,
-/// `(unscoped)` for a legacy pre-scoping row, and anything else as-is.
+/// `(unscoped)` for a row with no project ([`crate::runs::is_unscoped`]),
+/// and anything else as-is.
 fn project_label(scope: &str) -> &str {
-    if scope.is_empty() {
+    if crate::runs::is_unscoped(scope) {
         return "(unscoped)";
     }
     if let Some(repo) = scope.strip_prefix("github:") {
@@ -5394,6 +5395,7 @@ mod tests {
             "PROJ"
         );
         assert_eq!(project_label(""), "(unscoped)");
+        assert_eq!(project_label(crate::runs::LEGACY_UNSCOPED), "(unscoped)");
         assert_eq!(project_label("other"), "other");
     }
 
