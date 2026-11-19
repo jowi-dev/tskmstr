@@ -4317,7 +4317,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_21() {
+    fn open_migrates_a_fresh_db_to_user_version_22() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -4325,7 +4325,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 21);
+        assert_eq!(version, 22);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
