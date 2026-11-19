@@ -976,9 +976,84 @@ fn resolve_prompt_path(
 /// to `work.ml`'s hardcoded default (`~/Worktrees`) when unset. Mirrors
 /// `crate::cli::work::resolve_worktree_root`, duplicated here (rather than
 /// shared) because `cli::work` depends on `work::run`, not the reverse.
-fn resolve_worktree_root(config: &WorkConfig, home: &Path) -> PathBuf {
+pub fn resolve_worktree_root(config: &WorkConfig, home: &Path) -> PathBuf {
     let raw = config.worktree_root.as_deref().unwrap_or("~/Worktrees");
     expand_tilde(raw, home)
+}
+
+/// Where a lane keeps a ticket's worktree: the one place that computes it,
+/// shared by [`prepare_run_lane`] and the board's audit launch
+/// ([`crate::work::audit::launch_audit`], GitHub issue #252) so the two can
+/// never disagree about where a ticket lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneWorktree {
+    /// The lane's repository checkout, where `git worktree add` runs.
+    pub repo_root: PathBuf,
+    /// The per-repo directory under the worktree root (see
+    /// [`lane_repo_key`]).
+    pub repo: String,
+    /// The worktree's directory name, which is also the branch
+    /// [`GitOps::provision_worktree`] checks out in it: the lowercased
+    /// ticket key, or the lane name for a ticketless run.
+    pub wt_name: String,
+    /// `<worktree_root>/<repo>/<wt_name>`.
+    pub wt_path: PathBuf,
+}
+
+/// Computes `lane`'s worktree for `ticket` under `worktree_root` (already
+/// `~`-expanded, see [`resolve_worktree_root`]).
+///
+/// Errors with [`RunLaneError::EmptyWorktreeName`] for an empty ticket and
+/// [`RunLaneError::WorktreePathMismatch`] if the computed path is not
+/// exactly one level below `<worktree_root>/<repo>`: an empty ticket would
+/// make `naming::worktree_path`'s trailing `.join("")` a no-op and collapse
+/// the path onto the project's worktree directory itself (see that
+/// function's doc comment), and the path re-check guards the result
+/// independently of the emptiness check (see
+/// `naming::worktree_path_has_expected_parent`).
+pub fn lane_worktree(
+    worktree_root: &Path,
+    lane: &str,
+    lane_config: &crate::config::LaneConfig,
+    ticket: Option<&str>,
+) -> Result<LaneWorktree, RunLaneError> {
+    let wt_name = ticket
+        .map(str::to_lowercase)
+        .unwrap_or_else(|| lane.to_string());
+    if wt_name.trim().is_empty() {
+        return Err(RunLaneError::EmptyWorktreeName);
+    }
+
+    let root = worktree_root.to_string_lossy();
+    let repo = lane_repo_key(lane, lane_config);
+    let wt_path = naming::worktree_path(&root, &repo, &wt_name);
+    if !naming::worktree_path_has_expected_parent(&root, &repo, &wt_path) {
+        return Err(RunLaneError::WorktreePathMismatch(wt_path));
+    }
+
+    Ok(LaneWorktree {
+        repo_root: PathBuf::from(&lane_config.repo),
+        repo,
+        wt_name,
+        wt_path,
+    })
+}
+
+/// The base a lane cuts from when nothing more specific applies: the lane's
+/// `base_branch`, else the repository's default branch
+/// ([`GitOps::default_base`]), else [`RunLaneError::NoBaseBranch`].
+/// [`prepare_run_lane`] consults a stacked blocker's branch and `--from`
+/// first; an audit provisioning a worktree ahead of the lane uses this alone.
+pub fn lane_base(
+    git: &dyn GitOps,
+    lane: &str,
+    lane_config: &crate::config::LaneConfig,
+) -> Result<String, RunLaneError> {
+    if let Some(base) = lane_config.base_branch.clone() {
+        return Ok(base);
+    }
+    git.default_base(Path::new(&lane_config.repo))
+        .or(Err(RunLaneError::NoBaseBranch(lane.to_string())))
 }
 
 /// The final path component of `repo_root`, used as the worktree root's
@@ -1155,35 +1230,19 @@ pub fn prepare_run_lane(
         return Err(RunLaneError::PromptFileMissing(prompt_path));
     }
 
-    // Step 3: derive the worktree/branch-prefix name.
-    let wt_name = request
-        .ticket
-        .as_deref()
-        .map(str::to_lowercase)
-        .unwrap_or_else(|| lane.to_string());
-
-    // An empty ticket (`--ticket ""`) lowercases to an empty `wt_name`,
-    // which would make `naming::worktree_path`'s trailing `.join("")` a
-    // no-op and silently collapse the worktree path onto the project's
-    // worktree directory itself — see that function's doc comment. Reject
-    // it here, before it ever reaches `naming::worktree_path`.
-    if wt_name.trim().is_empty() {
-        return Err(RunLaneError::EmptyWorktreeName);
-    }
-
-    let worktree_root = resolve_worktree_root(config, &paths.home);
-    let repo = lane_repo_key(lane, lane_config);
-    let wt_path = naming::worktree_path(&worktree_root.to_string_lossy(), &repo, &wt_name);
-
-    // Belt-and-suspenders: re-check the *computed* path independently of
-    // the emptiness check above, right before anything below provisions a
-    // worktree at it. See `naming::worktree_path_has_expected_parent`'s doc
-    // comment for why this is a second, independent guard rather than
-    // redundant with the check above.
-    if !naming::worktree_path_has_expected_parent(&worktree_root.to_string_lossy(), &repo, &wt_path)
-    {
-        return Err(RunLaneError::WorktreePathMismatch(wt_path));
-    }
+    // Step 3: derive the worktree/branch-prefix name and the worktree path,
+    // validated by `lane_worktree` before anything below provisions at it.
+    let LaneWorktree {
+        repo,
+        wt_name,
+        wt_path,
+        ..
+    } = lane_worktree(
+        &resolve_worktree_root(config, &paths.home),
+        lane,
+        lane_config,
+        request.ticket.as_deref(),
+    )?;
 
     // The timestamp is computed here — earlier than strictly needed for
     // step 6's branch name below — specifically so `log_path` (and thus
@@ -1262,13 +1321,7 @@ pub fn prepare_run_lane(
         if let Some(base) = request.from_base.clone() {
             return Ok(base);
         }
-        if let Some(base) = lane_config.base_branch.clone() {
-            return Ok(base);
-        }
-        deps.git
-            .default_base(&repo_root)
-            .map_err(RunLaneError::from)
-            .or(Err(RunLaneError::NoBaseBranch(lane.to_string())))
+        lane_base(deps.git, lane, lane_config)
     };
 
     if !wt_path.exists() {
@@ -8495,6 +8548,85 @@ mod tests {
         assert_eq!(run.repo.as_deref(), Some("axiom"));
     }
 
+    fn worktree_test_lane(repo: &str, base_branch: Option<&str>) -> LaneConfig {
+        LaneConfig {
+            repo: repo.to_string(),
+            prompt_file: None,
+            base_branch: base_branch.map(str::to_string),
+            model: None,
+            max_turns: None,
+            permission_mode: None,
+            subagent: None,
+        }
+    }
+
+    #[test]
+    fn lane_worktree_places_a_ticket_under_the_lane_repo() {
+        let lane = worktree_test_lane("/Users/jowi/Projects/axiom", None);
+
+        let worktree = lane_worktree(Path::new("/wt"), "axiom", &lane, Some("PROJ-1")).unwrap();
+
+        assert_eq!(
+            worktree,
+            LaneWorktree {
+                repo_root: PathBuf::from("/Users/jowi/Projects/axiom"),
+                repo: "axiom".to_string(),
+                wt_name: "proj-1".to_string(),
+                wt_path: PathBuf::from("/wt/axiom/proj-1"),
+            }
+        );
+    }
+
+    #[test]
+    fn lane_worktree_without_a_ticket_is_named_after_the_lane() {
+        let lane = worktree_test_lane("/Users/jowi/Projects/axiom", None);
+
+        let worktree = lane_worktree(Path::new("/wt"), "partner", &lane, None).unwrap();
+
+        assert_eq!(worktree.wt_path, PathBuf::from("/wt/axiom/partner"));
+    }
+
+    #[test]
+    fn lane_worktree_rejects_an_empty_ticket() {
+        let lane = worktree_test_lane("/Users/jowi/Projects/axiom", None);
+
+        let err = lane_worktree(Path::new("/wt"), "axiom", &lane, Some(" ")).unwrap_err();
+
+        assert!(matches!(err, RunLaneError::EmptyWorktreeName), "{err:?}");
+    }
+
+    #[test]
+    fn lane_base_prefers_the_configured_base_branch() {
+        let lane = worktree_test_lane("/repo", Some("staging"));
+        let git = FakeGitOps::new().with_default_base(Ok("origin/main".to_string()));
+
+        assert_eq!(lane_base(&git, "axiom", &lane).unwrap(), "staging");
+    }
+
+    #[test]
+    fn lane_base_falls_back_to_the_repo_default_base() {
+        let lane = worktree_test_lane("/repo", None);
+        let git = FakeGitOps::new().with_default_base(Ok("origin/main".to_string()));
+
+        assert_eq!(lane_base(&git, "axiom", &lane).unwrap(), "origin/main");
+    }
+
+    #[test]
+    fn lane_base_without_any_base_is_no_base_branch() {
+        let lane = worktree_test_lane("/repo", None);
+        let git = FakeGitOps::new().with_default_base(Err(crate::work::git::GitError::Command {
+            command: "git rev-parse".to_string(),
+            exit_code: Some(128),
+            stderr: String::new(),
+        }));
+
+        let err = lane_base(&git, "axiom", &lane).unwrap_err();
+
+        assert!(
+            matches!(err, RunLaneError::NoBaseBranch(ref lane) if lane == "axiom"),
+            "{err:?}"
+        );
+    }
     #[test]
     fn dir_repo_key_is_the_final_path_component() {
         assert_eq!(
