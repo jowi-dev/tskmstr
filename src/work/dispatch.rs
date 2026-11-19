@@ -37,11 +37,15 @@
 //!    detached through a [`ci_fix::CiFixLauncher`]. A fix pass is not a
 //!    lane, so it counts against neither `max_lanes` nor the daily cap;
 //!    `tm review ci-fix` applies admission itself.
-//! 8. Sends the desktop notifications the scope owes
-//!    ([`crate::work::notify`]): tickets that entered awaiting review or hit
-//!    the fix-round cap, a refusal streak older than
-//!    `stall_notify_mins`, and a lane base branch whose head commit has a
-//!    failed check (GitHub issue #242). Each transition notifies once.
+//! 8. With `[dispatch] auto_merge` set, runs the automerge sweep
+//!    ([`auto_merge::sweep`], GitHub issue #243): starts one detached
+//!    `tm merge` for a lane PR whose review is complete, unless the scope
+//!    already has a merge running. A merge is not a lane either.
+//! 9. Sends the desktop notifications the scope owes
+//!    ([`crate::work::notify`]): tickets that entered awaiting review, hit
+//!    the fix-round cap, or had an automerge fail, a refusal streak older
+//!    than `stall_notify_mins`, and a lane base branch whose head commit has
+//!    a failed check (GitHub issue #242). Each transition notifies once.
 //!
 //! Every dependency is injected, so tests drive [`tick`] with a real
 //! [`RunStore`] in a temp dir and fake candidates and launchers.
@@ -55,6 +59,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::cli::ready::ListDecision;
+use crate::config::AutoMerge;
 use crate::config::{MemoryConfig, UsageConfig};
 use crate::runs::footprint::MemoryPressure;
 use crate::runs::overview::OverviewRun;
@@ -62,6 +67,7 @@ use crate::runs::{RunStatus, RunStore, RunStoreError};
 use crate::work::admission::{
     AdmissionRefusal, RouteRefusal, RunnerRefusal, UsageProber, UsageRefusal, route_unattended,
 };
+use crate::work::auto_merge::{self, AutoMergeAction};
 use crate::work::auto_review::RoundVerdict;
 use crate::work::ci_fix::{self, CiFixAction};
 use crate::work::detach::DetachSpawner;
@@ -190,6 +196,48 @@ pub fn ci_fix_log_dir(home: &Path) -> PathBuf {
         .join("ci-fix")
 }
 
+/// Production [`auto_merge::AutoMergeLauncher`]: spawns `<program> merge
+/// --auto-merge-run <run_id> <ticket>` detached in `cwd`, logging to
+/// `<log_dir>/<ticket lowercased>.log`. Detached because the tick holds the
+/// scope lock and a merge waits on checks and may open a conflict session.
+pub struct CommandAutoMergeLauncher<'a> {
+    /// The `tm` binary, normally `std::env::current_exe()`.
+    pub program: PathBuf,
+    /// Where to run it: the scope's repo, so `tm` loads its config.
+    pub cwd: PathBuf,
+    /// Where the logs go, normally [`auto_merge_log_dir`]; created on
+    /// first launch.
+    pub log_dir: PathBuf,
+    /// Spawns the detached process.
+    pub spawner: &'a dyn DetachSpawner,
+}
+
+impl auto_merge::AutoMergeLauncher for CommandAutoMergeLauncher<'_> {
+    fn launch(&self, ticket: &str, run_id: i64) -> Result<u32, String> {
+        std::fs::create_dir_all(&self.log_dir)
+            .map_err(|err| format!("could not create {}: {err}", self.log_dir.display()))?;
+        let log_path = self.log_dir.join(format!("{}.log", ticket.to_lowercase()));
+        let argv = [
+            "merge".to_string(),
+            "--auto-merge-run".to_string(),
+            run_id.to_string(),
+            ticket.to_string(),
+        ];
+        self.spawner
+            .spawn_detached(&self.program, &argv, &self.cwd, &log_path)
+            .map_err(|err| err.to_string())
+    }
+}
+
+/// Where [`CommandAutoMergeLauncher`] logs:
+/// `~/.local/state/tskmstr/auto-merge`, beside [`ci_fix_log_dir`].
+pub fn auto_merge_log_dir(home: &Path) -> PathBuf {
+    home.join(".local")
+        .join("state")
+        .join("tskmstr")
+        .join("auto-merge")
+}
+
 /// Held for as long as a tick runs; dropping it releases the scope lock.
 pub struct ScopeGuard {
     _file: Option<File>,
@@ -288,6 +336,9 @@ pub struct TickConfig<'a> {
     /// `[dispatch] fix_failing_ci`: run the CI-fix sweep (GitHub issue
     /// #226).
     pub fix_failing_ci: bool,
+    /// `[dispatch] auto_merge`: when the automerge sweep merges (GitHub
+    /// issue #243).
+    pub auto_merge: AutoMerge,
     /// `[dispatch] stall_notify_mins`: how long refusals for one reason
     /// last before a stall notification.
     pub stall_notify_mins: u64,
@@ -331,6 +382,9 @@ pub struct TickDeps<'a> {
     /// What the red-base watch reads the lane base branches' checks with
     /// (GitHub issue #242). `None` watches nothing.
     pub base_watch: Option<&'a notify::BaseWatch<'a>>,
+    /// What the automerge sweep reads PRs with and launches through.
+    /// `None` runs no sweep, whatever [`TickConfig::auto_merge`] says.
+    pub merge: Option<&'a auto_merge::SweepDeps<'a>>,
 }
 
 /// Why a tick did nothing at all.
@@ -475,6 +529,9 @@ pub struct TickReport {
     pub notified: Vec<String>,
     /// What the CI-fix sweep did, one entry per ticket it acted on.
     pub ci_fixes: Vec<CiFixAction>,
+    /// What the automerge sweep did: at most one started merge, or why
+    /// it could not read or launch.
+    pub auto_merges: Vec<AutoMergeAction>,
 }
 
 /// Errors that stop a tick outright.
@@ -591,6 +648,12 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
 
     if let Some(ci) = deps.ci.filter(|_| cfg.fix_failing_ci) {
         report.ci_fixes = ci_fix::sweep(ci, &runs, cfg.scope, cfg.max_fix_rounds)?;
+    }
+    if let Some(merge) = deps.merge.filter(|_| cfg.auto_merge != AutoMerge::Off) {
+        // Re-read: the CI-fix sweep may have started a fix or recorded a
+        // closed PR since `runs` was taken.
+        let runs = deps.store.overview_runs()?;
+        report.auto_merges = auto_merge::sweep(merge, &runs, cfg.scope, cfg.auto_merge)?;
     }
 
     let mut notices = notify::ticket_notices(&runs, cfg.scope, cfg.max_fix_rounds);
@@ -876,6 +939,7 @@ mod tests {
         max_fix_rounds: u32,
         stall_notify_mins: u64,
         fix_failing_ci: bool,
+        auto_merge: crate::config::AutoMerge,
         notifier: Recorder,
         /// Answers the red-base watch's check reads.
         gh: crate::github::gh_cli::FakeGhCli,
@@ -905,6 +969,7 @@ mod tests {
                 max_fix_rounds: 3,
                 stall_notify_mins: 30,
                 fix_failing_ci: false,
+                auto_merge: crate::config::AutoMerge::Off,
                 notifier: Recorder::default(),
                 gh: crate::github::gh_cli::FakeGhCli::new(),
                 bases: Vec::new(),
@@ -949,6 +1014,18 @@ mod tests {
             launcher: &dyn Launcher,
             ci: Option<&ci_fix::SweepDeps<'_>>,
         ) -> (TickReport, Option<bool>) {
+            self.tick_with_sweeps(candidates, launcher, ci, None)
+        }
+
+        /// [`Fixture::tick_with_ci_asking`] with `merge` as the tick's
+        /// automerge sweep deps.
+        fn tick_with_sweeps(
+            &self,
+            candidates: &[Candidate],
+            launcher: &dyn Launcher,
+            ci: Option<&ci_fix::SweepDeps<'_>>,
+            merge: Option<&auto_merge::SweepDeps<'_>>,
+        ) -> (TickReport, Option<bool>) {
             let lock = self.lock();
             let source = FakeCandidates(candidates.to_vec(), Cell::new(None));
             let pressure = self.pressure;
@@ -969,6 +1046,7 @@ mod tests {
                 notifier: &self.notifier,
                 ci,
                 base_watch: (!self.bases.is_empty()).then_some(&watch),
+                merge,
             };
             let cfg = TickConfig {
                 scope: SCOPE,
@@ -977,6 +1055,7 @@ mod tests {
                 max_fix_rounds: self.max_fix_rounds,
                 stall_notify_mins: self.stall_notify_mins,
                 fix_failing_ci: self.fix_failing_ci,
+                auto_merge: self.auto_merge,
                 lanes: &self.lanes,
                 runners: &self.runners,
                 memory: &self.memory,
@@ -1200,6 +1279,136 @@ mod tests {
         assert_eq!(
             crate::cli::review::auto_review_log_path(home, "GH-1").parent(),
             Some(Path::new("/home/me/.local/state/tskmstr/auto-review"))
+        );
+    }
+
+    // --- automerge sweep (GitHub issue #243) ---
+
+    /// Records each ticket a merge was started for.
+    #[derive(Default)]
+    struct FakeAutoMergeLauncher(RefCell<Vec<String>>);
+
+    impl auto_merge::AutoMergeLauncher for FakeAutoMergeLauncher {
+        fn launch(&self, ticket: &str, _run_id: i64) -> Result<u32, String> {
+            self.0.borrow_mut().push(ticket.to_string());
+            Ok(99)
+        }
+    }
+
+    /// `gh` reporting PR 7 open, approved and green on head `abc1234`.
+    fn approved_pr_gh() -> crate::github::gh_cli::FakeGhCli {
+        use crate::github::gh_cli::{
+            ChecksState, PrChecks, PrLifecycle, PrReviewState, ReviewDecision,
+        };
+        use crate::github::pr::PrInfo;
+        crate::github::gh_cli::FakeGhCli::new()
+            .with_pr_list_review_state(Ok(vec![PrReviewState {
+                pr: PrInfo {
+                    number: 7,
+                    url: "https://github.com/o/r/pull/7".to_string(),
+                    title: String::new(),
+                    body: String::new(),
+                    head_ref_name: String::new(),
+                    base_ref_name: String::new(),
+                },
+                review_decision: ReviewDecision::Approved,
+                merge_state_status: "CLEAN".to_string(),
+                checks: ChecksState::Passing,
+            }]))
+            .with_pr_checks(
+                7,
+                Ok(PrChecks {
+                    lifecycle: PrLifecycle::Open,
+                    head_sha: "abc1234".to_string(),
+                    checks: Vec::new(),
+                }),
+            )
+    }
+
+    #[test]
+    fn with_auto_merge_approved_an_approved_lane_pr_gets_merged() {
+        let mut fx = Fixture::new();
+        fx.auto_merge = crate::config::AutoMerge::Approved;
+        finished_lane_with_pr(&fx.store, "GH-1");
+        let gh = approved_pr_gh();
+        let merge_launcher = FakeAutoMergeLauncher::default();
+        let merge = auto_merge::SweepDeps {
+            store: &fx.store,
+            gh: &gh,
+            repo_dir: Path::new("/repo"),
+            launcher: &merge_launcher,
+        };
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let (report, _) = fx.tick_with_sweeps(&[ready("GH-2", 0)], &launcher, None, Some(&merge));
+
+        assert_eq!(*merge_launcher.0.borrow(), vec!["GH-1"]);
+        assert!(
+            matches!(
+                &report.auto_merges[..],
+                [auto_merge::AutoMergeAction::Started { ticket, sha, .. }]
+                    if ticket == "GH-1" && sha == "abc1234"
+            ),
+            "{:?}",
+            report.auto_merges
+        );
+        assert_eq!(launcher.tickets(), vec!["GH-2"], "lanes still launch");
+    }
+
+    #[test]
+    fn with_auto_merge_off_prs_are_never_read() {
+        let fx = Fixture::new();
+        finished_lane_with_pr(&fx.store, "GH-1");
+        let gh = approved_pr_gh();
+        let merge_launcher = FakeAutoMergeLauncher::default();
+        let merge = auto_merge::SweepDeps {
+            store: &fx.store,
+            gh: &gh,
+            repo_dir: Path::new("/repo"),
+            launcher: &merge_launcher,
+        };
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let (report, _) = fx.tick_with_sweeps(&[], &launcher, None, Some(&merge));
+
+        assert!(gh.pr_list_review_state_calls().is_empty());
+        assert!(merge_launcher.0.borrow().is_empty());
+        assert!(report.auto_merges.is_empty());
+    }
+
+    #[test]
+    fn command_auto_merge_launcher_spawns_tm_merge_detached() {
+        let dir = tempdir().unwrap();
+        let spawner = crate::work::detach::FakeDetachSpawner::new(4242);
+        let log_dir = dir.path().join("state/auto-merge");
+        let launcher = CommandAutoMergeLauncher {
+            program: PathBuf::from("/usr/local/bin/tm"),
+            cwd: PathBuf::from("/repo"),
+            log_dir: log_dir.clone(),
+            spawner: &spawner,
+        };
+
+        let pid = auto_merge::AutoMergeLauncher::launch(&launcher, "GH-12", 41).unwrap();
+
+        assert_eq!(pid, 4242);
+        let recorded = spawner.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].program, PathBuf::from("/usr/local/bin/tm"));
+        assert_eq!(
+            recorded[0].argv,
+            vec!["merge", "--auto-merge-run", "41", "GH-12"]
+        );
+        assert_eq!(recorded[0].working_dir, PathBuf::from("/repo"));
+        assert_eq!(recorded[0].log_path, log_dir.join("gh-12.log"));
+        assert!(log_dir.is_dir(), "the log dir is created");
+    }
+
+    #[test]
+    fn auto_merge_log_dir_sits_beside_the_ci_fix_logs() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            auto_merge_log_dir(home),
+            PathBuf::from("/home/me/.local/state/tskmstr/auto-merge")
         );
     }
 

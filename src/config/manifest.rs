@@ -295,6 +295,14 @@ pub const EXPECTED_CONFIG_KEYS: &[ExpectedConfigKey] = &[
         severity: KeySeverity::Recommended,
         suggested_default: |_| None,
     },
+    // GitHub issue #243. Merging unattended is opt-in, so there is no
+    // default to suggest.
+    ExpectedConfigKey {
+        path: &["dispatch", "auto_merge"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
     // GitHub issue #226. Fixing failing CI unattended is opt-in, so there
     // is no default to suggest.
     ExpectedConfigKey {
@@ -409,6 +417,14 @@ mod tests {
     #[test]
     fn dispatch_fix_failing_ci_is_registered_without_a_default() {
         let key = expected(&["dispatch", "fix_failing_ci"]);
+        assert_eq!(key.severity, KeySeverity::Recommended);
+        assert_eq!((key.suggested_default)(BackendKind::Github), None);
+        assert_eq!((key.suggested_default)(BackendKind::Jira), None);
+    }
+
+    #[test]
+    fn dispatch_auto_merge_is_registered_without_a_default() {
+        let key = expected(&["dispatch", "auto_merge"]);
         assert_eq!(key.severity, KeySeverity::Recommended);
         assert_eq!((key.suggested_default)(BackendKind::Github), None);
         assert_eq!((key.suggested_default)(BackendKind::Jira), None);

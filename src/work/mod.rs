@@ -6,6 +6,7 @@
 
 pub mod admission;
 pub mod audit;
+pub mod auto_merge;
 pub mod auto_review;
 pub mod autopilot;
 pub mod bugbot;

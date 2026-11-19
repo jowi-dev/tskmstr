@@ -352,6 +352,8 @@ pub struct RawRunnerConfig {
 pub struct RawDispatchConfig {
     /// See [`DispatchConfig::allow_paid_fallback`].
     pub allow_paid_fallback: Option<bool>,
+    /// `"off"`, `"approved"` or `"reviewed"`. See [`AutoMerge`].
+    pub auto_merge: Option<String>,
     /// See [`DispatchConfig::fix_failing_ci`].
     pub fix_failing_ci: Option<bool>,
     /// See [`DispatchConfig::max_fix_rounds`].
@@ -1063,6 +1065,45 @@ impl Billing {
     }
 }
 
+/// When the autopilot dispatcher merges a lane's pull request on its own
+/// (`[dispatch] auto_merge`, GitHub issue #243). Only applies to a scope
+/// with autopilot on; the merge itself is `tm merge`, so its gates apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AutoMerge {
+    /// Never: the operator runs `tm merge`. The default.
+    #[default]
+    Off,
+    /// Once the PR has an explicit approval, no conflicts, and green
+    /// checks (the overview's Ready to merge).
+    Approved,
+    /// Also once the machine is done with the PR and no human has looked
+    /// at it (the overview's Awaiting review). Merges with no human
+    /// approval.
+    Reviewed,
+}
+
+impl AutoMerge {
+    /// Parses a config `auto_merge` string. Returns `None` for unrecognized
+    /// values.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(AutoMerge::Off),
+            "approved" => Some(AutoMerge::Approved),
+            "reviewed" => Some(AutoMerge::Reviewed),
+            _ => None,
+        }
+    }
+
+    /// The config spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutoMerge::Off => "off",
+            AutoMerge::Approved => "approved",
+            AutoMerge::Reviewed => "reviewed",
+        }
+    }
+}
+
 /// A usage-window ceiling: the utilization fraction at or above which
 /// usage admission refuses a launch. [`merge`] only builds finite,
 /// positive ceilings, which keeps the `Eq` impl sound. It may exceed 1.0,
@@ -1249,6 +1290,9 @@ pub struct DispatchConfig {
     /// Whether unattended dispatch may route to a [`Billing::Metered`]
     /// runner. Off by default.
     pub allow_paid_fallback: bool,
+    /// When the autopilot dispatcher runs `tm merge` on a lane's PR by
+    /// itself (GitHub issue #243). Defaults to [`AutoMerge::Off`].
+    pub auto_merge: AutoMerge,
     /// Whether the autopilot dispatcher starts a fix pass in a lane's
     /// worktree when the lane's PR checks fail (GitHub issue #226). Each
     /// pass counts against `max_fix_rounds`. Off by default.
@@ -1285,6 +1329,7 @@ impl Default for DispatchConfig {
     fn default() -> Self {
         Self {
             allow_paid_fallback: false,
+            auto_merge: AutoMerge::Off,
             fix_failing_ci: false,
             max_fix_rounds: DEFAULT_MAX_FIX_ROUNDS,
             max_lanes: DEFAULT_DISPATCH_MAX_LANES,
@@ -1970,6 +2015,16 @@ pub enum ConfigError {
         value: String,
     },
 
+    /// A `[dispatch] auto_merge` value was not recognized (GitHub issue
+    /// #243).
+    #[error(
+        "invalid [dispatch] auto_merge `{value}`; expected \"off\", \"approved\" or \"reviewed\""
+    )]
+    InvalidAutoMerge {
+        /// The value as parsed.
+        value: String,
+    },
+
     /// `[backend].provider` was set to a value that isn't a recognized
     /// provider name at all (contrast [`ConfigError::ProviderNotImplemented`],
     /// for a recognized name with no adapter yet).
@@ -2400,6 +2455,17 @@ fn merge_with_repo_dir(
             .and_then(|d| d.allow_paid_fallback)
             .or(global.dispatch.as_ref().and_then(|d| d.allow_paid_fallback))
             .unwrap_or(false),
+        auto_merge: match repo
+            .dispatch
+            .as_ref()
+            .and_then(|d| d.auto_merge.clone())
+            .or(global.dispatch.as_ref().and_then(|d| d.auto_merge.clone()))
+        {
+            Some(value) => {
+                AutoMerge::parse(&value).ok_or(ConfigError::InvalidAutoMerge { value })?
+            }
+            None => AutoMerge::Off,
+        },
         fix_failing_ci: repo
             .dispatch
             .as_ref()
@@ -7539,6 +7605,45 @@ mod tests {
 
         let cfg = load_with("[dispatch]\nfix_failing_ci = true\n", None).expect("should load");
         assert!(cfg.dispatch.fix_failing_ci, "global kept");
+    }
+
+    // --- automerge: `[dispatch] auto_merge` (GitHub issue #243) ---
+
+    #[test]
+    fn auto_merge_defaults_to_off() {
+        let cfg = load_with("", None).expect("should load");
+
+        assert_eq!(cfg.dispatch.auto_merge, AutoMerge::Off);
+    }
+
+    #[test]
+    fn auto_merge_parses_each_mode_and_merges_repo_over_global() {
+        for (text, mode) in [
+            ("off", AutoMerge::Off),
+            ("approved", AutoMerge::Approved),
+            ("reviewed", AutoMerge::Reviewed),
+        ] {
+            let cfg = load_with(&format!("[dispatch]\nauto_merge = \"{text}\"\n"), None)
+                .expect("should load");
+            assert_eq!(cfg.dispatch.auto_merge, mode, "{text}");
+        }
+
+        let cfg = load_with(
+            "[dispatch]\nauto_merge = \"reviewed\"\n",
+            Some("[dispatch]\nauto_merge = \"approved\"\n"),
+        )
+        .expect("should load");
+        assert_eq!(cfg.dispatch.auto_merge, AutoMerge::Approved, "repo wins");
+    }
+
+    #[test]
+    fn auto_merge_rejects_an_unknown_mode() {
+        let err = load_with("[dispatch]\nauto_merge = \"always\"\n", None).unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::InvalidAutoMerge { ref value } if value == "always"),
+            "{err:?}"
+        );
     }
 
     #[test]

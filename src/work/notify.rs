@@ -8,6 +8,8 @@
 //!   is done and it is the operator's turn;
 //! - a ticket hit the fix-round cap: auto-review stopped at its round cap,
 //!   or the ticket has `[dispatch] max_fix_rounds` fix passes;
+//! - an automerge ([`crate::work::auto_merge`]) did not land: its run row
+//!   ended `failed` or was reaped `interrupted`;
 //! - dispatch has refused for the same reason for longer than
 //!   `[dispatch] stall_notify_mins`;
 //! - a lane base branch's head commit has a failed check
@@ -33,12 +35,15 @@ use crate::runs::overview::{
     ACTIVE_SCOPE_WINDOW_SECS, OverviewRun, REVIEW_FIX_KIND, awaiting_review,
 };
 use crate::runs::{RefusalStreak, RunStatus, RunStore, RunStoreError};
+use crate::work::auto_merge::AUTO_MERGE_KIND;
 use crate::work::auto_review::RoundVerdict;
 
 /// [`Notice::reason`] of a ticket entering awaiting review.
 pub const AWAITING_REVIEW: &str = "awaiting_review";
 /// [`Notice::reason`] of a ticket hitting the fix-round cap.
 pub const FIX_CAP: &str = "fix_cap";
+/// [`Notice::reason`] of an automerge that did not land.
+pub const AUTO_MERGE_FAILED: &str = "auto_merge_failed";
 /// [`Notice::reason`] of a stalled dispatcher.
 pub const STALL: &str = "stall";
 /// [`Notice::reason`] of a base branch whose head commit has a failed
@@ -157,7 +162,7 @@ pub struct Notice {
     /// [`BASE_RED`] notice holds its base branch here instead, so each base
     /// gets its own dedup slot.
     pub ticket: String,
-    /// [`AWAITING_REVIEW`], [`FIX_CAP`] or [`STALL`].
+    /// [`AWAITING_REVIEW`], [`FIX_CAP`], [`AUTO_MERGE_FAILED`] or [`STALL`].
     pub reason: &'static str,
     /// The transition's key: it is the same on every tick that sees the
     /// same transition, and changes when the state is entered again.
@@ -168,7 +173,8 @@ pub struct Notice {
     pub body: String,
 }
 
-/// The awaiting-review and fix-cap notices for `scope`'s tickets, from
+/// The awaiting-review, fix-cap and failed-automerge notices for `scope`'s
+/// tickets, from
 /// [`RunStore::overview_runs`] (newest first).
 ///
 /// A ticket's key is its newest run's id: no run starts while a ticket
@@ -203,6 +209,17 @@ pub fn ticket_notices(runs: &[OverviewRun], scope: &str, max_fix_rounds: u32) ->
                 key: key.clone(),
                 title: format!("tm: {ticket} is awaiting your review"),
                 body: pr.unwrap_or("PR open, bots reviewed").to_string(),
+            });
+        }
+        if newest.kind == AUTO_MERGE_KIND
+            && matches!(newest.status, RunStatus::Failed | RunStatus::Interrupted)
+        {
+            notices.push(Notice {
+                ticket: ticket.to_string(),
+                reason: AUTO_MERGE_FAILED,
+                key: key.clone(),
+                title: format!("tm: automerge of {ticket} did not land"),
+                body: format!("not merged; see `tm runs show {ticket}`"),
             });
         }
 
@@ -475,6 +492,53 @@ mod tests {
         let notices = ticket_notices(&store.overview_runs().unwrap(), SCOPE, 3);
 
         assert_eq!(reasons(&notices), vec![("GH-1", FIX_CAP)]);
+    }
+
+    #[test]
+    fn a_failed_or_interrupted_automerge_gets_one_notice_keyed_by_its_run() {
+        for status in [RunStatus::Failed, RunStatus::Interrupted] {
+            let (_dir, store) = open_store();
+            let lane = start(&store, "GH-1", "lane");
+            finish(&store, lane, RunStatus::Done, Some("https://gh/pr/1"));
+            let merge = start(&store, "GH-1", AUTO_MERGE_KIND);
+            finish(&store, merge, status, None);
+
+            let notices = ticket_notices(&store.overview_runs().unwrap(), SCOPE, 3);
+
+            assert_eq!(
+                reasons(&notices),
+                vec![("GH-1", AUTO_MERGE_FAILED)],
+                "{status:?}"
+            );
+            assert_eq!(notices[0].key, merge.to_string());
+            assert!(notices[0].title.contains("GH-1"), "{}", notices[0].title);
+            assert!(
+                notices[0].body.contains("tm runs show GH-1"),
+                "{}",
+                notices[0].body
+            );
+        }
+    }
+
+    #[test]
+    fn a_running_or_merged_automerge_gets_no_notice() {
+        let (_dir, store) = open_store();
+        let lane = start(&store, "GH-1", "lane");
+        finish(&store, lane, RunStatus::Done, Some("https://gh/pr/1"));
+        start(&store, "GH-1", AUTO_MERGE_KIND);
+        let lane = start(&store, "GH-2", "lane");
+        finish(&store, lane, RunStatus::Done, Some("https://gh/pr/2"));
+        let merged = start(&store, "GH-2", AUTO_MERGE_KIND);
+        finish(&store, merged, RunStatus::Done, None);
+
+        let notices = ticket_notices(&store.overview_runs().unwrap(), SCOPE, 3);
+
+        assert!(
+            !reasons(&notices)
+                .iter()
+                .any(|(_, reason)| *reason == AUTO_MERGE_FAILED),
+            "{notices:?}"
+        );
     }
 
     #[test]

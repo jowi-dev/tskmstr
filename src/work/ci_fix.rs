@@ -59,9 +59,16 @@ pub fn ready_to_fix(checks: &PrChecks) -> bool {
 /// already hold a [`CI_FIX_EVENT`] for head commit `sha`, whatever its
 /// outcome: `started`, `capped`, or `failed`.
 pub fn handled(events: &[RunEvent], sha: &str) -> bool {
+    handled_by(events, CI_FIX_EVENT, sha)
+}
+
+/// Whether `events` hold a `kind` event whose detail names head commit
+/// `sha` as its second word (`<outcome> <sha>[:] ...`). Shared by
+/// [`handled`] and [`crate::work::auto_merge::handled`].
+pub fn handled_by(events: &[RunEvent], kind: &str, sha: &str) -> bool {
     events
         .iter()
-        .filter(|event| event.kind == CI_FIX_EVENT)
+        .filter(|event| event.kind == kind)
         .filter_map(|event| event.detail.as_deref()?.split_whitespace().nth(1))
         .any(|word| word.trim_end_matches(':') == sha)
 }
