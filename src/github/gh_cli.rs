@@ -306,6 +306,18 @@ pub struct PrCreateRequest {
     pub base: Option<String>,
 }
 
+/// A pull request associated with a commit, as reported by
+/// [`GhCli::commit_pulls`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitPull {
+    /// Pull request number.
+    pub number: u64,
+    /// Pull request title.
+    pub title: String,
+    /// Pull request body (description); empty when the PR has none.
+    pub body: String,
+}
+
 /// Request body for editing a pull request via `gh pr edit`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PrEditRequest {
@@ -415,6 +427,14 @@ pub trait GhCli {
     /// repo root, same rationale as [`GhCli::pr_review_threads`]'s doc
     /// comment.
     fn job_failed_log(&self, dir: &Path, job_id: u64) -> Result<String, GhError>;
+
+    /// The pull requests associated with commit `sha` (`gh api
+    /// repos/{owner}/{repo}/commits/{sha}/pulls`): for a commit on the base
+    /// branch, the PR that merged it.
+    ///
+    /// `dir` is an explicit repo root, same rationale as
+    /// [`GhCli::pr_review_threads`]'s doc comment.
+    fn commit_pulls(&self, dir: &Path, sha: &str) -> Result<Vec<CommitPull>, GhError>;
 
     /// List the review threads on pull request `number`, same as
     /// [`GhCli::pr_review_threads`] but with each thread's first comment's
@@ -1955,6 +1975,26 @@ impl GhCli for ShellGhCli {
         )
     }
 
+    fn commit_pulls(&self, dir: &Path, sha: &str) -> Result<Vec<CommitPull>, GhError> {
+        let repo = self.resolve_repo(dir)?;
+
+        let path = format!("repos/{}/{}/commits/{sha}/pulls", repo.owner, repo.name);
+        let output = Command::new("gh")
+            .args(["api", &path])
+            .current_dir(dir)
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh api commits/pulls".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_commit_pulls_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
     fn job_failed_log(&self, dir: &Path, job_id: u64) -> Result<String, GhError> {
         let output = Command::new("gh")
             .args(["run", "view", "--job", &job_id.to_string(), "--log-failed"])
@@ -3183,6 +3223,46 @@ fn actions_job_id(url: &str) -> Option<u64> {
 ///
 /// Pure over the exit code and captured stdout/stderr, for the same
 /// testability reasons as [`interpret_pr_view_output`].
+/// Raw shape of one entry in `gh api repos/{owner}/{repo}/commits/{sha}/pulls`
+/// output, for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawCommitPull {
+    number: u64,
+    title: String,
+    body: Option<String>,
+}
+
+/// Parses [`GhCli::commit_pulls`]'s `gh api` output: a JSON array of pull
+/// requests on exit 0, a [`GhError::Command`] otherwise.
+fn interpret_commit_pulls_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<Vec<CommitPull>, GhError> {
+    match exit_code {
+        Some(0) => serde_json::from_str::<Vec<RawCommitPull>>(stdout)
+            .map(|pulls| {
+                pulls
+                    .into_iter()
+                    .map(|raw| CommitPull {
+                        number: raw.number,
+                        title: raw.title,
+                        body: raw.body.unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .map_err(|err| GhError::Parse {
+                command: "gh api commits/pulls".to_string(),
+                message: err.to_string(),
+            }),
+        code => Err(GhError::Command {
+            command: "gh api commits/pulls".to_string(),
+            exit_code: code,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
 fn interpret_run_failed_log_output(
     exit_code: Option<i32>,
     stdout: &str,
@@ -4465,6 +4545,8 @@ pub struct FakeGhCli {
     job_failed_log_results: RefCell<HashMap<u64, Result<String, GhError>>>,
     job_failed_log_calls: RefCell<Vec<u64>>,
     run_failed_log_calls: RefCell<Vec<u64>>,
+    commit_pulls_results: RefCell<HashMap<String, Result<Vec<CommitPull>, GhError>>>,
+    commit_pulls_calls: RefCell<Vec<String>>,
     finding_details_results: RefCell<HashMap<u64, Result<Vec<FindingDetail>, GhError>>>,
     finding_details_calls: RefCell<Vec<u64>>,
     full_threads_results: RefCell<HashMap<u64, Result<PrReviewThreads, GhError>>>,
@@ -4570,6 +4652,8 @@ impl Default for FakeGhCli {
             commit_checks_calls: RefCell::new(Vec::new()),
             run_failed_log_results: RefCell::new(HashMap::new()),
             run_failed_log_calls: RefCell::new(Vec::new()),
+            commit_pulls_results: RefCell::new(HashMap::new()),
+            commit_pulls_calls: RefCell::new(Vec::new()),
             job_failed_log_results: RefCell::new(HashMap::new()),
             job_failed_log_calls: RefCell::new(Vec::new()),
             finding_details_results: RefCell::new(HashMap::new()),
@@ -4805,6 +4889,21 @@ impl FakeGhCli {
     /// The run ids passed to `run_failed_log`, in call order.
     pub fn run_failed_log_calls(&self) -> Vec<u64> {
         self.run_failed_log_calls.borrow().clone()
+    }
+
+    /// Set the result `commit_pulls` will return for commit `sha`.
+    ///
+    /// A sha with no configured result returns `Ok(vec![])`.
+    pub fn with_commit_pulls(self, sha: &str, result: Result<Vec<CommitPull>, GhError>) -> Self {
+        self.commit_pulls_results
+            .borrow_mut()
+            .insert(sha.to_string(), result);
+        self
+    }
+
+    /// The shas passed to `commit_pulls`, in call order.
+    pub fn commit_pulls_calls(&self) -> Vec<String> {
+        self.commit_pulls_calls.borrow().clone()
     }
 
     /// Set the result `job_failed_log` will return for Actions job `job_id`.
@@ -5338,6 +5437,14 @@ impl GhCli for FakeGhCli {
         }
     }
 
+    fn commit_pulls(&self, _dir: &Path, sha: &str) -> Result<Vec<CommitPull>, GhError> {
+        self.commit_pulls_calls.borrow_mut().push(sha.to_string());
+        match self.commit_pulls_results.borrow().get(sha) {
+            Some(result) => result.clone(),
+            None => Ok(Vec::new()),
+        }
+    }
+
     fn job_failed_log(&self, _dir: &Path, job_id: u64) -> Result<String, GhError> {
         self.job_failed_log_calls.borrow_mut().push(job_id);
         match self.job_failed_log_results.borrow().get(&job_id) {
@@ -5860,6 +5967,54 @@ mod tests {
             None
         );
         assert_eq!(actions_job_id("https://ci.example.com/job/42"), None);
+    }
+
+    // --- commit_pulls ---
+
+    #[test]
+    fn commit_pulls_output_parses_number_title_and_body() {
+        let stdout = r#"[
+            {"number": 12, "title": "Split config", "body": "Why it split", "state": "closed"},
+            {"number": 13, "title": "No body", "body": null}
+        ]"#;
+
+        assert_eq!(
+            interpret_commit_pulls_output(Some(0), stdout, "").unwrap(),
+            vec![
+                CommitPull {
+                    number: 12,
+                    title: "Split config".to_string(),
+                    body: "Why it split".to_string(),
+                },
+                CommitPull {
+                    number: 13,
+                    title: "No body".to_string(),
+                    body: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn commit_pulls_output_surfaces_a_nonzero_exit_as_a_command_error() {
+        let err = interpret_commit_pulls_output(Some(1), "", "Not Found").unwrap_err();
+
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn fake_commit_pulls_returns_configured_results_or_empty() {
+        let pull = CommitPull {
+            number: 7,
+            title: "t".to_string(),
+            body: "b".to_string(),
+        };
+        let fake = FakeGhCli::new().with_commit_pulls("abc", Ok(vec![pull.clone()]));
+        let dir = Path::new(".");
+
+        assert_eq!(fake.commit_pulls(dir, "abc").unwrap(), vec![pull]);
+        assert!(fake.commit_pulls(dir, "def").unwrap().is_empty());
+        assert_eq!(fake.commit_pulls_calls(), vec!["abc", "def"]);
     }
 
     // --- run_failed_log ---
