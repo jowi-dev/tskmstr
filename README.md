@@ -1783,7 +1783,9 @@ yet. A reply from that peer clears it; a message from someone else does not.
 A broadcast the lane sent never marks it: an announcement expects no reply.
 
 The overview raises the same signal: a running lane awaiting a reply moves
-to **needs input** and its row shows `chat?` until the answer arrives.
+to **needs input** and its row shows `chat?` until the answer arrives. It
+reads each lane's own messages, the same ones the detail panel shows, so a
+busy chat elsewhere on the machine can't push the question out of view.
 
 tm reads chat through thatch's CLI only (ADR-0011). It maps the run's
 recorded session id to a chat name with `thatch chat list --json --host-id

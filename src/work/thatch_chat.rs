@@ -319,8 +319,8 @@ pub fn broadcast(
 }
 
 /// How many messages each `thatch chat tail --once` call asks for. A lane's
-/// detail window shows at most this many sent and this many received; the
-/// overview scans this many across every session.
+/// detail window and the overview's chat signal see at most this many sent
+/// and this many received per lane.
 pub const TAIL_LIMIT: usize = 100;
 
 /// One chat message, built from `thatch chat tail`'s `sent` event plus its
@@ -589,17 +589,14 @@ pub fn awaiting_reply(name: &str, messages: &[ChatMessage]) -> bool {
 
 /// The subset of `host_ids` whose chat session is waiting on an answer
 /// (see [`awaiting_reply`]), for the overview's attention signal. One
-/// roster lookup plus one unfiltered tail snapshot covers every lane, so
-/// the cost does not grow with the lane count. Empty without `thatch`.
+/// roster lookup, then each lane's own [`lane_messages`] tails: the same
+/// calls the run detail panel makes, so the two views agree. A single
+/// unfiltered tail would lose a lane's question once [`TAIL_LIMIT`] newer
+/// messages from any session pushed it out. Empty without `thatch`.
 pub fn lanes_awaiting_reply(runner: &dyn ThatchRunner, host_ids: &[String]) -> BTreeSet<String> {
-    let names = chat_names(runner, host_ids);
-    if names.is_empty() {
-        return BTreeSet::new();
-    }
-    let messages = tail(runner, None);
-    names
+    chat_names(runner, host_ids)
         .into_iter()
-        .filter(|(_, name)| awaiting_reply(name, &messages))
+        .filter(|(_, name)| awaiting_reply(name, &lane_messages(runner, name)))
         .map(|(host_id, _)| host_id)
         .collect()
 }
@@ -928,20 +925,30 @@ Broadcast from jowi-dev to 2 of 4 registered sessions (projects: jowi-dev/tskmst
         assert!(!awaiting_reply("lane", &[]));
     }
 
+    /// Each lane is judged on its own `--from`/`--to` tails, the same ones
+    /// the run detail panel reads, so a question older than the newest
+    /// [`TAIL_LIMIT`] messages machine-wide still counts.
     #[test]
-    fn lanes_awaiting_reply_maps_host_ids_through_one_roster_and_one_tail() {
-        let stdout_roster = ROSTER;
-        let stdout_tail = tail(&[
-            &sent(1, "t1", "npc-4-00008", "coord", "q?"),
-            &sent(2, "t2", "rex-protocol-00007", "coord", "q?"),
-            &sent(3, "t3", "coord", "rex-protocol-00007", "a"),
-        ]);
-        let runner = ScriptedThatchRunner::new(vec![stdout_roster.to_string(), stdout_tail]);
+    fn lanes_awaiting_reply_reads_each_lanes_own_tails() {
+        let rex_from = tail(&[&sent(2, "t2", "rex-protocol-00007", "coord", "q?")]);
+        let rex_to = tail(&[&sent(3, "t3", "coord", "rex-protocol-00007", "a")]);
+        let npc_from = tail(&[&sent(1, "t1", "npc-4-00008", "coord", "q?")]);
+        let npc_to = String::new();
+        // Host ids sort as "ses_raw" (rex) before "sess-a" (npc).
+        let runner =
+            ScriptedThatchRunner::new(vec![ROSTER.to_string(), rex_from, rex_to, npc_from, npc_to]);
         let waiting = lanes_awaiting_reply(&runner, &["sess-a".to_string(), "ses_raw".to_string()]);
         assert_eq!(waiting, BTreeSet::from(["sess-a".to_string()]));
         let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1], tail_args(None));
+        assert_eq!(
+            calls[1..],
+            [
+                tail_args(Some(("--from", "rex-protocol-00007"))),
+                tail_args(Some(("--to", "rex-protocol-00007"))),
+                tail_args(Some(("--from", "npc-4-00008"))),
+                tail_args(Some(("--to", "npc-4-00008"))),
+            ]
+        );
     }
 
     #[test]
