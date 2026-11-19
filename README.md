@@ -1762,6 +1762,53 @@ cadence. To turn it off:
 wake_on_chat_mail = false   # default true
 ```
 
+### Epic coordinators
+
+**An epic coordinator is one agent session that drives an epic's tickets to
+merged PRs**: it launches their lanes, talks to them over thatch chat, and
+merges the PRs it has verified (GitHub issue #209). The design is in
+`docs/plans/gh-209-epic-coordinator.md`.
+
+```
+tm work coordinator start GH-176   # run inside the repo
+tm work coordinator stop GH-176
+```
+
+`start` checks that the key is an epic, lists its children into the
+session's opening prompt, and opens a `coordinator` window in the epic's
+`tm-<scope>-<EPIC>` session, in the repo's checkout. The session is recorded
+as a run of kind `coordinator` on the epic, so it shows up in `tm runs`,
+`tm overview` and the chat panel like any run, counts against the memory
+budget, and is reaped, hibernated and woken for chat mail like any
+interactive run. A second `start` while one is live is refused.
+
+**tm is the coordinator's hands.** Its prompt lets it act on the epic only
+through `tm` commands: `tm ticket children`, `tm ready`, `tm work run
+--unattended`, `tm runs` and `tm merge`. Memory admission, the lane cap and
+the usage gate apply to its launches as they do to autopilot's. **The
+readiness check is in the prompt, not in tm**: the coordinator is told to
+launch only when `tm ready` returns 0 or 3, but `tm work run` itself does
+not run the full `tm ready` decision yet.
+
+**thatch chat is its voice.** It maps each lane's session id (from `tm runs
+show`) to a chat name with `thatch chat list --json --host-id`, and keeps
+the supervision discipline of thatch's `thatch-coordination` skill: one
+tracked entry per lane, reconcile every turn, and verify a lane's "done"
+before merging. thatch installs that skill for opencode only, so tm's
+prompt carries the discipline itself.
+
+`stop` kills the coordinator's window and marks its run interrupted. **The
+lanes it launched keep running.**
+
+```toml
+[work.coordinator]
+# prompt_file = ".tskmstr/prompts/coordinator.md"  # optional; see [work.audit]'s prompt_file
+# model = "opus"                                     # optional; falls back to [work] default_model
+```
+
+`prompt` or `prompt_file` replace the built-in prompt; `{epic}` becomes the
+epic key and `{children}` one `KEY  STATUS  SUMMARY` line per child ticket.
+
 ### Assigning a ticket from the board
 
 Pressing `A` on the board opens a floating picker for the selected card,
