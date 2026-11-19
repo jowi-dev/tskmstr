@@ -297,7 +297,7 @@ tm auth status
 | `tm work list` | List every current tmux session with a worktree/session kind column |
 | `tm work restore` | Recreate tmux sessions for every existing worktree that doesn't already have one running |
 | `tm work session <KEY>` | Rebuild `<KEY>`'s `tm-<scope>-<key>` tmux session and its windows from the ticket's recorded runs — after a reboot, a `tmux kill-server`, or an accidental `kill-session`. Only runs still in flight come back; never attaches, and does nothing to a healthy session. See "Per-ticket tmux sessions" below |
-| `tm work clean <KEY>` | Finish with `<KEY>`: archive each window's scrollback, then one `kill-session` on `tm-<scope>-<key>`, plus one worktree removal. Only a path under the configured worktree root is ever removed, so an audit run's `[work.audit].dir` is never touched |
+| `tm work clean <KEY>` | Finish with `<KEY>`: archive each window's scrollback, then one `kill-session` on `tm-<scope>-<key>`, plus one worktree removal (including one an audit provisioned). Only a path under the configured worktree root is ever removed, so an audit run's `[work.audit].dir` is never touched |
 | `tm work sweep [KEYS...] [--merged] [--closed] [--yes]` | Clean many tickets in one pass: mark them by key and/or every ticket whose PR is merged or closed, confirm once, then run `tm work clean` for each. Live runs, root sessions, and dirty worktrees are skipped; exits 1 when any ticket failed. See "Sweeping many tickets" below |
 | `tm work start [<dir>]` | Attach to (or create) the tmux session for `<dir>`, defaulting to `cwd` |
 | `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<scope>-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
@@ -1874,9 +1874,11 @@ it is safe to run at any time or from a script.
 Because the session is the ticket, cleanup is one `kill-session` plus one
 worktree removal. The worktree comes from the ticket's run rows, and only a
 path sitting one level below the configured worktree root is ever removed —
-an `audit` run records `[work.audit].dir`, your own checkout, and that can
-never be handed to `git worktree remove`. A worktree that is already gone is
-reported, not an error.
+an `audit` run that fell back to `[work.audit].dir`, your own checkout,
+records that path, and it can never be handed to `git worktree remove`. An
+audit that ran in the ticket's lane worktree records the worktree, so
+`clean` removes it even when no lane run ever followed. A worktree that is
+already gone is reported, not an error.
 
 The session is archived before it is killed, and sometimes left running,
 exactly as after `tm merge`. See "Archived scrollback" below. You rarely
@@ -2019,7 +2021,7 @@ terminal to that session (the board suspends, tmux takes over; detach with
 
 ```toml
 [work.audit]
-dir = "~/Projects/axiom"            # required: where the session runs
+dir = "~/Projects/axiom"            # required: enables `a`; where the session runs without a lane worktree
 # prompt = "/ticket-audit {key}"    # optional; this is the default
 # prompt_file = ".tskmstr/prompts/audit.md"  # optional; see below
 # model = "opus"                    # optional; see "Which model a launch uses"
@@ -2038,13 +2040,28 @@ launch pre-registers a `kind = "audit"` run, and the in-session
 `tm ticket audit <KEY>` adopts it (via `TSKMSTR_SESSION_RUN_ID`), so the
 whole conversation's telemetry lands on one run.
 
+**The session runs in the ticket's lane worktree** when one can be
+resolved: the same `<worktree_root>/<repo>/<key>` path and local branch a
+`tm work run <lane> <KEY>` would provision, cut from the lane's
+`base_branch` (or the repo's default branch). The audit creates it if it
+is missing, and the lane run launched afterwards reuses it. Nothing is
+pushed. Rooting the session there is what lets the session picker show the
+ticket's branch and merge status and jump back to the root session. The
+lane is resolved from the lanes `w` would offer for this repo: one lane,
+or several that all keep the ticket in the same worktree (lanes sharing a
+repo). With no such lane, or lanes that disagree, the audit runs in `dir`
+and the status line says why, for example `launched audit for <KEY> in
+[work.audit].dir (no lane is configured for this repo) -- press a to
+attach`.
+
 If `dir`'s resolved backend doesn't match the current repo's own — the
 same mismatch `w`'s lane filtering checks for (GitHub issue #5) — the
 audit session falls back to launching in the current repo instead of
 refusing outright, since a repo hosting the ticket's own backend always
 resolves the ticket correctly. The status line notes the fallback:
 `launched audit for <KEY> in the current repo (configured audit dir is
-backend-incompatible) -- press a to attach`.
+backend-incompatible; <reason>) -- press a to attach`. This only applies
+when the audit is not running in a lane worktree.
 
 `model` takes precedence over `[work] default_model` for audits only. Leave
 it unset and the session falls back to `[work] default_model`, then the

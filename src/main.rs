@@ -1144,6 +1144,11 @@ fn run_board(
         &lanes,
         &backend_identity_resolver,
     );
+    let audit_lanes: Vec<(String, tskmstr::config::LaneConfig)> = lane_names
+        .iter()
+        .map(|name| (name.clone(), lanes[name].clone()))
+        .collect();
+    let worktree_root = tskmstr::work::run::resolve_worktree_root(&config.work, &home);
 
     // Built before the `config.work.*` moves below, while `config` is still
     // whole enough to borrow.
@@ -1225,6 +1230,9 @@ fn run_board(
             launcher: Box::new(tskmstr::tui::launcher::RealLaneLauncher),
             lane_names,
             hidden_lane_count,
+            audit_lanes,
+            worktree_root,
+            git: Box::new(tskmstr::work::git::ShellGitOps),
             audit_dir_fallback,
             create_dir_fallback,
             backend_identity: current_backend_identity,
