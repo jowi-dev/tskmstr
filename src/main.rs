@@ -832,6 +832,44 @@ fn run_work(
             let identity = backend_identity_or_placeholder(full_config.as_ref());
             tskmstr::cli::work::clean(&ctx, &run_store, &identity, &key, &mut stdout)?;
         }
+        WorkCmd::Coordinator {
+            cmd: tskmstr::cli::CoordinatorCmd::Start { epic },
+        } => {
+            // Unlike the rest of `tm work`, a coordinator needs the tracker
+            // (to check the key is an epic and list its children), so a
+            // missing or invalid config is an error here.
+            let config = config::load(paths)?;
+            let provider = run_ticket_provider(&config, keychain, env_token)?;
+            let run_store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
+            let identity = tskmstr::config::BackendIdentity::from_config(&config);
+            let runner = agent_runner_for(&config);
+            let repo_dir = tskmstr::work::git::GitOps::repo_root(&git, &cwd)?;
+            with_admission(Some(&config), runner, |admission| {
+                let deps = tskmstr::work::coordinator::CoordinatorLaunchDeps {
+                    store: &run_store,
+                    tmux: &tmux,
+                    runner,
+                    model_defaults: tskmstr::work::model::ModelDefaults::from_config(&config),
+                    admission,
+                };
+                let req = tskmstr::cli::work::CoordinatorStartRequest {
+                    provider: provider.as_ref(),
+                    cfg: &config.work.coordinator,
+                    home: &home,
+                    identity: &identity,
+                    epic: &epic,
+                    repo_dir: &repo_dir,
+                };
+                tskmstr::cli::work::coordinator_start(&deps, &req, &mut stdout)
+            })?;
+        }
+        WorkCmd::Coordinator {
+            cmd: tskmstr::cli::CoordinatorCmd::Stop { epic },
+        } => {
+            let run_store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
+            let identity = backend_identity_or_placeholder(full_config.as_ref());
+            tskmstr::cli::work::coordinator_stop(&run_store, &tmux, &identity, &epic, &mut stdout)?;
+        }
         WorkCmd::Start { dir } => {
             let dir_path = dir.map(PathBuf::from);
             tskmstr::cli::work::start(&ctx, dir_path.as_deref(), &cwd, &mut stdout)?;
