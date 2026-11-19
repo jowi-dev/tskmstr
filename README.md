@@ -2839,8 +2839,9 @@ same way the conflict sessions do.
 `wait_for_checks` and `checks_timeout_secs` control stage 4's wait for
 green checks: on by default, handing the ticket back after 30 minutes.
 `verify_command` is a shell command (run with `sh -c`) that runs in the
-branch's checkout after a rebase and before every push, its output going
-to the terminal. It catches breakage before CI does, so the conflict agent
+branch's checkout after a rebase and before every push. Its output goes
+to `merge-<KEY>-verify.log` in tm's run-state directory, which `tm merge`
+names when it starts the command and again if it fails. It catches breakage before CI does, so the conflict agent
 doesn't need to run the full suite after every commit. A non-zero exit
 stops the merge with nothing pushed. Unset, nothing runs.
 

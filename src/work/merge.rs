@@ -250,14 +250,17 @@ pub enum MergeError {
     /// `[work.merge] verify_command` exited non-zero after the rebase, so
     /// nothing was pushed or merged.
     #[error(
-        "verify_command `{command}` failed in {}; nothing pushed",
-        dir.display()
+        "verify_command `{command}` failed in {}; nothing pushed (output in {})",
+        dir.display(),
+        log.display()
     )]
     VerifyFailed {
         /// The configured command.
         command: String,
         /// The checkout it ran in.
         dir: PathBuf,
+        /// The file its output was written to.
+        log: PathBuf,
     },
 
     /// `[work.merge] verify_command` could not be started.
@@ -365,24 +368,36 @@ pub struct MergeDeps<'a> {
     /// broken base itself.
     pub allow_red_base: bool,
     /// Runs `[work.merge] verify_command` (the second argument) in a
-    /// checkout (the first) and reports whether it exited zero; production
-    /// passes [`run_verify_command`].
+    /// checkout (the first), its output going to a log file under
+    /// `state_dir` (the third), and reports whether it exited zero;
+    /// production passes [`run_verify_command`].
     pub run_verify: &'a VerifyRunner,
 }
 
 /// Runs `[work.merge] verify_command` (the second argument) in a checkout
-/// (the first) and reports whether it exited zero. See
-/// [`MergeDeps::run_verify`].
-pub type VerifyRunner = dyn Fn(&Path, &str) -> std::io::Result<bool>;
+/// (the first), writing its output to a log file (the third), and reports
+/// whether it exited zero. See [`MergeDeps::run_verify`].
+pub type VerifyRunner = dyn Fn(&Path, &str, &Path) -> std::io::Result<bool>;
 
 /// Production [`MergeDeps::run_verify`]: runs `command` with `sh -c` in
-/// `dir`, its output going straight to the terminal, and reports whether it
-/// exited zero.
-pub fn run_verify_command(dir: &Path, command: &str) -> std::io::Result<bool> {
+/// `dir` and reports whether it exited zero. Its stdout and stderr go to
+/// `log` (truncated first) and its stdin is closed.
+///
+/// The output never shares tm's own stdout or stderr. The board runs
+/// `tm merge` with both piped and reads them only after it exits, so a test
+/// suite's worth of output would fill the pipe and block `tm merge`
+/// forever. Keeping it out also leaves tm's own error as the first stderr
+/// line the board shows.
+pub fn run_verify_command(dir: &Path, command: &str, log: &Path) -> std::io::Result<bool> {
+    let stdout = std::fs::File::create(log)?;
+    let stderr = stdout.try_clone()?;
     std::process::Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
         .status()
         .map(|status| status.success())
 }
@@ -2189,20 +2204,25 @@ fn verify_and_push(
 ) -> Result<PushedHead, MergeError> {
     let branch = &prepared.branch;
     if let Some(command) = deps.merge_cfg.verify_command.as_deref() {
-        writeln!(
-            out,
-            "running verify_command `{command}` in {}...",
-            dir.display()
-        )?;
-        out.flush()?;
-        let passed = (deps.run_verify)(dir, command).map_err(|source| MergeError::VerifySpawn {
+        let spawn_err = |source| MergeError::VerifySpawn {
             command: command.to_string(),
             source,
-        })?;
+        };
+        std::fs::create_dir_all(deps.state_dir).map_err(spawn_err)?;
+        let log = verify_log_path(deps.state_dir, &prepared.key);
+        writeln!(
+            out,
+            "running verify_command `{command}` in {} (output in {})...",
+            dir.display(),
+            log.display()
+        )?;
+        out.flush()?;
+        let passed = (deps.run_verify)(dir, command, &log).map_err(spawn_err)?;
         if !passed {
             return Err(MergeError::VerifyFailed {
                 command: command.to_string(),
                 dir: dir.to_path_buf(),
+                log,
             });
         }
         writeln!(out, "verify_command passed")?;
@@ -2222,6 +2242,12 @@ fn verify_and_push(
         String::new()
     };
     Ok(PushedHead { sha, expect_checks })
+}
+
+/// Where [`verify_and_push`] writes `key`'s `verify_command` output: one
+/// file per ticket under `state_dir`, overwritten by each run.
+fn verify_log_path(state_dir: &Path, key: &str) -> PathBuf {
+    state_dir.join(format!("merge-{key}-verify.log"))
 }
 
 /// How [`wait_for_checks`] ended, short of a failing check (an error).
@@ -2754,7 +2780,7 @@ mod tests {
                 kill_pid: Box::new(move |pid| recorder.borrow_mut().push(pid)),
                 verify_calls,
                 verify_passes,
-                run_verify: Box::new(move |dir, command| {
+                run_verify: Box::new(move |dir, command, _log| {
                     verify_recorder
                         .borrow_mut()
                         .push((dir.to_path_buf(), command.to_string()));
@@ -6031,6 +6057,38 @@ mod tests {
         );
         assert!(fx.git.push_force_with_lease_calls().is_empty());
         assert!(fx.gh.pr_merge_calls().is_empty());
+    }
+
+    #[test]
+    fn failing_verify_command_names_its_log_under_state_dir() {
+        let mut fx = gated_fixture();
+        fx.merge_cfg.verify_command = Some("cargo test".to_string());
+        fx.verify_passes.set(false);
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        match result {
+            Err(MergeError::VerifyFailed { log, .. }) => {
+                assert_eq!(log, fx.state_dir.join("merge-PROJ-1-verify.log"));
+            }
+            other => panic!("{other:?}: {out}"),
+        }
+    }
+
+    #[test]
+    fn run_verify_command_writes_large_output_to_the_log_not_tm_streams() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("verify.log");
+        // ~200 KB across stdout and stderr: well past a 64 KB pipe buffer.
+        let command = "i=0; while [ $i -lt 2000 ]; do \
+            printf '%0100d\\n' $i; printf '%0100d\\n' $i >&2; i=$((i+1)); done; \
+            read -r line || exit 0";
+
+        let passed = run_verify_command(dir.path(), command, &log).unwrap();
+
+        assert!(passed, "stdin should be closed, so `read` hits EOF");
+        let len = std::fs::metadata(&log).unwrap().len();
+        assert!(len > 64 * 1024, "log holds {len} bytes");
     }
 
     #[test]
