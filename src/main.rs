@@ -844,24 +844,23 @@ fn run_work(
             let identity = tskmstr::config::BackendIdentity::from_config(&config);
             let runner = agent_runner_for(&config);
             let repo_dir = tskmstr::work::git::GitOps::repo_root(&git, &cwd)?;
-            with_admission(Some(&config), runner, |admission| {
-                let deps = tskmstr::work::coordinator::CoordinatorLaunchDeps {
-                    store: &run_store,
-                    tmux: &tmux,
-                    runner,
-                    model_defaults: tskmstr::work::model::ModelDefaults::from_config(&config),
-                    admission,
-                };
-                let req = tskmstr::cli::work::CoordinatorStartRequest {
-                    provider: provider.as_ref(),
-                    cfg: &config.work.coordinator,
-                    home: &home,
-                    identity: &identity,
-                    epic: &epic,
-                    repo_dir: &repo_dir,
-                };
-                tskmstr::cli::work::coordinator_start(&deps, &req, &mut stdout)
-            })?;
+            let admission = owned_admission(Some(&config), runner);
+            let deps = tskmstr::work::coordinator::CoordinatorLaunchDeps {
+                store: &run_store,
+                tmux: &tmux,
+                runner,
+                model_defaults: tskmstr::work::model::ModelDefaults::from_config(&config),
+                admission: admission.deps(),
+            };
+            let req = tskmstr::cli::work::CoordinatorStartRequest {
+                provider: provider.as_ref(),
+                cfg: &config.work.coordinator,
+                home: &home,
+                identity: &identity,
+                epic: &epic,
+                repo_dir: &repo_dir,
+            };
+            tskmstr::cli::work::coordinator_start(&deps, &req, &mut stdout)?;
         }
         WorkCmd::Coordinator {
             cmd: tskmstr::cli::CoordinatorCmd::Stop { epic },
