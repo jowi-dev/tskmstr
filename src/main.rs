@@ -511,11 +511,13 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             log_dir: tskmstr::work::dispatch::auto_merge_log_dir(&self.home),
             spawner: &tskmstr::work::detach::RealDetachSpawner,
         };
+        let epic_tickets = |epic: &str| epic_ticket_keys(provider.as_ref(), epic);
         let merge = tskmstr::work::auto_merge::SweepDeps {
             store: self.store,
             gh: &gh,
             repo_dir,
             launcher: &merge_launcher,
+            epic_tickets: &epic_tickets,
         };
         let notifier = tskmstr::work::notify::DesktopNotifier::detect();
         let deps = tskmstr::work::dispatch::TickDeps {
@@ -2490,6 +2492,18 @@ fn run_ready_check(key: String) -> ExitCode {
 /// one.
 const MERGE_EXIT_CONFLICTS: u8 = 2;
 
+/// The keys of `epic`'s child tickets, for the automerge sweep's merge
+/// epic (GitHub issue #247).
+fn epic_ticket_keys(
+    provider: &dyn tskmstr::ticketing::provider::TicketProvider,
+    epic: &str,
+) -> Result<Vec<String>, String> {
+    provider
+        .children(epic)
+        .map(|issues| issues.into_iter().map(|issue| issue.key).collect())
+        .map_err(|err| err.to_string())
+}
+
 /// `tm merge <KEY>`: build real dependencies and run
 /// [`tskmstr::work::merge::run_merge`], mapping its
 /// [`tskmstr::work::merge::MergeFlowOutcome`] to an exit code (`0` merged,
@@ -3262,11 +3276,13 @@ impl AutopilotTicker {
             log_dir: dispatch::auto_merge_log_dir(&self.home),
             spawner: &tskmstr::work::detach::RealDetachSpawner,
         };
+        let epic_tickets = |epic: &str| epic_ticket_keys(jira.as_ref(), epic);
         let merge = tskmstr::work::auto_merge::SweepDeps {
             store: &store,
             gh: &gh,
             repo_dir: &target.repo_root,
             launcher: &merge_launcher,
+            epic_tickets: &epic_tickets,
         };
         let notifier = tskmstr::work::notify::DesktopNotifier::detect();
         let deps = dispatch::TickDeps {
