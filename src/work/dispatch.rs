@@ -53,10 +53,10 @@
 //!    into each idle Claude Code lane that has new unread thatch chat
 //!    mail, so the agent reads it.
 //! 10. Sends the desktop notifications the scope owes
-//!    ([`crate::work::notify`]): tickets that entered awaiting review, hit
-//!    the fix-round cap, or had an automerge fail, a refusal streak older
-//!    than `stall_notify_mins`, and a lane base branch whose head commit has
-//!    a failed check (GitHub issue #242). Each transition notifies once.
+//!     ([`crate::work::notify`]): tickets that entered awaiting review, hit
+//!     the fix-round cap, or had an automerge fail, a refusal streak older
+//!     than `stall_notify_mins`, and a lane base branch whose head commit has
+//!     a failed check (GitHub issue #242). Each transition notifies once.
 //!
 //! Every dependency is injected, so tests drive [`tick`] with a real
 //! [`RunStore`] in a temp dir and fake candidates and launchers.
