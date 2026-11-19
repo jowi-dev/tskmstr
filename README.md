@@ -3399,13 +3399,12 @@ adapter binds to.
 
 #### opencode server mode (`[agent.opencode] mode`)
 
-opencode 2.x runs one background server per user. Each `opencode run`
-is a client of that server and loads its own opencode runtime, which
-costs a few hundred MB per lane. With server mode, a headless lane
-(`tm work run --headless`/`--fg`, or a usage-limit fallback attempt
-that lands on opencode) runs as a session on that server instead. A
-small tm process creates the session, sends the prompt, and polls until
-the session goes idle:
+opencode 2.x runs one background server per user, and each `opencode
+run` is a client of it. With server mode, a headless lane (`tm work run
+--headless`/`--fg`, or a usage-limit fallback attempt that lands on
+opencode) runs as a session on that server with no `opencode run`
+process. A small tm process creates the session, sends the prompt, and
+polls until the session goes idle:
 
 ```toml
 [agent.opencode]
@@ -3432,6 +3431,13 @@ What changes and what doesn't:
 - The driver talks to the server through `opencode api`, so the
   opencode service must be running (`opencode service start`). tm never
   reads the server's password.
+
+Server mode does **not** save memory on opencode 2.x. An `opencode run`
+client there is already about 80 MB, each `opencode api` call the
+driver makes costs about the same, and the session's memory lives in the
+shared server in both modes. Measured at 5 concurrent lanes, server mode
+peaked between 0.88x and 1.22x of process mode. Leave it at the default
+unless that changes. The plan doc below has the numbers.
 
 Interactive sessions always run the opencode TUI. `mode = "server"` on
 `[agent.claude]` is a config error. See
