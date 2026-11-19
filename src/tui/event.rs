@@ -317,7 +317,8 @@ pub struct TuiDeps {
     /// commands' own admission.
     pub admission: crate::work::admission::OwnedAdmission,
     /// Runs `thatch` for the broadcast key's `thatch chat broadcast`
-    /// (GitHub issue #225).
+    /// (GitHub issue #225) and for the run detail window's lane chat
+    /// (GitHub issue #223).
     pub thatch: Box<dyn crate::work::thatch_chat::ThatchRunner>,
     /// The thatch project label broadcasts address: the board repo's
     /// `owner/name` origin slug (see
@@ -1349,6 +1350,10 @@ pub struct WatchDeps {
     /// Memory and usage admission for hibernate wake on attach (GitHub
     /// issue #149); see [`TuiDeps::admission`].
     pub admission: crate::work::admission::OwnedAdmission,
+    /// Reads lane chat for the run detail window and the overview's
+    /// waiting-on-a-reply signal (GitHub issue #223); see
+    /// [`crate::work::thatch_chat`]. Local-only, like `tmux`.
+    pub thatch: Box<dyn crate::work::thatch_chat::ThatchRunner>,
 }
 
 /// The autopilot host a board or overview runs (GitHub issue #116).
@@ -1885,7 +1890,7 @@ fn load_run_detail(deps: &WatchDeps, run_id: i64) -> Vec<Msg> {
         Ok(None) => return vec![Msg::RunDetailFailed(format!("no run with id {run_id}"))],
         Err(err) => return vec![Msg::RunDetailFailed(err.to_string())],
     };
-    load_run_detail_tail(&deps.store, run)
+    load_run_detail_tail(&deps.store, deps.thatch.as_ref(), run)
 }
 
 /// Run `Cmd::LoadTicketRunDetail`: resolve `key`'s latest run (any `kind`)
@@ -1903,26 +1908,38 @@ fn load_ticket_run_detail(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         Ok(None) => return vec![Msg::RunDetailFailed(format!("no runs for {key}"))],
         Err(err) => return vec![Msg::RunDetailFailed(err.to_string())],
     };
-    load_run_detail_tail(store, run)
+    load_run_detail_tail(store, deps.thatch.as_ref(), run)
 }
 
 /// Shared tail of [`load_run_detail`]/[`load_ticket_run_detail`]: given a
-/// resolved [`crate::runs::Run`], load its event timeline and produce
-/// [`Msg::RunDetailLoaded`], or [`Msg::RunDetailFailed`] if the events can't
-/// be read.
-fn load_run_detail_tail(store: &crate::runs::RunStore, run: crate::runs::Run) -> Vec<Msg> {
+/// resolved [`crate::runs::Run`], load its event timeline and its thatch
+/// chat (GitHub issue #223) and produce [`Msg::RunDetailLoaded`], or
+/// [`Msg::RunDetailFailed`] if the events can't be read. A run with no
+/// session id, or no `thatch` on `PATH`, loads with no chat.
+fn load_run_detail_tail(
+    store: &crate::runs::RunStore,
+    thatch: &dyn crate::work::thatch_chat::ThatchRunner,
+    run: crate::runs::Run,
+) -> Vec<Msg> {
     let events = match store.events_for_run(run.id) {
         Ok(events) => events,
         Err(err) => return vec![Msg::RunDetailFailed(err.to_string())],
     };
-    vec![Msg::RunDetailLoaded(Box::new(run_to_detail(run, events)))]
+    let chat = run
+        .session_id
+        .as_deref()
+        .and_then(|session_id| crate::work::thatch_chat::lane_chat(thatch, session_id));
+    vec![Msg::RunDetailLoaded(Box::new(run_to_detail(
+        run, events, chat,
+    )))]
 }
 
-/// Map a [`crate::runs::Run`] plus its events to a
+/// Map a [`crate::runs::Run`] plus its events and chat to a
 /// [`crate::tui::app::RunDetail`].
 fn run_to_detail(
     run: crate::runs::Run,
     events: Vec<crate::runs::RunEvent>,
+    chat: Option<crate::work::thatch_chat::LaneChat>,
 ) -> crate::tui::app::RunDetail {
     let checklist = crate::runs::latest_checklist(&events);
     let tool_counts = crate::runs::tool_counts(&events);
@@ -1960,6 +1977,7 @@ fn run_to_detail(
         agent_usage,
         mem_current_bytes: run.mem_current_bytes,
         mem_peak_bytes: run.mem_peak_bytes,
+        chat,
     }
 }
 
@@ -5086,6 +5104,7 @@ mod tests {
             home: std::path::PathBuf::new(),
             repo_roots: RepoRootCache::new(Box::new(|_| None)),
             autopilot: AutopilotDeps::default(),
+            thatch: Box::new(crate::work::thatch_chat::FakeThatchRunner::missing()),
         }
     }
 
@@ -5810,6 +5829,52 @@ mod tests {
                 assert_eq!(detail.events.len(), 1);
                 assert_eq!(detail.events[0].kind, "tool_use");
             }
+            other => panic!("expected RunDetailLoaded, got {other:?}"),
+        }
+    }
+
+    /// One canned `thatch` stdout serving both the roster lookup and the
+    /// tail snapshots: each parser skips the other's lines.
+    const CHAT_STDOUT: &str = concat!(
+        r#"{"name":"lane-00007","session_id":"mcp_x","host_kind":"mcp","project":"a/b","topic":null,"status":"idle","last_seen":"2026-11-19T10:00:00Z","unread":0,"host_id":"sess-1"}"#,
+        "\n",
+        r#"{"event":"sent","at":"2026-11-19T10:00:00Z","id":1,"from":"lane-00007","from_topic":null,"to":"coord","to_topic":null,"broadcast":false,"body":"which base?"}"#,
+        "\n",
+    );
+
+    #[test]
+    fn execute_watch_load_run_detail_includes_the_runs_thatch_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.update_session_id(run_id, "sess-1").unwrap();
+        let mut deps = watch_deps(store);
+        deps.thatch = Box::new(crate::work::thatch_chat::FakeThatchRunner::returning(
+            CHAT_STDOUT,
+        ));
+
+        let msgs = execute_watch(&deps, Cmd::LoadRunDetail { run_id });
+        match msgs.as_slice() {
+            [Msg::RunDetailLoaded(detail)] => {
+                let chat = detail.chat.as_ref().expect("chat section");
+                assert_eq!(chat.name, "lane-00007");
+                assert_eq!(chat.messages.len(), 1);
+                assert_eq!(chat.messages[0].body, "which base?");
+            }
+            other => panic!("expected RunDetailLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_watch_load_run_detail_has_no_chat_without_thatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.update_session_id(run_id, "sess-1").unwrap();
+
+        let msgs = execute_watch(&watch_deps(store), Cmd::LoadRunDetail { run_id });
+        match msgs.as_slice() {
+            [Msg::RunDetailLoaded(detail)] => assert_eq!(detail.chat, None),
             other => panic!("expected RunDetailLoaded, got {other:?}"),
         }
     }

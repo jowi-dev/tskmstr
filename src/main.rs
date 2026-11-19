@@ -1270,7 +1270,10 @@ fn run_board(
             status_on_merge: config.status_on_merge,
             autopilot,
             admission,
-            thatch: Box::new(tskmstr::work::thatch_chat::ShellThatchRunner),
+            thatch: Box::new(tskmstr::work::thatch_chat::CachedThatchRunner::new(
+                Box::new(tskmstr::work::thatch_chat::ShellThatchRunner),
+                tskmstr::work::thatch_chat::CHAT_CACHE_TTL,
+            )),
             thatch_project: tskmstr::work::thatch_chat::detect_project(&cwd),
         },
         net,
@@ -3161,6 +3164,10 @@ fn watch_deps(
         })),
         autopilot: autopilot_deps(config, Vec::new()),
         admission: owned_admission(config, agent_runner_or_default(config)),
+        thatch: Box::new(tskmstr::work::thatch_chat::CachedThatchRunner::new(
+            Box::new(tskmstr::work::thatch_chat::ShellThatchRunner),
+            tskmstr::work::thatch_chat::CHAT_CACHE_TTL,
+        )),
     }
 }
 

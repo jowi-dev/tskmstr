@@ -398,6 +398,11 @@ pub struct RunDetail {
     /// Largest footprint sample, in bytes; see
     /// [`crate::runs::Run::mem_peak_bytes`].
     pub mem_peak_bytes: Option<u64>,
+    /// The run's thatch chat (GitHub issue #223): its session's chat name
+    /// and messages. `None` when `thatch` is not installed, the run has no
+    /// session id, or the session never joined chat; the window then shows
+    /// no chat section.
+    pub chat: Option<crate::work::thatch_chat::LaneChat>,
 }
 
 /// A [`RunDetail`]'s model usage breakdown, labeled so the UI can
@@ -8168,6 +8173,7 @@ mod tests {
             agent_usage: vec![],
             mem_current_bytes: None,
             mem_peak_bytes: None,
+            chat: None,
         }
     }
 
