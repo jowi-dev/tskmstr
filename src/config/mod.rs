@@ -582,8 +582,9 @@ pub struct RawWorkConfig {
     /// (GitHub issue #149). Defaults to 60.
     pub admission_wait_mins: Option<u64>,
     /// Directories copied from the main checkout into each new worktree
-    /// (GitHub issue #255), e.g. `copy_dirs = ["deps"]`, so a lane starts
-    /// with its dependencies instead of downloading them again. Paths are
+    /// (GitHub issues #255 and #259), e.g. `copy_dirs = ["deps", "_build"]`,
+    /// so a lane starts with its dependencies and their build output
+    /// instead of downloading and compiling them again. Paths are
     /// relative to the checkout root and may not leave it. On macOS the
     /// copy is a copy-on-write clone that uses no extra disk until a file is
     /// rewritten. A repo list replaces the global one as a whole. Unset or

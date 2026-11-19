@@ -1509,7 +1509,7 @@ that already holds a slot, such as a build script calling cargo, also
 skips it. The slot pool is shared by every lane on the machine, whichever
 repo it belongs to.
 
-### Copying dependency directories into new worktrees (`[work] copy_dirs`)
+### Copying dependency and build directories into new worktrees (`[work] copy_dirs`)
 
 Every worktree normally downloads and builds its own dependencies, even
 though most lane runs never change them. List the directories a new
@@ -1517,7 +1517,7 @@ worktree should start with instead:
 
 ```toml
 [work]
-copy_dirs = ["deps", "assets/node_modules"]
+copy_dirs = ["deps", "_build", "assets/node_modules"]
 ```
 
 When `tm work new` or `tm work run` creates a worktree, each listed
@@ -1534,8 +1534,21 @@ is just a head start for that install.
 
 - Paths are relative to the checkout root and may not be absolute or
   contain `..`. A repo-local list replaces the global one.
-- A directory is skipped when the main checkout doesn't have it. A copy
-  that fails prints a warning and the worktree builds that directory itself.
+- Build output (`_build` for Mix, `target` for Cargo) works too, and
+  skips the cold dependency build a fresh worktree would otherwise start
+  with. Mix and Cargo decide what to rebuild from timestamps and content
+  hashes, so a copy older than the worktree's sources only costs a rebuild
+  of the stale parts. Cargo always rebuilds the crate the worktree itself
+  checks out, so `target` saves less than `_build`.
+- The copy is made once, when the worktree is created, and never synced
+  again. Refresh the main checkout's build to give new worktrees a fresher
+  start.
+- A directory is skipped when the main checkout doesn't have it. Each
+  copied directory is reported as cloned or, when the filesystem can't
+  clone, as a full copy. A copy that fails entirely prints a warning and
+  the worktree builds that directory itself.
+- `du` counts a clone at its full size even though it shares disk blocks,
+  so summed worktree sizes overstate the real disk use.
 - Worktrees that already exist are not touched. With no `copy_dirs` set,
   worktrees are created as before.
 - This saves disk, not memory.
