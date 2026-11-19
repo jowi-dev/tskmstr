@@ -254,6 +254,10 @@ pub enum Screen {
     /// entered via `tm overview` (GitHub issue #83, ADR-0009). Shares the
     /// watch loop with [`Screen::Runs`]; `Tab` switches between the two.
     Overview,
+    /// The runs.db merge queue (GitHub issue #247), entered via `Q` from
+    /// [`Screen::Board`] or [`Screen::Overview`]; see
+    /// [`crate::tui::merge_queue`].
+    MergeQueue,
 }
 
 /// A run as displayed on the [`Screen::Runs`] kanban board, derived from a
@@ -936,6 +940,8 @@ pub struct App {
     /// A snapshot of `rank_tickets` taken at grab time, restored verbatim if
     /// the grab is cancelled. `None` whenever nothing is grabbed.
     pub rank_snapshot: Option<Vec<TicketSummary>>,
+    /// [`Screen::MergeQueue`]'s state.
+    pub merge_queue_view: crate::tui::merge_queue::MergeQueueView,
     /// Set when the event loop should exit.
     pub quit: bool,
     /// [`Screen::Runs`]'s cards, in the order [`RunStore::list_runs`] returns
@@ -1281,7 +1287,10 @@ impl App {
         }
         // Pushed last so the stable sort keeps a card's titled copy first
         // and the dedup drops this key-only one.
-        if let Some(key) = self.autopilot_epic() {
+        for key in [self.autopilot_epic(), self.merge_epic()]
+            .into_iter()
+            .flatten()
+        {
             epics.push(ParentRef {
                 key: key.to_string(),
                 summary: String::new(),
@@ -1301,6 +1310,15 @@ impl App {
         let scope = self.autopilot_scope.as_deref()?;
         crate::tui::autopilot::status_for(self, scope)?
             .priority_epic
+            .as_deref()
+    }
+
+    /// The board scope's merge epic (GitHub issue #247), as last loaded
+    /// with the autopilot status.
+    pub fn merge_epic(&self) -> Option<&str> {
+        let scope = self.autopilot_scope.as_deref()?;
+        crate::tui::autopilot::status_for(self, scope)?
+            .merge_epic
             .as_deref()
     }
 
@@ -1532,6 +1550,26 @@ pub enum Msg {
     /// filter or the autopilot flag. See
     /// [`crate::tui::autopilot::prioritize_epic`].
     EpicPickerPrioritize,
+    /// `m` in the board's epic picker: set or clear the scope's merge epic
+    /// (GitHub issue #247); see [`crate::tui::merge_queue::set_epic_from_picker`].
+    EpicPickerMergeEpic,
+    /// `Q` on the board or the overview: open [`Screen::MergeQueue`].
+    OpenMergeQueue,
+    /// `+` on the board or the overview: add the highlighted ticket to the
+    /// merge queue, or remove it.
+    QueueTicketAction,
+    /// `Space`/`Enter` on [`Screen::MergeQueue`]: grab or drop a row.
+    MergeQueueGrabToggle,
+    /// `x` on [`Screen::MergeQueue`]: remove the highlighted row.
+    MergeQueueRemove,
+    /// `E` on [`Screen::MergeQueue`]: clear the scope's merge epic.
+    MergeQueueClearEpic,
+    /// [`Cmd::LoadMergeQueue`] finished.
+    MergeQueueLoaded(Result<Vec<crate::tui::merge_queue::ScopeQueue>, String>),
+    /// A merge queue write ([`Cmd::ToggleQueuedMerge`],
+    /// [`Cmd::MoveQueuedMerge`], [`Cmd::RemoveQueuedMerge`],
+    /// [`Cmd::SetMergeEpic`]) finished.
+    MergeQueueChanged(Result<crate::tui::merge_queue::Change, String>),
     /// Enter board search mode (GitHub issue #152): every printable key now
     /// edits [`App::board_search_query`] until [`Msg::SearchSubmit`] or
     /// [`Msg::SearchCancel`]. Only meaningful on [`Screen::Board`];
@@ -2009,6 +2047,51 @@ pub enum Cmd {
         /// The scope to write.
         scope: String,
         /// The epic key to write, or `None` to clear.
+        epic: Option<String>,
+    },
+    /// Read the merge queues of `scopes` (and, with `all`, every scope
+    /// with queued merges); reports [`Msg::MergeQueueLoaded`].
+    LoadMergeQueue {
+        /// The scopes to read.
+        scopes: Vec<String>,
+        /// Also read every other scope with queued merges.
+        all: bool,
+    },
+    /// Remove `ticket` from `scope`'s merge queue, or add it (recording
+    /// `repo_dir`, else the board's repo, as the scope's checkout);
+    /// reports [`Msg::MergeQueueChanged`].
+    ToggleQueuedMerge {
+        /// The scope.
+        scope: String,
+        /// Ticket key.
+        ticket: String,
+        /// The scope's checkout, when the caller knows it.
+        repo_dir: Option<std::path::PathBuf>,
+    },
+    /// Move `ticket` to `index` in `scope`'s merge queue; reports
+    /// [`Msg::MergeQueueChanged`].
+    MoveQueuedMerge {
+        /// The scope.
+        scope: String,
+        /// Ticket key.
+        ticket: String,
+        /// Its new 0-based place.
+        index: usize,
+    },
+    /// Remove `ticket` from `scope`'s merge queue; reports
+    /// [`Msg::MergeQueueChanged`].
+    RemoveQueuedMerge {
+        /// The scope.
+        scope: String,
+        /// Ticket key.
+        ticket: String,
+    },
+    /// Set or clear `scope`'s merge epic; reports
+    /// [`Msg::MergeQueueChanged`].
+    SetMergeEpic {
+        /// The scope.
+        scope: String,
+        /// The new merge epic, or `None` to clear it.
         epic: Option<String>,
     },
     /// Replace the scopes the autopilot host thread ticks.
@@ -2510,6 +2593,11 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
                     cmds.push(Cmd::LoadRunDetail { run_id: card.id });
                 }
                 (app, cmds)
+            } else if app.screen == Screen::MergeQueue {
+                let cmds = crate::tui::merge_queue::reload_cmd(&app)
+                    .into_iter()
+                    .collect();
+                (app, cmds)
             } else if app.screen == Screen::Rank {
                 let query = TicketQuery::Ranked {
                     project_key: app.project_key.clone(),
@@ -2722,6 +2810,14 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, Vec::new())
         }
         Msg::EpicPickerPrioritize => crate::tui::autopilot::prioritize_epic(app),
+        Msg::EpicPickerMergeEpic => crate::tui::merge_queue::set_epic_from_picker(app),
+        Msg::OpenMergeQueue => crate::tui::merge_queue::open(app),
+        Msg::QueueTicketAction => crate::tui::merge_queue::toggle_ticket(app),
+        Msg::MergeQueueGrabToggle => crate::tui::merge_queue::grab_toggle(app),
+        Msg::MergeQueueRemove => crate::tui::merge_queue::remove(app),
+        Msg::MergeQueueClearEpic => crate::tui::merge_queue::clear_epic(app),
+        Msg::MergeQueueLoaded(result) => (crate::tui::merge_queue::loaded(app, result), Vec::new()),
+        Msg::MergeQueueChanged(result) => crate::tui::merge_queue::changed(app, result),
         Msg::StartSearch => {
             app.board_searching = true;
             (app, Vec::new())
@@ -4042,6 +4138,18 @@ fn tick(mut app: App) -> (App, Vec<Cmd>) {
             }
             (app, cmds)
         }
+        // ~2s, like the board's badges: row states follow the sweep.
+        Screen::MergeQueue => {
+            app.watch_tick += 1;
+            let cmds = if app.watch_tick.is_multiple_of(8) {
+                crate::tui::merge_queue::reload_cmd(&app)
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (app, cmds)
+        }
         _ => (app, Vec::new()),
     }
 }
@@ -4494,6 +4602,9 @@ fn enter(mut app: App) -> (App, Vec<Cmd>) {
         // The overview opens run detail with `v` (GitHub issue #87), not
         // `Enter`, matching the board.
         Screen::Overview => (app, Vec::new()),
+        // `map_key` routes Enter on the merge queue to
+        // `Msg::MergeQueueGrabToggle`.
+        Screen::MergeQueue => (app, Vec::new()),
     }
 }
 
@@ -4549,6 +4660,7 @@ fn back(app: &mut App) {
                 app.quit = true;
             }
         }
+        Screen::MergeQueue => crate::tui::merge_queue::back(app),
     }
 }
 
@@ -4594,6 +4706,7 @@ fn move_up(app: &mut App) {
             }
             OverviewLayout::Columns => move_overview_in_column(app, -1),
         },
+        Screen::MergeQueue => crate::tui::merge_queue::move_by(app, -1),
     }
 }
 
@@ -4650,6 +4763,7 @@ fn move_down(app: &mut App) {
             }
             OverviewLayout::Columns => move_overview_in_column(app, 1),
         },
+        Screen::MergeQueue => crate::tui::merge_queue::move_by(app, 1),
     }
 }
 
@@ -5447,6 +5561,7 @@ mod tests {
                 blocked_age_secs: None,
                 last_launch_age_secs: None,
                 priority_epic: epic.map(str::to_string),
+                merge_epic: None,
             }],
             ..epic_board()
         }

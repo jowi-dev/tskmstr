@@ -37,10 +37,14 @@
 //!    detached through a [`ci_fix::CiFixLauncher`]. A fix pass is not a
 //!    lane, so it counts against neither `max_lanes` nor the daily cap;
 //!    `tm review ci-fix` applies admission itself.
-//! 8. With `[dispatch] auto_merge` set, runs the automerge sweep
-//!    ([`auto_merge::sweep`], GitHub issue #243): starts one detached
-//!    `tm merge` for a lane PR whose review is complete, unless the scope
-//!    already has a merge running. A merge is not a lane either.
+//! 8. Runs the automerge sweep ([`auto_merge::sweep`], GitHub issues #243
+//!    and #247): with `[dispatch] auto_merge` set it adds lane PRs whose
+//!    review is complete to the scope's merge queue, then starts one
+//!    detached `tm merge` for the highest queued ticket that can merge,
+//!    unless the scope already has a merge running. A merge is not a lane
+//!    either. This step also runs with autopilot off, for tickets the
+//!    operator queued by hand, followed by step 9's automerge-failure
+//!    notices only; the tick still reports [`Skip::Disabled`].
 //! 9. Sends the desktop notifications the scope owes
 //!    ([`crate::work::notify`]): tickets that entered awaiting review, hit
 //!    the fix-round cap, or had an automerge fail, a refusal streak older
@@ -336,8 +340,9 @@ pub struct TickConfig<'a> {
     /// `[dispatch] fix_failing_ci`: run the CI-fix sweep (GitHub issue
     /// #226).
     pub fix_failing_ci: bool,
-    /// `[dispatch] auto_merge`: when the automerge sweep merges (GitHub
-    /// issue #243).
+    /// `[dispatch] auto_merge`: which PRs the automerge sweep adds to the
+    /// merge queue on its own (GitHub issues #243, #247). `Off` adds none;
+    /// tickets queued by hand still drain.
     pub auto_merge: AutoMerge,
     /// `[dispatch] stall_notify_mins`: how long refusals for one reason
     /// last before a stall notification.
@@ -383,7 +388,7 @@ pub struct TickDeps<'a> {
     /// (GitHub issue #242). `None` watches nothing.
     pub base_watch: Option<&'a notify::BaseWatch<'a>>,
     /// What the automerge sweep reads PRs with and launches through.
-    /// `None` runs no sweep, whatever [`TickConfig::auto_merge`] says.
+    /// `None` runs no sweep.
     pub merge: Option<&'a auto_merge::SweepDeps<'a>>,
 }
 
@@ -392,7 +397,8 @@ pub struct TickDeps<'a> {
 pub enum Skip {
     /// Another host holds the scope lock.
     Locked,
-    /// Autopilot is off for the scope.
+    /// Autopilot is off for the scope. Only the merge queue drained
+    /// ([`TickReport::auto_merges`]).
     Disabled,
 }
 
@@ -562,7 +568,21 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
         return Ok(skipped(Skip::Locked));
     };
     if !deps.store.autopilot_enabled(cfg.scope)? {
-        return Ok(skipped(Skip::Disabled));
+        // The operator's own queued merges drain with autopilot off, so a
+        // failed automerge still notifies; the other notices wait for
+        // autopilot.
+        let mut report = skipped(Skip::Disabled);
+        if let Some(merge) = deps.merge {
+            let runs = deps.store.overview_runs()?;
+            report.auto_merges = auto_merge::sweep(merge, &runs, cfg.scope, AutoMerge::Off)?;
+        }
+        let runs = deps.store.overview_runs()?;
+        let notices: Vec<_> = notify::ticket_notices(&runs, cfg.scope, cfg.max_fix_rounds)
+            .into_iter()
+            .filter(|notice| notice.reason == notify::AUTO_MERGE_FAILED)
+            .collect();
+        report.notified = notify::send(deps.store, deps.notifier, cfg.scope, &notices)?;
+        return Ok(report);
     }
     deps.store.stamp_autopilot_tick(cfg.scope)?;
     let priority_epic = deps.store.autopilot_epic(cfg.scope)?;
@@ -649,7 +669,7 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
     if let Some(ci) = deps.ci.filter(|_| cfg.fix_failing_ci) {
         report.ci_fixes = ci_fix::sweep(ci, &runs, cfg.scope, cfg.max_fix_rounds)?;
     }
-    if let Some(merge) = deps.merge.filter(|_| cfg.auto_merge != AutoMerge::Off) {
+    if let Some(merge) = deps.merge {
         // Re-read: the CI-fix sweep may have started a fix or recorded a
         // closed PR since `runs` was taken.
         let runs = deps.store.overview_runs()?;
@@ -1337,6 +1357,7 @@ mod tests {
             gh: &gh,
             repo_dir: Path::new("/repo"),
             launcher: &merge_launcher,
+            epic_tickets: &|_| Ok(Vec::new()),
         };
         let launcher = FakeLauncher::new(&fx.store);
 
@@ -1346,8 +1367,10 @@ mod tests {
         assert!(
             matches!(
                 &report.auto_merges[..],
-                [auto_merge::AutoMergeAction::Started { ticket, sha, .. }]
-                    if ticket == "GH-1" && sha == "abc1234"
+                [
+                    auto_merge::AutoMergeAction::Queued { .. },
+                    auto_merge::AutoMergeAction::Started { ticket, sha, .. },
+                ] if ticket == "GH-1" && sha == "abc1234"
             ),
             "{:?}",
             report.auto_merges
@@ -1366,6 +1389,7 @@ mod tests {
             gh: &gh,
             repo_dir: Path::new("/repo"),
             launcher: &merge_launcher,
+            epic_tickets: &|_| Ok(Vec::new()),
         };
         let launcher = FakeLauncher::new(&fx.store);
 
@@ -1374,6 +1398,87 @@ mod tests {
         assert!(gh.pr_list_review_state_calls().is_empty());
         assert!(merge_launcher.0.borrow().is_empty());
         assert!(report.auto_merges.is_empty());
+    }
+
+    #[test]
+    fn with_auto_merge_off_a_manually_queued_ticket_still_merges() {
+        let fx = Fixture::new();
+        finished_lane_with_pr(&fx.store, "GH-1");
+        fx.store
+            .enqueue_merge(SCOPE, "GH-1", crate::runs::merge_queue::QueueSource::Manual)
+            .unwrap();
+        let gh = approved_pr_gh();
+        let merge_launcher = FakeAutoMergeLauncher::default();
+        let merge = auto_merge::SweepDeps {
+            store: &fx.store,
+            gh: &gh,
+            repo_dir: Path::new("/repo"),
+            launcher: &merge_launcher,
+            epic_tickets: &|_| Ok(Vec::new()),
+        };
+        let launcher = FakeLauncher::new(&fx.store);
+
+        fx.tick_with_sweeps(&[], &launcher, None, Some(&merge));
+
+        assert_eq!(*merge_launcher.0.borrow(), vec!["GH-1"]);
+    }
+
+    #[test]
+    fn with_autopilot_off_the_queue_drains_but_nothing_launches_or_enqueues() {
+        let mut fx = Fixture::new();
+        fx.auto_merge = crate::config::AutoMerge::Approved;
+        fx.store.set_autopilot(SCOPE, false).unwrap();
+        finished_lane_with_pr(&fx.store, "GH-1");
+        fx.store
+            .enqueue_merge(SCOPE, "GH-1", crate::runs::merge_queue::QueueSource::Manual)
+            .unwrap();
+        let gh = approved_pr_gh();
+        let merge_launcher = FakeAutoMergeLauncher::default();
+        let merge = auto_merge::SweepDeps {
+            store: &fx.store,
+            gh: &gh,
+            repo_dir: Path::new("/repo"),
+            launcher: &merge_launcher,
+            epic_tickets: &|_| Ok(Vec::new()),
+        };
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let (report, _) = fx.tick_with_sweeps(&[ready("GH-2", 0)], &launcher, None, Some(&merge));
+
+        assert_eq!(report.skipped, Some(Skip::Disabled));
+        assert!(launcher.tickets().is_empty(), "no lanes with autopilot off");
+        assert_eq!(*merge_launcher.0.borrow(), vec!["GH-1"]);
+        assert!(
+            matches!(
+                &report.auto_merges[..],
+                [auto_merge::AutoMergeAction::Started { ticket, .. }] if ticket == "GH-1"
+            ),
+            "{:?}",
+            report.auto_merges
+        );
+    }
+
+    #[test]
+    fn with_autopilot_off_and_an_empty_queue_prs_are_never_read() {
+        let mut fx = Fixture::new();
+        fx.auto_merge = crate::config::AutoMerge::Approved;
+        fx.store.set_autopilot(SCOPE, false).unwrap();
+        finished_lane_with_pr(&fx.store, "GH-1");
+        let gh = approved_pr_gh();
+        let merge_launcher = FakeAutoMergeLauncher::default();
+        let merge = auto_merge::SweepDeps {
+            store: &fx.store,
+            gh: &gh,
+            repo_dir: Path::new("/repo"),
+            launcher: &merge_launcher,
+            epic_tickets: &|_| Ok(Vec::new()),
+        };
+        let launcher = FakeLauncher::new(&fx.store);
+
+        fx.tick_with_sweeps(&[], &launcher, None, Some(&merge));
+
+        assert!(gh.pr_list_review_state_calls().is_empty());
+        assert!(fx.store.merge_queue(SCOPE).unwrap().is_empty());
     }
 
     #[test]
@@ -1651,6 +1756,25 @@ mod tests {
         fx.tick(&[], &launcher);
 
         assert!(fx.notifier.0.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_disabled_scope_still_notifies_a_failed_automerge_once() {
+        let fx = Fixture::new();
+        fx.store.set_autopilot(SCOPE, false).unwrap();
+        awaiting_review(&fx.store);
+        let lane = start(&fx.store, "GH-1", "lane");
+        finish(&fx.store, lane, RunStatus::Done, Some("https://gh/pr/1"));
+        let merge = start(&fx.store, "GH-1", auto_merge::AUTO_MERGE_KIND);
+        finish(&fx.store, merge, RunStatus::Failed, None);
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let first = fx.tick(&[], &launcher);
+        let second = fx.tick(&[], &launcher);
+
+        assert_eq!(first.skipped, Some(Skip::Disabled));
+        assert_eq!(first.notified, vec!["tm: automerge of GH-1 did not land"]);
+        assert!(second.notified.is_empty());
     }
 
     #[test]

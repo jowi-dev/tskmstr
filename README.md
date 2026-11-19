@@ -269,12 +269,13 @@ tm auth status
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
 | `tm merge <KEY>... [--allow-red-base]` | Rebase, merge, and locally sync `<KEY>`'s open PR (refuses while the base branch's head commit has a failed check unless `--allow-red-base`, fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, finishing the ticket's live runs, archive-then-kill of the `tm-<scope>-<key>` tmux session, `status_on_merge`, stale `tm:status/*` label sweep on a closed GitHub issue, then the same for stacked PRs already merged into its branch, then a short headless agent session that archives the merged branch's thatch memories). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
+| `tm merge --queue <KEY>...` / `--unqueue <KEY>...` | Add tickets to, or remove them from, the repo's merge queue instead of merging now. The dispatch tick merges them in order once each is ready, autopilot on or off. See "The merge queue" below |
 | `tm drift [KEY...] [--fix] [--stall-hours <N>]` | List tickets whose tracker status has drifted from what their lane runs and PRs did, across every project the run store has lane runs for: finished work still in To Do, merged PRs whose ticket isn't done, running lanes on a To Do ticket, and in-progress tickets with no live run or open PR for more than `N` hours (default 24). Read-only by default; `--fix` applies each finding's `status_on_*` transition (stalled tickets are never moved), and `KEY...` restricts listing and fixing to those tickets. See "Ticket/run status drift" below |
 | `tm usage` | Print the stored usage snapshots (5-hour / 7-day utilization per agent) with their source, age and reset time — what the usage gate sees. See "Usage snapshots" below |
 | `tm usage statusline [-- <command...>]` | Claude Code statusline shim: save the stdin payload's `rate_limits` as usage snapshots (at most every 30s), then run `<command...>` with the same stdin and print its output unchanged. Recording errors never change the output or exit code (`TM_DEBUG=1` prints them on stderr). See "Usage snapshots" below |
-| `tm dispatch tick [--scope S \| --all] [--json]` | Run one autopilot dispatch pass for the current repo, one scope, or every scope that is on. Exits `0` even when a scope is off, locked, or refused by a gate; `1` only when a scope can't tick. See "Running autopilot without a TUI" below |
+| `tm dispatch tick [--scope S \| --all] [--json]` | Run one autopilot dispatch pass for the current repo, one scope, or every scope that is on or has queued merges. Exits `0` even when a scope is off, locked, or refused by a gate; `1` only when a scope can't tick. See "Running autopilot without a TUI" below |
 | `tm dispatch on\|off [--scope S \| --all]` | Turn autopilot on or off. `on` inside a repo also records the repo for `tick --all`; `off --all` is the kill switch |
-| `tm dispatch status` | Per scope: on or off, running lanes, last tick, time since the last launch, and the refusal blocking it now (with how long it has lasted) |
+| `tm dispatch status` | Per scope: on or off, running lanes, last tick, time since the last launch, the refusal blocking it now (with how long it has lasted), the newest automerge, and the merge epic and merge queue |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `auto-review`, `review-watch`, `bugbot-cleanup`, `merge-conflict`, `setup`, `walkthrough`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
@@ -603,10 +604,12 @@ overview` from:
 - `M` asks to confirm, then runs `tm merge <key>` in the row's repo. It
   needs a known PR: a run that recorded a PR URL, or a PR stage from the
   tracker.
-- `Space` queues the row for a batch merge, with the same gate as `M`. With
-  anything queued, `M` confirms the whole queue and runs one `tm merge K1 K2
+- `Space` adds the row to a merge batch, with the same gate as `M`. With
+  anything batched, `M` confirms the whole batch and runs one `tm merge K1 K2
   …` per repo, because a batch shares one conflict session and that session
-  lives in one repo. Queued rows show `+` after the key.
+  lives in one repo. Batched rows show `+` after the key.
+- `+` adds the row's ticket to its repo's merge queue, or removes it, and
+  `Q` opens the merge queue view (see "The merge queue" below).
 
 A row needs its repo root. Runs started before the `runs.repo_root` column
 existed don't have one, so their actions stay disabled and the status line
@@ -1298,10 +1301,13 @@ it. A tick:
    lane PR whose checks finished red (see "Fixing failing CI" below). A
    fix pass is not a lane, so it counts against neither `max_lanes` nor
    `max_launches_per_day`.
-8. **Starts an automerge**, when `auto_merge` is not `off`: one detached
-   `tm merge` for a lane PR whose review is complete, unless the repo
-   already has a merge running (see "Merging automatically" below). A
-   merge is not a lane either.
+8. **Drains the merge queue**: with `auto_merge` not `off`, it first adds
+   each lane PR whose review is complete to the repo's merge queue. Then it
+   starts one detached `tm merge` for the highest queued ticket that is
+   ready, unless the repo already has a merge running (see "Merging
+   automatically" and "The merge queue" below). A merge is not a lane
+   either. This step alone also runs while autopilot is off, so tickets you
+   queued by hand still merge.
 9. **Sends desktop notifications** (GitHub issue #121,
    `src/work/notify.rs`) when:
    - a ticket enters "awaiting review": its PR is open, the bots have
@@ -1320,8 +1326,9 @@ it. A tick:
    Each of these fires once per transition, not once per tick. runs.db's
    `notifications` table remembers, per ticket and reason, the transition
    it last notified. A ticket that goes back to work and returns to the
-   same state notifies again. A tick sends nothing while the scope's
-   autopilot is off, and only tickets active in the last 7 days notify.
+   same state notifies again. While the scope's autopilot is off, a tick
+   sends only the automerge-failure notice, since queued tickets still
+   merge then. Only tickets active in the last 7 days notify.
 
    Notifications use `notify-send` on Linux and `osascript` on macOS. If
    the command is not installed, the tick sends nothing and carries on.
@@ -1364,7 +1371,7 @@ max_launches_per_day = 20   # default; launches per repo in any rolling 24 hours
 stall_notify_mins = 30      # default; refusing this long for one reason notifies
 max_fix_rounds = 3          # default; automatic fix passes per ticket, every source
 fix_failing_ci = false      # default; start a fix pass when a lane PR's CI fails
-auto_merge = "off"          # default; "approved" or "reviewed" runs tm merge on its own
+auto_merge = "off"          # default; "approved" or "reviewed" queues reviewed PRs to merge
 ```
 
 #### Running autopilot from the TUI
@@ -1381,7 +1388,8 @@ Turning autopilot on ticks at once. A tick reads the tracker, so it never
 runs on the thread that draws the screen. Each tick loads that repo's own
 config, so `max_lanes`, the lanes and the runners all come from it.
 
-A tick whose scope has autopilot off does nothing. Two open TUIs (or a TUI
+A tick whose scope has autopilot off only drains the merge queue and
+sends automerge-failure notices. Two open TUIs (or a TUI
 and `tm dispatch`) take the same per-scope lock, so they never launch the
 same ticket.
 
@@ -1623,8 +1631,10 @@ move them in the epics view instead; see "The epics view" below.
 | `V` | Open the selected ticket's lane-run worktree in `vdiff` for review (board only); see "Board-launched vdiff review loop" below |
 | `W` | Open a change walkthrough of the selected ticket's lane PR in a `walkthrough` window of its session (board only); see "Board-launched change walkthroughs" below |
 | `F` | Dispatch a fix pass over the review comments `vdiff` captured for the selected ticket (board only); see "Board-launched vdiff review loop" below |
-| `M` | Merge the selected ticket's open PR, after a confirmation prompt naming the PR and the post-merge status: runs the full `tm merge <KEY>` flow in the background, board stays responsive (board only); with tickets queued via `Space`, confirms and merges the whole queue in one `tm merge KEY1 KEY2 ...` instead; see "Merging from the board" below |
-| `Space` | Toggle the selected ticket in or out of the merge queue, marked `+` on its card (board only; on the priority screen `Space` grabs/drops instead) |
+| `M` | Merge the selected ticket's open PR, after a confirmation prompt naming the PR and the post-merge status: runs the full `tm merge <KEY>` flow in the background, board stays responsive (board only); with tickets batched via `Space`, confirms and merges the whole batch in one `tm merge KEY1 KEY2 ...` instead; see "Merging from the board" below |
+| `Space` | Toggle the selected ticket in or out of the merge batch, marked `+` on its card (board only; on the priority screen `Space` grabs/drops instead) |
+| `+` | Add the selected ticket to the repo's merge queue, or remove it; see "The merge queue" below |
+| `Q` | Open the merge queue view; see "The merge queue" below |
 | `R` | Open the retro board (board only); see "Retro board" below |
 | `P` | Turn autopilot on or off for the board's repo, or for the highlighted row's repo on `tm overview`; see "Running autopilot from the TUI" below |
 | `C` | Type a message and send it to every live agent session in the board's repo through `thatch chat broadcast` (board only); see "Broadcasting to the project's lanes" below |
@@ -2522,53 +2532,114 @@ the lane for review, and sends the fix-cap notification.
 
 ### Merging automatically
 
-**With `[dispatch] auto_merge`, autopilot runs `tm merge` on its own once a
-ticket's review is complete** (GitHub issue #243). It is `"off"` by
-default and only runs while autopilot is on for the repo. The two other
-values say when a review counts as complete:
+**With `[dispatch] auto_merge`, autopilot merges tickets on its own once
+their review is complete** (GitHub issues #243, #247). It adds each one to
+the repo's merge queue (see "The merge queue" below), which then merges
+them in order. It is `"off"` by default and only adds tickets while
+autopilot is on for the repo. The two other values say when a review counts
+as complete:
 
-- **`"approved"`** merges a PR at the overview's Ready to merge: an
+- **`"approved"`** queues a PR at the overview's Ready to merge: an
   explicit GitHub approval, no conflicts, and green checks.
-- **`"reviewed"`** also merges a PR at Awaiting review: the review bots and
+- **`"reviewed"`** also queues a PR at Awaiting review: the review bots and
   auto-review are done, any cleanup has finished, and nothing is running.
   **This merges with no human approval at all.** Use it only in a repo
   where you trust auto-review and CI to stand in for a reviewer.
 
-A PR with a failing check is never merged this way; `fix_failing_ci` owns
-it.
+A PR with a failing check is never queued this way; `fix_failing_ci` owns
+it. When several PRs qualify on one tick, the lowest-numbered one is queued
+first.
 
-**One merge runs per repo at a time.** Each merge rebases onto the base
-the previous one changed, so a dispatch tick starts nothing while the
-repo has an automerge or a `tm merge` conflict session running. When
-several PRs qualify, the lowest-numbered one goes first.
+**A merge epic limits what autopilot queues.** Press `m` on an epic in the
+board's epic picker (`e`) to make it the repo's merge epic; `m` on it again,
+or on `All epics`, clears it. With one set, autopilot only queues that
+epic's tickets. You can still queue any ticket by hand. The merge epic is
+separate from the priority epic (`P` in the same picker), so lanes and
+merges can work on different epics.
 
-**One merge runs per head commit.** Before it starts, tm records an
-`auto_merge started <sha> run <id>` event on the lane run, so later ticks
-leave that commit alone. A merge that fails is not retried until the PR's
-head changes, for example after a fix pass pushes. That holds in both
-modes: in `"reviewed"` the failed `auto-merge` run does not take the PR out
-of Awaiting review.
-
-Each automerge is an `auto-merge` run: `tm dispatch` spawns `tm merge
-<KEY>` detached in the repo, logging to
-`~/.local/state/tskmstr/auto-merge/<key>.log`. Because it is `tm merge`,
-every gate `tm merge` applies holds for it too: the wait for green checks
-on the pushed head, `verify_command`, and the conflict session. The run
-ends `done` when the PR merged. Anything else ends it `failed`, with the
-reason as its blocker, and flags the ticket's lane run for review. That
-covers a conflict session that was handed back, checks still running at
-`checks_timeout_secs`, and any refusal or error. A failed or interrupted
-automerge sends one desktop notification.
-
-`tm dispatch tick` prints the merge it started, and `tm dispatch status`
-shows each repo's newest automerge: running, merged, or failed with its
-reason. The overview shows a running automerge as Running and a failed
-one as Stuck, like any other run.
+**One queue entry per head commit.** When autopilot queues a ticket, tm
+records an `auto_merge queued <sha>` event on the lane run. If you remove
+the ticket from the queue, autopilot does not add it back until the PR's
+head changes, for example after a fix pass pushes.
 
 ```toml
 [dispatch]
 # auto_merge = "off"        # or "approved", or "reviewed" (no human approval)
 ```
+
+### The merge queue
+
+**The merge queue is a per-repo list of tickets waiting to merge, kept in
+runs.db** (GitHub issue #247). It outlives the TUI, the dispatch tick reads
+it with or without a TUI open, and every tick merges at most one of its
+tickets per repo.
+
+**Adding tickets.** Autopilot adds reviewed tickets as described above. You
+add any ticket by hand, whether autopilot is on or off:
+
+- `tm merge --queue KEY...` inside the repo. It also records the repo's
+  checkout, so the dispatch timer's `tm dispatch tick --all` drains the
+  queue even while autopilot is off. `tm merge --unqueue KEY...` removes
+  tickets.
+- `+` on a board card or an overview row. `+` again removes it.
+
+**Draining.** Each dispatch tick starts `tm merge` for **the highest ticket
+in the queue that is ready**. A ticket is ready when its PR is open with
+green (or no) checks, it is not a draft, no reviewer requested changes, and
+nothing is running for it. A ticket that autopilot queued must also still
+pass its `auto_merge` mode, so turning autopilot off stops those but not
+yours. A ticket that is not ready keeps its place, and the queue shows why
+it is waiting (`checks pending`, `no open PR`, `autopilot off`, ...).
+Conflicts do not block a ticket: `tm merge` rebases it and opens its
+conflict session as usual.
+
+**One merge runs per repo at a time.** Each merge rebases onto the base the
+previous one changed, so a tick starts nothing while the repo has an
+automerge or a `tm merge` conflict session running.
+
+**A merge that does not land holds its ticket.** A merged ticket leaves the
+queue. Otherwise the ticket stays where it is, marked held with the reason,
+and is not tried again until its PR's head changes. That holds in both
+modes: in `"reviewed"` the failed `auto-merge` run does not take the PR out
+of Awaiting review. A ticket whose PR was merged or closed some other way
+also leaves the queue.
+
+Each merge is an `auto-merge` run: `tm dispatch` spawns `tm merge <KEY>`
+detached in the repo, logging to
+`~/.local/state/tskmstr/auto-merge/<key>.log`. Because it is `tm merge`,
+every gate `tm merge` applies holds for it too: the wait for green checks
+on the pushed head, `verify_command`, and the conflict
+session. The run ends `done` when the PR merged. Anything else ends it
+`failed`, with the reason as its blocker, and flags the ticket's lane run
+for review. That covers a conflict session that was handed back, checks
+still running at `checks_timeout_secs`, and any refusal or error. A failed
+or interrupted automerge sends one desktop notification.
+
+**Seeing and reordering it.** `Q` on the board or the overview opens the
+merge queue view: the board's repo, or every repo the overview shows plus
+any other repo with queued tickets. Each repo lists its merge epic, then its
+tickets in merge order, each with who added it (`manual` or `autopilot`) and
+its state: `waiting` (with the reason), `merging`, or `held` (with the
+reason). In the view:
+
+| Key | Action |
+|---|---|
+| `j`/`k` | Move the highlight |
+| `Enter`/`Space` | Grab the highlighted ticket; `j`/`k` then move it within its repo's queue, and `Enter`/`Space` drops it there. `Esc` cancels the move |
+| `x` | Remove the highlighted ticket from the queue |
+| `E` | Clear the repo's merge epic |
+| `r` | Reload (the view also reloads every ~2 seconds) |
+| `Esc`/`q` | Back to the board or overview |
+
+`tm dispatch tick` prints what the queue did (`automerge GH-12 queued`,
+`started`, `left the queue`). `tm dispatch status` shows each repo's newest
+automerge, its merge epic and its queue.
+
+**The queue is not the board's merge batch.** `Space` and `M` on the board
+and the overview build a *merge batch*: a set kept in TUI memory that
+merges right away in one `tm merge K1 K2 ...` when you confirm it (see
+"Batching several tickets for one merge" below). Use the batch to merge
+now, and the queue to merge later, once each ticket is ready.
 
 ### Merging from the board
 
@@ -2614,18 +2685,22 @@ in progress on disk in the meantime. Any other failure (no mergeable PR, a
 `gh`/`git` error) surfaces as its own status-line message; nothing is
 merged and no status is touched.
 
-#### Queueing several tickets for one batch merge
+#### Batching several tickets for one merge
 
-`Space` on a board card toggles it in and out of a merge queue; a queued
+`Space` on a board card toggles it in and out of a merge batch; a batched
 card shows a magenta `+` after its readiness glyph. A ticket whose merge is
-already in flight can't be queued (the status line says so). With anything
-queued, `M` skips the PR lookup and opens a "Merge queue" confirmation
-listing every queued key in board order (column, then position), which is
+already in flight can't be batched (the status line says so). With anything
+batched, `M` skips the PR lookup and opens a "Merge batch" confirmation
+listing every batched key in board order (column, then position), which is
 the order `tm merge` receives them. Confirming runs one
 `tm merge KEY1 KEY2 ...` watched child (see "Merging several tickets at once"
-below), clears the queue, and marks every key in flight until it
-finishes. Cancelling leaves the queue as it was. With nothing queued, `M`
+below), clears the batch, and marks every key in flight until it
+finishes. Cancelling leaves the batch as it was. With nothing batched, `M`
 merges the hovered ticket exactly as described above.
+
+A batch lives only in the TUI and merges as soon as you confirm. To have
+tickets merge later, each once it is ready, add them to the merge queue
+with `+` instead (see "The merge queue" above).
 
 ### Merging a ticket's PR
 
@@ -2842,9 +2917,9 @@ still had checks pending, else `0`.
 
 Two boundaries worth knowing:
 
-- **The board's `M` key batches only what you queue.** Queue tickets with
-  `Space` first (see "Queueing several tickets for one batch merge" above);
-  with nothing queued, `M` merges just the selected ticket.
+- **The board's `M` key batches only what you batch.** Batch tickets with
+  `Space` first (see "Batching several tickets for one merge" above);
+  with nothing batched, `M` merges just the selected ticket.
 - **Earlier merges can leave a later ticket behind its base.** A ticket
   that resolved in the shared session was rebased onto the base as it was
   then; if another batch ticket merged into that base since, branch

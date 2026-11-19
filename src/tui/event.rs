@@ -1349,6 +1349,11 @@ pub struct AutopilotDeps {
     pub host: Option<crate::work::autopilot::AutopilotHost>,
     /// `[dispatch] max_lanes`, shown against the running lane count.
     pub max_lanes: usize,
+    /// The board's repo checkout (its first target's), recorded when `+`
+    /// queues a merge so `tm dispatch tick --all` can drain the queue
+    /// (GitHub issue #247). `None` on the overview, whose rows carry their
+    /// own.
+    pub repo_root: Option<std::path::PathBuf>,
 }
 
 /// Run an autopilot [`Cmd`] against `store` and the host. `store` is
@@ -1689,6 +1694,13 @@ fn execute_watch(deps: &WatchDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::SetAutopilotEpic { .. }
         | Cmd::SetAutopilotTargets(_)) => {
             execute_autopilot(Some(&deps.store), &deps.autopilot, cmd)
+        }
+        cmd @ (Cmd::LoadMergeQueue { .. }
+        | Cmd::ToggleQueuedMerge { .. }
+        | Cmd::MoveQueuedMerge { .. }
+        | Cmd::RemoveQueuedMerge { .. }
+        | Cmd::SetMergeEpic { .. }) => {
+            crate::tui::merge_queue::execute(Some(&deps.store), None, cmd)
         }
         Cmd::LoadRunDetail { run_id } => load_run_detail(deps, run_id),
         Cmd::ReapRuns => reap_runs(deps),
@@ -2042,6 +2054,15 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::SetAutopilotTargets(_)) => {
             execute_autopilot(deps.store.as_ref(), &deps.autopilot, cmd)
         }
+        cmd @ (Cmd::LoadMergeQueue { .. }
+        | Cmd::ToggleQueuedMerge { .. }
+        | Cmd::MoveQueuedMerge { .. }
+        | Cmd::RemoveQueuedMerge { .. }
+        | Cmd::SetMergeEpic { .. }) => crate::tui::merge_queue::execute(
+            deps.store.as_ref(),
+            deps.autopilot.repo_root.as_deref(),
+            cmd,
+        ),
         Cmd::LaunchCleanup { key } => launch_cleanup_cmd(deps, &key),
         Cmd::LoadTicketRunDetail { key } => load_ticket_run_detail(deps, &key),
         Cmd::RecordAudit { key } => record_audit(deps, &key),
@@ -5625,6 +5646,7 @@ mod tests {
         let deps = AutopilotDeps {
             host: Some(host),
             max_lanes: 1,
+            repo_root: None,
         };
         deps.host
             .as_ref()

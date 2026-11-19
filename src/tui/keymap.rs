@@ -78,6 +78,13 @@ fn is_inert_while_rank_grabbed(key: KeyCode) -> bool {
 /// nothing irreversible can happen from a stray keystroke while the prompt
 /// is up.
 ///
+/// On [`Screen::MergeQueue`] (GitHub issue #247), `Enter`/`Space` grab or
+/// drop the highlighted row, `x` removes it and `E` clears the scope's
+/// merge epic; navigation, `r` and `Esc`/`q` are the shared bindings. `Q`
+/// opens that screen and `+` queues the highlighted ticket, from
+/// [`Screen::Board`] and [`Screen::Overview`]. `m` in the epic picker sets
+/// the merge epic.
+///
 /// While a ticket is grabbed on [`Screen::Rank`] (`rank_grabbed`), `r` is
 /// inert: refreshing would silently discard the pending, undropped reorder.
 /// `rank_grabbed` is ignored on every other screen.
@@ -186,6 +193,7 @@ pub fn map_key(
             KeyCode::Char('k') | KeyCode::Up => Some(Msg::EpicPickerUp),
             KeyCode::Enter => Some(Msg::EpicPickerSelect),
             KeyCode::Char('P') => Some(Msg::EpicPickerPrioritize),
+            KeyCode::Char('m') => Some(Msg::EpicPickerMergeEpic),
             KeyCode::Esc | KeyCode::Char('q') => Some(Msg::EpicPickerClose),
             _ => None,
         };
@@ -261,6 +269,15 @@ pub fn map_key(
         };
     }
 
+    if *screen == Screen::MergeQueue {
+        match key {
+            KeyCode::Enter | KeyCode::Char(' ') => return Some(Msg::MergeQueueGrabToggle),
+            KeyCode::Char('x') => return Some(Msg::MergeQueueRemove),
+            KeyCode::Char('E') => return Some(Msg::MergeQueueClearEpic),
+            _ => {}
+        }
+    }
+
     if *screen == Screen::Rank {
         if let Some(msg) = map_rank_key(key) {
             return Some(msg);
@@ -331,6 +348,12 @@ pub fn map_key(
         KeyCode::Char('R') if *screen == Screen::Board => Some(Msg::OpenRetro),
         KeyCode::Char('Y') if *screen == Screen::Board => Some(Msg::MarkAuditedAction),
         KeyCode::Char('E') if *screen == Screen::Board => Some(Msg::ToggleEpicsView),
+        KeyCode::Char('Q') if matches!(screen, Screen::Board | Screen::Overview) => {
+            Some(Msg::OpenMergeQueue)
+        }
+        KeyCode::Char('+') if matches!(screen, Screen::Board | Screen::Overview) => {
+            Some(Msg::QueueTicketAction)
+        }
         KeyCode::Char('d') if *screen == Screen::Retro => Some(Msg::RetroDefectStart),
         KeyCode::Char('c') if *screen == Screen::Retro => Some(Msg::RetroMarkClean),
         _ => None,
@@ -3353,6 +3376,7 @@ mod tests {
             (KeyCode::Esc, Msg::EpicPickerClose),
             (KeyCode::Char('q'), Msg::EpicPickerClose),
             (KeyCode::Char('P'), Msg::EpicPickerPrioritize),
+            (KeyCode::Char('m'), Msg::EpicPickerMergeEpic),
         ];
         for (key, msg) in cases {
             assert_eq!(epic_picker_key(key), Some(msg));
@@ -3364,6 +3388,46 @@ mod tests {
         for c in ['r', 'f', 'e', '?', '/', 'h', 'l', 'w', 'M'] {
             assert_eq!(epic_picker_key(KeyCode::Char(c)), None);
         }
+    }
+
+    /// GitHub issue #247: `Q` opens the merge queue and `+` queues the
+    /// highlighted ticket, on the board and the overview only.
+    #[test]
+    fn q_opens_the_merge_queue_and_plus_queues_a_ticket() {
+        for screen in [Screen::Board, Screen::Overview] {
+            assert_eq!(
+                plain_key(&screen, KeyCode::Char('Q')),
+                Some(Msg::OpenMergeQueue)
+            );
+            assert_eq!(
+                plain_key(&screen, KeyCode::Char('+')),
+                Some(Msg::QueueTicketAction)
+            );
+        }
+        for screen in [Screen::Runs, Screen::Rank, Screen::Retro] {
+            assert_eq!(plain_key(&screen, KeyCode::Char('Q')), None);
+            assert_eq!(plain_key(&screen, KeyCode::Char('+')), None);
+        }
+    }
+
+    #[test]
+    fn merge_queue_screen_keys() {
+        let screen = Screen::MergeQueue;
+        for key in [KeyCode::Enter, KeyCode::Char(' ')] {
+            assert_eq!(plain_key(&screen, key), Some(Msg::MergeQueueGrabToggle));
+        }
+        assert_eq!(
+            plain_key(&screen, KeyCode::Char('x')),
+            Some(Msg::MergeQueueRemove)
+        );
+        assert_eq!(
+            plain_key(&screen, KeyCode::Char('E')),
+            Some(Msg::MergeQueueClearEpic)
+        );
+        assert_eq!(plain_key(&screen, KeyCode::Char('j')), Some(Msg::Down));
+        assert_eq!(plain_key(&screen, KeyCode::Char('r')), Some(Msg::Refresh));
+        assert_eq!(plain_key(&screen, KeyCode::Esc), Some(Msg::Back));
+        assert_eq!(plain_key(&screen, KeyCode::Char('M')), None);
     }
 
     /// GitHub issue #83: `Tab` switches between `tm runs watch` and
