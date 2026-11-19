@@ -30,7 +30,10 @@
 //!    tick moves on to the next ticket.
 //! 6. Records a `launch` row in `dispatch_events` per launch, and a
 //!    `refused` row, with its [`Refusal::code`], for the tick's first
-//!    refusal.
+//!    refusal. A tick that launched and refused nothing records an `idle`
+//!    row saying why: no ready tickets, or the in-hand tickets and the run
+//!    holding each (GitHub issue #263). An idle reason the scope's newest
+//!    event already records is not recorded again.
 //! 7. With `[dispatch] fix_failing_ci` on, runs the CI-fix sweep
 //!    ([`ci_fix::sweep`], GitHub issue #226): a fix pass for each lane PR
 //!    whose checks finished red on a head commit not yet handled, started
@@ -77,6 +80,9 @@ use crate::work::notify::{self, Notifier};
 pub const LAUNCH_EVENT: &str = "launch";
 /// `dispatch_events.kind` of a tick's first refusal.
 pub const REFUSED_EVENT: &str = "refused";
+/// `dispatch_events.kind` of a tick that launched nothing and refused
+/// nothing, with why in its detail (GitHub issue #263).
+pub const IDLE_EVENT: &str = "idle";
 
 /// The daily launch cap's rolling window, in seconds.
 const DAY_SECS: i64 = 24 * 60 * 60;
@@ -525,6 +531,9 @@ pub struct TickReport {
     pub refused: Option<Refusal>,
     /// Set when the tick did nothing at all.
     pub skipped: Option<Skip>,
+    /// Why a tick that launched and refused nothing had nothing to launch,
+    /// as recorded in its [`IDLE_EVENT`].
+    pub idle: Option<String>,
     /// The titles of the notifications the tick sent, in order.
     pub notified: Vec<String>,
     /// What the CI-fix sweep did, one entry per ticket it acted on.
@@ -569,7 +578,7 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
 
     let runs = deps.store.overview_runs()?;
     let busy = in_hand(&runs, cfg.scope);
-    let mut queue: Vec<Candidate> = deps
+    let (held, mut queue): (Vec<Candidate>, Vec<Candidate>) = deps
         .candidates
         .candidates(priority_epic.is_some())
         .map_err(DispatchError::Candidates)?
@@ -580,8 +589,7 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
                 ListDecision::Ready | ListDecision::Stackable { .. }
             )
         })
-        .filter(|c| !busy.contains_key(&c.key))
-        .collect();
+        .partition(|c| busy.contains_key(&c.key));
     // A stable sort: rank order survives within each (epic, unblocks) tie.
     queue.sort_by_key(|c| {
         let outside_epic = priority_epic.is_none() || c.epic != priority_epic;
@@ -644,6 +652,14 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
             refusal.code(),
             &refusal.to_string(),
         )?;
+    } else if report.launched.is_empty() {
+        let detail = idle_detail(&held, &busy, &runs, cfg.scope);
+        let newest = deps.store.dispatch_events(cfg.scope, 1)?.into_iter().next();
+        if !newest.is_some_and(|event| event.kind == IDLE_EVENT && event.detail == detail) {
+            deps.store
+                .record_dispatch_event(cfg.scope, None, IDLE_EVENT, &detail)?;
+        }
+        report.idle = Some(detail);
     }
 
     if let Some(ci) = deps.ci.filter(|_| cfg.fix_failing_ci) {
@@ -738,6 +754,19 @@ pub struct DispatchState {
     /// What is stopping launches now: set while the scope's newest dispatch
     /// event is a refusal.
     pub blocked: Option<Blocked>,
+    /// Why the scope has nothing to launch: set while its newest dispatch
+    /// event is an [`IDLE_EVENT`] (GitHub issue #263).
+    pub idle: Option<Idle>,
+}
+
+/// Why a scope's dispatcher had nothing to launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Idle {
+    /// When ticks started finding nothing to launch for this reason, in unix
+    /// seconds: identical idle ticks record one event.
+    pub since_unix: i64,
+    /// The idle event's detail.
+    pub detail: String,
 }
 
 /// The refusal a scope's dispatcher is stuck on.
@@ -760,22 +789,56 @@ pub fn dispatch_state(store: &RunStore, scope: &str) -> Result<DispatchState, Ru
     let last_launch_unix = store
         .last_dispatch_event(scope, LAUNCH_EVENT)?
         .map(|event| event.created_unix);
-    let blocked = match store.dispatch_events(scope, 1)?.into_iter().next() {
+    let mut state = DispatchState {
+        last_launch_unix,
+        ..DispatchState::default()
+    };
+    match store.dispatch_events(scope, 1)?.into_iter().next() {
         Some(newest) if newest.kind == REFUSED_EVENT => {
             let since_unix = store
                 .refusal_streak(scope)?
                 .map_or(newest.created_unix, |streak| streak.since_unix);
-            Some(Blocked {
+            state.blocked = Some(Blocked {
                 since_unix,
                 detail: newest.detail,
-            })
+            });
         }
-        _ => None,
-    };
-    Ok(DispatchState {
-        last_launch_unix,
-        blocked,
-    })
+        Some(newest) if newest.kind == IDLE_EVENT => {
+            state.idle = Some(Idle {
+                since_unix: newest.created_unix,
+                detail: newest.detail,
+            });
+        }
+        _ => {}
+    }
+    Ok(state)
+}
+
+/// Why a tick launched nothing: no ready tickets, or each `held` ticket
+/// with why it is in hand and the run holding it.
+fn idle_detail(
+    held: &[Candidate],
+    busy: &HashMap<String, InHand>,
+    runs: &[OverviewRun],
+    scope: &str,
+) -> String {
+    if held.is_empty() {
+        return "nothing to launch: no ready tickets".to_string();
+    }
+    let tickets: Vec<String> = held
+        .iter()
+        .filter_map(|c| {
+            let reason = busy.get(&c.key)?;
+            Some(match reason.holding_run(runs, scope, &c.key) {
+                Some(id) => format!("{} ({} {id})", c.key, reason.label()),
+                None => format!("{} ({})", c.key, reason.label()),
+            })
+        })
+        .collect();
+    format!(
+        "nothing to launch: every ready ticket is in hand: {}",
+        tickets.join(", ")
+    )
 }
 
 /// Why the run store says a ticket is already in hand, so a tick leaves it
@@ -793,6 +856,40 @@ pub enum InHand {
     /// Its newest auto-review round hit the round cap
     /// ([`RoundVerdict::Capped`]).
     FixRoundCap,
+}
+
+impl InHand {
+    /// A short description ending in a noun that a run id can follow, for
+    /// an idle tick's detail: `lane already attempted, run 12`.
+    fn label(self) -> &'static str {
+        match self {
+            InHand::Live => "live run",
+            InHand::Attempted => "lane already attempted, run",
+            InHand::OpenPr => "PR open, run",
+            InHand::FixRoundCap => "fix rounds capped, run",
+        }
+    }
+
+    /// The id of `ticket`'s newest run in `scope` that holds it for this
+    /// reason, from `runs` (newest first, as [`in_hand`] reads them).
+    fn holding_run(self, runs: &[OverviewRun], scope: &str, ticket: &str) -> Option<i64> {
+        let capped = format!(" {}", RoundVerdict::Capped.as_str());
+        runs.iter()
+            .filter(|run| run.scope == scope && run.ticket == ticket)
+            .find(|run| match self {
+                InHand::Live => matches!(
+                    run.status,
+                    RunStatus::Running | RunStatus::Queued | RunStatus::Hibernated
+                ),
+                InHand::Attempted => run.kind == "lane",
+                InHand::OpenPr => run.pr_url.is_some(),
+                InHand::FixRoundCap => run
+                    .auto_review_round
+                    .as_deref()
+                    .is_some_and(|detail| detail.ends_with(&capped)),
+            })
+            .map(|run| run.id)
+    }
 }
 
 /// The tickets in `scope` that the run store says are already in hand,
@@ -1901,8 +1998,10 @@ mod tests {
 
         let report = fx.tick(&[], &launcher);
 
-        assert_eq!(report, TickReport::default());
-        assert!(fx.events().is_empty());
+        assert_eq!(report.refused, None);
+        assert!(report.launched.is_empty());
+        let kinds: Vec<String> = fx.events().into_iter().map(|e| e.1).collect();
+        assert_eq!(kinds, vec![IDLE_EVENT.to_string()]);
     }
 
     #[test]
@@ -2206,6 +2305,62 @@ mod tests {
         assert_eq!(busy.get("GH-2"), Some(&InHand::Attempted));
         assert_eq!(busy.get("GH-3"), Some(&InHand::OpenPr));
         assert_eq!(busy.get("GH-4"), Some(&InHand::FixRoundCap));
+    }
+
+    /// GitHub issue #263: a tick that launches nothing says why, naming the
+    /// run that holds each ready ticket.
+    #[test]
+    fn a_tick_that_launches_nothing_records_which_runs_hold_the_tickets() {
+        let fx = Fixture::new();
+        let lane = start(&fx.store, "GH-2", "lane");
+        finish(&fx.store, lane, RunStatus::Failed, None);
+        let live = start(&fx.store, "GH-3", "audit");
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let report = fx.tick(&[ready("GH-2", 0), ready("GH-3", 0)], &launcher);
+
+        let detail = format!(
+            "nothing to launch: every ready ticket is in hand: \
+             GH-2 (lane already attempted, run {lane}), GH-3 (live run {live})"
+        );
+        assert!(launcher.tickets().is_empty());
+        assert_eq!(report.refused, None);
+        assert_eq!(report.idle.as_deref(), Some(detail.as_str()));
+        let state = dispatch_state(&fx.store, SCOPE).unwrap();
+        assert_eq!(state.idle.map(|idle| idle.detail), Some(detail));
+        assert_eq!(state.blocked, None);
+    }
+
+    #[test]
+    fn a_tick_with_no_ready_ticket_records_that() {
+        let fx = Fixture::new();
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let report = fx.tick(&[], &launcher);
+
+        let detail = "nothing to launch: no ready tickets";
+        assert_eq!(report.idle.as_deref(), Some(detail));
+        assert_eq!(
+            dispatch_state(&fx.store, SCOPE)
+                .unwrap()
+                .idle
+                .map(|idle| idle.detail)
+                .as_deref(),
+            Some(detail)
+        );
+    }
+
+    #[test]
+    fn repeated_idle_ticks_for_one_reason_record_one_event() {
+        let fx = Fixture::new();
+        let launcher = FakeLauncher::new(&fx.store);
+
+        fx.tick(&[], &launcher);
+        fx.tick(&[], &launcher);
+
+        let events = fx.store.dispatch_events(SCOPE, 10).unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].kind, IDLE_EVENT);
     }
 
     /// GitHub issue #263: GitHub keys restart at 1 in every repo, so

@@ -3973,7 +3973,8 @@ impl RunStore {
     /// (GitHub issue #121): the refusals since the newest launch, or since
     /// the newest refusal with a different (or no) reason code. `None` when
     /// the newest event is not a coded refusal. A tick with nothing to
-    /// launch writes no event, so it neither extends nor ends a streak.
+    /// launch writes an `idle` event (GitHub issue #263), which ends a
+    /// streak: the dispatcher is no longer stuck on a refusal.
     pub fn refusal_streak(&self, scope: &str) -> Result<Option<RefusalStreak>, RunStoreError> {
         let Some(newest) = self.dispatch_events(scope, 1)?.into_iter().next() else {
             return Ok(None);

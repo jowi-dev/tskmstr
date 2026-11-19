@@ -141,7 +141,7 @@ pub fn tick_targets(
 
 /// What happened to one scope in `tm dispatch tick`.
 enum TickOutcome {
-    Ran(TickReport),
+    Ran(Box<TickReport>),
     Failed(String),
 }
 
@@ -165,7 +165,7 @@ pub fn tick(
                     target.scope
                 )),
                 Some(dir) => match ticker.tick(&target.scope, dir) {
-                    Ok(report) => TickOutcome::Ran(report),
+                    Ok(report) => TickOutcome::Ran(Box::new(report)),
                     Err(err) => TickOutcome::Failed(err),
                 },
             };
@@ -211,6 +211,7 @@ fn tick_json(scope: &str, outcome: &TickOutcome) -> serde_json::Value {
                 "stacked_on": launch.stacked_on,
             })).collect::<Vec<_>>(),
             "refused": report.refused.as_ref().map(ToString::to_string),
+            "idle": report.idle,
             "skipped": report.skipped.map(skip_name),
             "notified": report.notified,
             "ci_fixes": report.ci_fixes.iter().map(ci_fix_json).collect::<Vec<_>>(),
@@ -221,6 +222,7 @@ fn tick_json(scope: &str, outcome: &TickOutcome) -> serde_json::Value {
             "scope": scope,
             "launched": [],
             "refused": null,
+            "idle": null,
             "skipped": null,
             "notified": [],
             "ci_fixes": [],
@@ -338,7 +340,8 @@ fn write_tick_text(scope: &str, outcome: &TickOutcome, out: &mut dyn Write) -> i
     if let Some(refusal) = &report.refused {
         writeln!(out, "{scope}: {refusal}")?;
     } else if report.launched.is_empty() {
-        writeln!(out, "{scope}: nothing to launch")?;
+        let idle = report.idle.as_deref().unwrap_or("nothing to launch");
+        writeln!(out, "{scope}: {idle}")?;
     }
     for action in &report.ci_fixes {
         writeln!(out, "{scope}: {}", ci_fix_text(action))?;
@@ -393,7 +396,9 @@ pub fn set(
 /// off, its running lanes (the ones `max_lanes` caps, named by ticket; see
 /// [`RunStore::running_lane_tickets`]), when it last ticked, and how long ago it last
 /// launched. A scope whose newest tick refused also gets the refusal and how
-/// long refusals for that reason have lasted, and a scope with an automerge
+/// long refusals for that reason have lasted, a scope whose newest tick had
+/// nothing to launch gets why and for how long (GitHub issue #263), and a
+/// scope with an automerge
 /// (GitHub issue #243) gets its newest one: running, merged, or failed with
 /// the reason. `now` is unix seconds.
 pub fn status(store: &RunStore, now: i64, out: &mut dyn Write) -> Result<(), DispatchCliError> {
@@ -430,6 +435,14 @@ pub fn status(store: &RunStore, now: i64, out: &mut dyn Write) -> Result<(), Dis
                 "  blocked for {}: {}",
                 format_age(now - blocked.since_unix),
                 blocked.detail
+            )?;
+        }
+        if let Some(idle) = &state_now.idle {
+            writeln!(
+                out,
+                "  idle for {}: {}",
+                format_age(now - idle.since_unix),
+                idle.detail
             )?;
         }
         let newest_merge = runs
@@ -524,8 +537,8 @@ mod tests {
     use crate::work::admission::UsageProber;
     use crate::work::auto_merge::AUTO_MERGE_KIND;
     use crate::work::dispatch::{
-        Candidate, CandidateSource, FileScopeLock, LAUNCH_EVENT, Launch, Launcher, Refusal,
-        ScopeLock, TickConfig, TickDeps,
+        Candidate, CandidateSource, FileScopeLock, IDLE_EVENT, LAUNCH_EVENT, Launch, Launcher,
+        Refusal, ScopeLock, TickConfig, TickDeps,
     };
     use tempfile::{TempDir, tempdir};
 
@@ -683,6 +696,7 @@ mod tests {
                 running: vec!["GH-7".to_string(), "GH-8".to_string()],
                 max: 2,
             }),
+            idle: None,
             skipped: None,
             notified: vec!["tm: GH-0 is awaiting your review".to_string()],
             ci_fixes: vec![
@@ -831,6 +845,7 @@ mod tests {
                         {"ticket": "GH-2", "lane": "backend", "runner": "opencode", "stacked_on": "gh-1-branch"},
                     ],
                     "refused": "not launching: 2 lanes running (GH-7, GH-8), [dispatch] max_lanes is 2",
+                    "idle": null,
                     "skipped": null,
                     "notified": ["tm: GH-0 is awaiting your review"],
                     "ci_fixes": [
@@ -851,6 +866,7 @@ mod tests {
                     "scope": TWO,
                     "launched": [],
                     "refused": null,
+                    "idle": null,
                     "skipped": null,
                     "notified": [],
                     "ci_fixes": [],
@@ -1156,6 +1172,24 @@ mod tests {
         assert_eq!(
             lines[3],
             "github:o/two: off, 0 lanes running, last tick never, never launched"
+        );
+    }
+
+    #[test]
+    fn status_says_why_an_idle_scope_launched_nothing() {
+        let (_dir, store) = store();
+        store.set_autopilot(ONE, true).unwrap();
+        store
+            .record_dispatch_event(ONE, None, IDLE_EVENT, "nothing to launch: no ready tickets")
+            .unwrap();
+        let now = store.dispatch_events(ONE, 1).unwrap()[0].created_unix + 120;
+
+        let out = text(|out| status(&store, now, out).unwrap());
+
+        assert_eq!(
+            out.lines().nth(1),
+            Some("  idle for 2m: nothing to launch: no ready tickets"),
+            "{out}"
         );
     }
 
