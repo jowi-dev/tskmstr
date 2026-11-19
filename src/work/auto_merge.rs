@@ -118,6 +118,46 @@ pub fn drain_blocker(
     None
 }
 
+/// What a merge queue row is doing, for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowState {
+    /// A live [`AUTO_MERGE_KIND`] run is merging the ticket.
+    Merging,
+    /// Its last merge did not land; held until the PR's head changes.
+    Held(String),
+    /// Waiting to merge, with why the last sweep passed it over (`None`
+    /// before any sweep looked).
+    Waiting(Option<String>),
+}
+
+impl std::fmt::Display for RowState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RowState::Merging => f.write_str("merging"),
+            RowState::Held(reason) => write!(f, "held: {reason}"),
+            RowState::Waiting(Some(reason)) => write!(f, "waiting: {reason}"),
+            RowState::Waiting(None) => f.write_str("waiting"),
+        }
+    }
+}
+
+/// `entry`'s [`RowState`], given every run ([`RunStore::overview_runs`]).
+pub fn row_state(entry: &MergeQueueEntry, runs: &[OverviewRun]) -> RowState {
+    let merging = runs.iter().any(|run| {
+        run.scope == entry.scope
+            && run.ticket == entry.ticket
+            && run.kind == AUTO_MERGE_KIND
+            && is_live(run.status)
+    });
+    if merging {
+        RowState::Merging
+    } else if let Some(reason) = &entry.held {
+        RowState::Held(reason.clone())
+    } else {
+        RowState::Waiting(entry.waiting.clone())
+    }
+}
+
 /// Whether `events` (a lane run's) hold an [`AUTO_MERGE_EVENT`] for head
 /// commit `sha`, whatever its outcome.
 pub fn handled(events: &[RunEvent], sha: &str) -> bool {
@@ -1342,6 +1382,29 @@ mod tests {
             matches!(&actions[..], [AutoMergeAction::CheckFailed { .. }]),
             "{actions:?}"
         );
+    }
+
+    #[test]
+    fn row_state_reports_merging_then_held_then_waiting() {
+        let fx = Fixture::new();
+        fx.enqueue("GH-1");
+        let entry = || fx.queue().remove(0);
+        let runs = || fx.store.overview_runs().unwrap();
+        assert_eq!(row_state(&entry(), &runs()), RowState::Waiting(None));
+
+        fx.store
+            .set_merge_waiting(SCOPE, "GH-1", Some("checks pending"))
+            .unwrap();
+        assert_eq!(
+            row_state(&entry(), &runs()).to_string(),
+            "waiting: checks pending"
+        );
+
+        let run = fx.start("GH-1", AUTO_MERGE_KIND);
+        assert_eq!(row_state(&entry(), &runs()), RowState::Merging);
+
+        finish(&fx.store, run, &Err("boom".to_string())).unwrap();
+        assert_eq!(row_state(&entry(), &runs()).to_string(), "held: boom");
     }
 
     // --- finish ---

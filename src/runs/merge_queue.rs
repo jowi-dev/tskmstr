@@ -204,6 +204,21 @@ impl RunStore {
         Ok(())
     }
 
+    /// Records `repo_dir` as `scope`'s main checkout without touching its
+    /// autopilot flag (a new row is off), so `tm dispatch tick --all` can
+    /// drain the scope's queue from any directory.
+    pub fn record_autopilot_repo(&self, scope: &str, repo_dir: &str) -> Result<(), RunStoreError> {
+        self.conn.execute(
+            &format!(
+                "INSERT INTO autopilot (scope, enabled, updated_at, repo_dir)
+                 VALUES (?1, 0, {NOW_SQL}, ?2)
+                 ON CONFLICT(scope) DO UPDATE SET repo_dir = excluded.repo_dir"
+            ),
+            params![scope, repo_dir],
+        )?;
+        Ok(())
+    }
+
     /// Sets or, with `None`, clears `scope`'s merge epic: when set, the
     /// automerge sweep enqueues only that epic's tickets on its own. Never
     /// changes the scope's autopilot flag.
@@ -394,6 +409,21 @@ mod tests {
 
         store.mark_merge_started(SCOPE, "GH-1", "abc").unwrap();
         assert_eq!(store.merge_queue(SCOPE).unwrap()[0].waiting, None);
+    }
+
+    #[test]
+    fn record_autopilot_repo_keeps_the_flag() {
+        let (_dir, store) = store();
+        store.record_autopilot_repo(SCOPE, "/repos/r").unwrap();
+        let rows = store.autopilot_scopes().unwrap();
+        assert_eq!(rows[0].repo_dir.as_deref(), Some("/repos/r"));
+        assert!(!rows[0].enabled);
+
+        store.set_autopilot(SCOPE, true).unwrap();
+        store.record_autopilot_repo(SCOPE, "/repos/r2").unwrap();
+        let rows = store.autopilot_scopes().unwrap();
+        assert_eq!(rows[0].repo_dir.as_deref(), Some("/repos/r2"));
+        assert!(rows[0].enabled);
     }
 
     #[test]

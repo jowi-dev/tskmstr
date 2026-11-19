@@ -464,6 +464,7 @@ pub fn status(store: &RunStore, now: i64, out: &mut dyn Write) -> Result<(), Dis
         if let Some(merge) = newest_merge {
             writeln!(out, "  {}", auto_merge_status(store, merge)?)?;
         }
+        super::merge_queue::write_queue(store, &row.scope, &runs, out)?;
     }
     Ok(())
 }
@@ -1334,6 +1335,23 @@ mod tests {
 
         assert!(
             out.ends_with(&format!("  last automerge: GH-3 merged (run {merged})\n")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn status_lists_the_merge_queue_of_a_scope_that_is_off() {
+        let (_dir, store) = store();
+        store.record_autopilot_repo(ONE, "/repos/one").unwrap();
+        store
+            .enqueue_merge(ONE, "GH-5", crate::runs::merge_queue::QueueSource::Manual)
+            .unwrap();
+
+        let out = text(|out| status(&store, 0, out).unwrap());
+
+        assert!(out.starts_with("github:o/one: off,"), "{out}");
+        assert!(
+            out.ends_with("  merge queue:\n    1. GH-5 (manual) waiting\n"),
             "{out}"
         );
     }
