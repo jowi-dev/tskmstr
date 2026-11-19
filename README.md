@@ -3397,6 +3397,47 @@ existing tm skill set works as-is. See
 `docs/plans/gh-41-opencode-runner.md` for the full CLI contract this
 adapter binds to.
 
+#### opencode server mode (`[agent.opencode] mode`)
+
+opencode 2.x runs one background server per user. Each `opencode run`
+is a client of that server and loads its own opencode runtime, which
+costs a few hundred MB per lane. With server mode, a headless lane
+(`tm work run --headless`/`--fg`, or a usage-limit fallback attempt
+that lands on opencode) runs as a session on that server instead. A
+small tm process creates the session, sends the prompt, and polls until
+the session goes idle:
+
+```toml
+[agent.opencode]
+mode = "server"   # default "process": one `opencode run` per lane
+```
+
+What changes and what doesn't:
+
+- The supervisor still spawns one process per lane:
+  `tm work __agent-driver opencode run ...` in place of `opencode run
+  ...`. That process writes the same JSON event stream, so cost, turns,
+  session id, the run viewer, and the rate-limit fallback work as in
+  process mode.
+- The lane's environment (`TSKMSTR_RUN_ID`, the build-slot `PATH`, and
+  the rest) reaches the session's tools: the driver copies its whole
+  environment into the session.
+- Permission requests get the same answers as `opencode run`: approved
+  when the lane bypasses permissions, rejected otherwise.
+- `SIGTERM`, `SIGINT` or `SIGHUP` to the driver interrupts the session.
+  `SIGKILL` cannot be caught, and the session then finishes on the
+  server with nobody reading it.
+- Memory accounting (`[work] memory_budget_gb`) sees the driver, not the
+  session's growth inside the shared server.
+- The driver talks to the server through `opencode api`, so the
+  opencode service must be running (`opencode service start`). tm never
+  reads the server's password.
+
+Interactive sessions always run the opencode TUI. `mode = "server"` on
+`[agent.claude]` is a config error. See
+`docs/plans/gh-194-opencode-server-mode.md` for the verified server API
+and the design.
+
 The delegation-subagent asset (see "Setup" above) is runner-aware the same
 way: `tm init` scaffolds a claude definition at `.claude/agents/<name>.md`
 and an opencode one at `.opencode/agent/<name>.md` (with `mode: subagent`),

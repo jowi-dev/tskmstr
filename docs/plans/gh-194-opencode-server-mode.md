@@ -65,11 +65,11 @@ opencode run --format json --model <provider/model> [--auto] -- <prompt>
 into
 
 ```text
-<tm> agent-driver opencode run --format json --model <provider/model> [--auto] -- <prompt>
+<tm> work __agent-driver opencode run --format json --model <provider/model> [--auto] -- <prompt>
 ```
 
-with the same environment. `tm agent-driver` is a hidden subcommand.
-Its first argument names the runner, and the rest is that runner's own
+with the same environment. `tm work __agent-driver` is a hidden
+subcommand. Its first argument names the runner, and the rest is that runner's own
 headless argv, so the driver parses exactly what process mode would have
 run. The driver:
 
@@ -124,9 +124,9 @@ growth per session is not possible from outside the server.
 
 ### Liveness and kill
 
-The run's recorded pid is the driver's. Reap (#26) needs no change: a dead
-driver is a dead pid. The driver turns the session's state into its own
-exit, so:
+The run's recorded pid is the supervisor's, and the driver is its child,
+exactly where `opencode run` sat. Reap (#26) needs no change. The driver
+turns the session's state into its own exit, so:
 
 - **Kill.** On `SIGTERM`, `SIGINT` or `SIGHUP` the driver interrupts the
   session (`POST .../interrupt`) before exiting, so closing the lane's
