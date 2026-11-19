@@ -143,6 +143,78 @@ impl ThatchRunner for FakeThatchRunner {
     }
 }
 
+/// How long [`CachedThatchRunner`] reuses a read result. The run detail
+/// window and the overview reload every half second on the TUI's event
+/// loop; chat is human-paced, so a few seconds of lag costs nothing and
+/// saves several `thatch` spawns per reload.
+pub const CHAT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`ThatchRunner`] that reuses the result of a read-only call (`chat list`,
+/// `chat tail`) made with the same arguments within `ttl`. Every other
+/// call, such as `chat broadcast`, always runs.
+pub struct CachedThatchRunner {
+    inner: Box<dyn ThatchRunner>,
+    ttl: std::time::Duration,
+    cache: RefCell<
+        std::collections::HashMap<Vec<String>, (std::time::Instant, Result<String, ThatchError>)>,
+    >,
+    inner_calls: std::cell::Cell<usize>,
+}
+
+impl CachedThatchRunner {
+    /// Wrap `inner`, reusing read results for `ttl`.
+    pub fn new(inner: Box<dyn ThatchRunner>, ttl: std::time::Duration) -> Self {
+        Self {
+            inner,
+            ttl,
+            cache: RefCell::new(std::collections::HashMap::new()),
+            inner_calls: std::cell::Cell::new(0),
+        }
+    }
+
+    /// How many calls reached the wrapped runner.
+    #[cfg(test)]
+    fn inner_calls(&self) -> usize {
+        self.inner_calls.get()
+    }
+
+    fn run_inner(&self, args: &[String]) -> Result<String, ThatchError> {
+        self.inner_calls.set(self.inner_calls.get() + 1);
+        self.inner.run(args)
+    }
+}
+
+/// Whether `args` is a read-only `thatch chat` call safe to cache.
+fn is_cacheable(args: &[String]) -> bool {
+    matches!(
+        args,
+        [chat, sub, ..] if chat == "chat" && (sub == "list" || sub == "tail")
+    )
+}
+
+impl ThatchRunner for CachedThatchRunner {
+    fn available(&self) -> bool {
+        self.inner.available()
+    }
+
+    fn run(&self, args: &[String]) -> Result<String, ThatchError> {
+        if !is_cacheable(args) {
+            return self.run_inner(args);
+        }
+        let now = std::time::Instant::now();
+        if let Some((at, result)) = self.cache.borrow().get(args)
+            && now.duration_since(*at) < self.ttl
+        {
+            return result.clone();
+        }
+        let result = self.run_inner(args);
+        self.cache
+            .borrow_mut()
+            .insert(args.to_vec(), (now, result.clone()));
+        result
+    }
+}
+
 /// The thatch project label for the repo at `dir`: the `owner/name` slug of
 /// its `origin` remote, which is what thatch itself records for sessions
 /// started there. `None` when the repo has no GitHub `origin` remote.
@@ -739,6 +811,42 @@ Broadcast from jowi-dev to 2 of 4 registered sessions (projects: jowi-dev/tskmst
     fn lanes_awaiting_reply_is_empty_without_thatch() {
         let runner = FakeThatchRunner::missing();
         assert!(lanes_awaiting_reply(&runner, &["sess-a".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn cached_runner_reuses_a_fresh_read_result() {
+        let cached = CachedThatchRunner::new(
+            Box::new(FakeThatchRunner::returning("out")),
+            std::time::Duration::from_secs(60),
+        );
+        let args = tail_args(None);
+        assert_eq!(cached.run(&args).unwrap(), "out");
+        assert_eq!(cached.run(&args).unwrap(), "out");
+        assert_eq!(cached.inner_calls(), 1);
+    }
+
+    #[test]
+    fn cached_runner_reruns_once_the_result_expires() {
+        let cached = CachedThatchRunner::new(
+            Box::new(FakeThatchRunner::returning("out")),
+            std::time::Duration::ZERO,
+        );
+        let args = roster_args(&["a".to_string()]);
+        cached.run(&args).unwrap();
+        cached.run(&args).unwrap();
+        assert_eq!(cached.inner_calls(), 2);
+    }
+
+    #[test]
+    fn cached_runner_never_caches_a_broadcast() {
+        let cached = CachedThatchRunner::new(
+            Box::new(FakeThatchRunner::returning(REPORT)),
+            std::time::Duration::from_secs(60),
+        );
+        let args = broadcast_args("a/b", "hi");
+        cached.run(&args).unwrap();
+        cached.run(&args).unwrap();
+        assert_eq!(cached.inner_calls(), 2);
     }
 
     /// A runner returning each canned stdout in turn.
