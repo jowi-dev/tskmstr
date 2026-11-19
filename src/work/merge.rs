@@ -1157,7 +1157,8 @@ pub fn run_merge_batch(
             Some(conflict) => {
                 writeln!(
                     out,
-                    "{key}: rebase stopped on conflicts; set aside for the conflict session"
+                    "{key}: {} stopped on conflicts; set aside for the conflict session",
+                    operation(deps.merge_cfg.strategy)
                 )?;
                 set_aside.push((prepared, conflict));
             }
@@ -1702,7 +1703,8 @@ fn prepare_merge(
         None => {
             writeln!(
                 out,
-                "warning: no local checkout of {branch}; skipping auto-rebase"
+                "warning: no local checkout of {branch}; skipping auto-{}",
+                operation(deps.merge_cfg.strategy)
             )?;
         }
     }
@@ -5242,5 +5244,24 @@ mod tests {
         assert_eq!(fx.git.push_calls().len(), 2);
         assert!(fx.git.push_force_with_lease_calls().is_empty());
         assert!(fx.git.rebase_onto_calls().is_empty());
+        assert!(
+            out.contains("PROJ-1: merge stopped on conflicts; set aside"),
+            "{out}"
+        );
+        assert!(!out.contains("rebase stopped"), "{out}");
+    }
+
+    #[test]
+    fn merge_strategy_without_a_checkout_says_it_skips_the_merge() {
+        let mut fx = Fixture::new();
+        fx.merge_cfg.strategy = MergeStrategy::Merge;
+        fx.gh = fx
+            .gh
+            .with_pr_list(Ok(vec![pr_info(7, "proj-1-fix", "main", "PROJ-1")]));
+        fx.git = fx.git.with_branch_exists_local(Ok(false));
+
+        let (_result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(out.contains("skipping auto-merge"), "{out}");
     }
 }
