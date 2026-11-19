@@ -1049,6 +1049,15 @@ fn run_work(
                 return Err("lane run failed".into());
             }
         }
+        WorkCmd::AgentDriver { runner, args } => {
+            match tskmstr::agent::routing::run_server_driver(&runner, &args) {
+                Ok(code) => std::process::exit(code),
+                Err(message) => {
+                    eprintln!("tm: {message}");
+                    std::process::exit(2);
+                }
+            }
+        }
         WorkCmd::AwaitLane { state_file } => {
             let raw = std::fs::read_to_string(&state_file)?;
             let state: tskmstr::work::detach::SupervisorState = serde_json::from_str(&raw)?;

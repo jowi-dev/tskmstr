@@ -6,7 +6,8 @@
 //! API and the design. In short:
 //!
 //! - [`server_mode_invocation`] rewrites the adapter's headless
-//!   `opencode run ...` invocation into `<tm> agent-driver opencode run ...`
+//!   `opencode run ...` invocation into
+//!   `<tm> work __agent-driver opencode run ...`
 //!   with the same argv and environment, so the supervisor still spawns
 //!   one process per lane and reads one NDJSON stdout file.
 //! - [`drive`] is that process. It creates a session at its cwd, copies its
@@ -29,10 +30,11 @@ use serde_json::{Value, json};
 
 use crate::agent::AgentInvocation;
 
-/// The hidden `tm` subcommand that runs a runner's server-mode driver. Its
-/// first argument names the runner; the rest is that runner's own headless
-/// argv. Must match the subcommand name in `src/cli/mod.rs`.
-pub const DRIVER_SUBCOMMAND: &str = "agent-driver";
+/// The hidden `tm` subcommand (`tm work __agent-driver`) that runs a
+/// runner's server-mode driver. Its next argument names the runner; the
+/// rest is that runner's own headless argv. Must match `WorkCmd::AgentDriver`
+/// in `src/cli/mod.rs`.
+pub const DRIVER_SUBCOMMAND: [&str; 2] = ["work", "__agent-driver"];
 
 /// The runner name [`server_mode_invocation`] passes as the driver's first
 /// argument.
@@ -50,10 +52,11 @@ pub const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 const MESSAGE_PAGE: usize = 100;
 
 /// Rewrites a headless `opencode run ...` invocation into the server-mode
-/// driver invocation: `tm_exe agent-driver opencode run ...`, keeping the
+/// driver invocation: `tm_exe work __agent-driver opencode run ...`, keeping the
 /// argv after the program and the environment deltas as they were.
 pub fn server_mode_invocation(headless: &AgentInvocation, tm_exe: &Path) -> AgentInvocation {
-    let mut args = vec![DRIVER_SUBCOMMAND.to_string(), RUNNER_ARG.to_string()];
+    let mut args: Vec<String> = DRIVER_SUBCOMMAND.iter().map(|s| s.to_string()).collect();
+    args.push(RUNNER_ARG.to_string());
     args.extend(headless.args.iter().cloned());
     AgentInvocation {
         program: tm_exe.to_string_lossy().into_owned(),
@@ -193,6 +196,60 @@ pub struct DriveDeps<'a> {
 /// Exit code for a session that ended `interrupted`, matching a process
 /// killed by `SIGINT`.
 pub const EXIT_INTERRUPTED: i32 = 130;
+
+/// Set by [`on_stop_signal`] when the driver receives `SIGTERM`, `SIGINT`
+/// or `SIGHUP`.
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_stop_signal(_signal: libc::c_int) {
+    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `tm work __agent-driver opencode <args>`: parses `args` as the headless
+/// `opencode run` argv and drives one session at the current directory
+/// with this process's environment, writing NDJSON to stdout. Returns the
+/// exit code (see [`drive`]). A caught `SIGTERM`, `SIGINT` or `SIGHUP`
+/// interrupts the session before exiting.
+pub fn run_from_cli(args: &[String]) -> i32 {
+    let mut stdout = std::io::stdout();
+    let parsed = match parse_run_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            write_event(&mut stdout, &error_event(None, "DriverError", &message));
+            return 2;
+        }
+    };
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: the handler only stores to an atomic, which is
+        // async-signal-safe.
+        unsafe {
+            libc::signal(signal, on_stop_signal as *const () as libc::sighandler_t);
+        }
+    }
+    let stopped = || STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst);
+    let sleep = || {
+        let step = Duration::from_millis(100);
+        let mut waited = Duration::ZERO;
+        while waited < POLL_INTERVAL && !stopped() {
+            std::thread::sleep(step);
+            waited += step;
+        }
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let title = match std::env::var(crate::agent::TSKMSTR_RUN_ID) {
+        Ok(run_id) if !run_id.is_empty() => format!("tm lane run {run_id}"),
+        _ => "tm lane run".to_string(),
+    };
+    let deps = DriveDeps {
+        api: &CliServerApi,
+        cwd: &cwd,
+        env: std::env::vars().collect(),
+        title,
+        sleep: &sleep,
+        stop: &stopped,
+    };
+    drive(&parsed, &deps, &mut stdout)
+}
 
 /// Runs one server-mode lane session to its end, writing
 /// `opencode run --format json`-compatible NDJSON to `out`. Returns the
@@ -736,7 +793,7 @@ mod tests {
         assert_eq!(driven.program, "/bin/tm");
         assert_eq!(
             driven.args,
-            vec!["agent-driver", "opencode", "run", "--", "hi"]
+            vec!["work", "__agent-driver", "opencode", "run", "--", "hi"]
         );
         assert_eq!(driven.env_set, headless.env_set);
         assert_eq!(driven.env_remove, headless.env_remove);
