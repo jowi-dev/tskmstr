@@ -1750,11 +1750,16 @@ fn load_runs(deps: &WatchDeps) -> Vec<Msg> {
 /// (ADR-0009 slice 3) feeds them in. Repo roots come from `runs.repo_root`,
 /// falling back to the row's worktree through [`WatchDeps::repo_roots`]
 /// (GitHub issue #87), which spawns at most one `git` per worktree.
+///
+/// Running runs with a session id are checked against thatch chat (GitHub
+/// issue #223): one awaiting a reply reads as needs input. Without
+/// `thatch` on `PATH` no run is flagged.
 fn load_overview(deps: &WatchDeps) -> Vec<Msg> {
     use crate::runs::overview;
     match deps.store.overview_runs() {
         Ok(runs) => {
-            let runs = overview::active_scope_runs(&runs, overview::ACTIVE_SCOPE_WINDOW_SECS);
+            let mut runs = overview::active_scope_runs(&runs, overview::ACTIVE_SCOPE_WINDOW_SECS);
+            flag_runs_awaiting_reply(deps.thatch.as_ref(), &mut runs);
             vec![Msg::OverviewLoaded(overview::join_rows(
                 &runs,
                 &overview::TrackerSignals::default(),
@@ -1763,6 +1768,27 @@ fn load_overview(deps: &WatchDeps) -> Vec<Msg> {
             ))]
         }
         Err(err) => vec![Msg::RunsFailed(err.to_string())],
+    }
+}
+
+/// Set [`crate::runs::overview::OverviewRun::awaiting_reply`] on each
+/// running run whose thatch chat session is waiting on an answer.
+fn flag_runs_awaiting_reply(
+    thatch: &dyn crate::work::thatch_chat::ThatchRunner,
+    runs: &mut [crate::runs::overview::OverviewRun],
+) {
+    let session_ids: Vec<String> = runs
+        .iter()
+        .filter(|run| run.status == crate::runs::RunStatus::Running)
+        .filter_map(|run| run.session_id.clone())
+        .collect();
+    let waiting = crate::work::thatch_chat::lanes_awaiting_reply(thatch, &session_ids);
+    for run in runs.iter_mut() {
+        run.awaiting_reply = run.status == crate::runs::RunStatus::Running
+            && run
+                .session_id
+                .as_ref()
+                .is_some_and(|id| waiting.contains(id));
     }
 }
 
@@ -5472,6 +5498,56 @@ mod tests {
                     crate::runs::overview::TicketKey::new("github:a/b", "GH-1")
                 );
                 assert_eq!(rows[0].stage, crate::runs::overview::Stage::Running);
+            }
+            other => panic!("expected OverviewLoaded, got {other:?}"),
+        }
+    }
+
+    /// GitHub issue #223: a running lane whose chat session sent an
+    /// unanswered message reads as needs input, with the badge set.
+    #[test]
+    fn execute_watch_load_overview_flags_a_lane_awaiting_a_chat_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store
+            .start_run(&crate::runs::StartRun {
+                scope: "github:a/b".to_string(),
+                ..start_params("GH-1")
+            })
+            .unwrap();
+        store.update_session_id(run_id, "sess-1").unwrap();
+        let mut deps = watch_deps(store);
+        deps.thatch = Box::new(crate::work::thatch_chat::FakeThatchRunner::returning(
+            CHAT_STDOUT,
+        ));
+
+        let msgs = execute_watch(&deps, Cmd::LoadOverview);
+        match msgs.as_slice() {
+            [Msg::OverviewLoaded(rows)] => {
+                assert_eq!(rows[0].stage, crate::runs::overview::Stage::NeedsInput);
+                assert!(rows[0].awaiting_reply);
+            }
+            other => panic!("expected OverviewLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_watch_load_overview_without_thatch_has_no_chat_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store
+            .start_run(&crate::runs::StartRun {
+                scope: "github:a/b".to_string(),
+                ..start_params("GH-1")
+            })
+            .unwrap();
+        store.update_session_id(run_id, "sess-1").unwrap();
+
+        let msgs = execute_watch(&watch_deps(store), Cmd::LoadOverview);
+        match msgs.as_slice() {
+            [Msg::OverviewLoaded(rows)] => {
+                assert_eq!(rows[0].stage, crate::runs::overview::Stage::Running);
+                assert!(!rows[0].awaiting_reply);
             }
             other => panic!("expected OverviewLoaded, got {other:?}"),
         }

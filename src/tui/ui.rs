@@ -1049,6 +1049,9 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
                     auto_review_style(import),
                 ));
             }
+            if row.awaiting_reply {
+                spans.push(Span::styled("  chat?", theme::AWAITING_INPUT));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -1157,6 +1160,9 @@ fn draw_overview_columns(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 if let Some(import) = &row.review_import {
                     detail.push_str(&format!("  gh {import}"));
+                }
+                if row.awaiting_reply {
+                    detail.push_str("  chat?");
                 }
                 ListItem::new(vec![
                     Line::from(vec![
@@ -5302,6 +5308,36 @@ mod tests {
         };
         let text = buffer_text(&render_with_size(&app, 240, 24));
         assert!(text.contains("gh fix"), "{text}");
+    }
+
+    #[test]
+    fn overview_rows_show_a_chat_badge_while_awaiting_a_reply_in_both_layouts() {
+        let row = OverviewRow {
+            awaiting_reply: true,
+            ..overview_row("github:me/alpha", "GH-1", Stage::NeedsInput)
+        };
+        let app = overview_app(vec![row.clone()]);
+        let text = buffer_text(&render_with_size(&app, 120, 24));
+        let line = text.lines().nth(line_of(&text, "GH-1").unwrap()).unwrap();
+        assert!(line.contains("chat?"), "{line}");
+
+        let app = App {
+            overview_layout: OverviewLayout::Columns,
+            ..overview_app(vec![row])
+        };
+        let text = buffer_text(&render_with_size(&app, 240, 24));
+        assert!(text.contains("chat?"), "{text}");
+    }
+
+    #[test]
+    fn overview_rows_have_no_chat_badge_when_not_awaiting_a_reply() {
+        let app = overview_app(vec![overview_row(
+            "github:me/alpha",
+            "GH-1",
+            Stage::Running,
+        )]);
+        let text = buffer_text(&render_with_size(&app, 120, 24));
+        assert!(!text.contains("chat?"), "{text}");
     }
 
     #[test]
