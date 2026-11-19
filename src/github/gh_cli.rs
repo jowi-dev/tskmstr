@@ -4457,6 +4457,7 @@ pub struct FakeGhCli {
     pr_state_results: RefCell<HashMap<u64, Result<PrLifecycle, GhError>>>,
     pr_state_calls: RefCell<Vec<u64>>,
     pr_checks_results: RefCell<HashMap<u64, Result<PrChecks, GhError>>>,
+    pr_checks_sequences: RefCell<HashMap<u64, Vec<Result<PrChecks, GhError>>>>,
     pr_checks_calls: RefCell<Vec<u64>>,
     commit_checks_results: RefCell<HashMap<String, Result<CommitChecks, GhError>>>,
     commit_checks_calls: RefCell<Vec<String>>,
@@ -4563,6 +4564,7 @@ impl Default for FakeGhCli {
             pr_state_results: RefCell::new(HashMap::new()),
             pr_state_calls: RefCell::new(Vec::new()),
             pr_checks_results: RefCell::new(HashMap::new()),
+            pr_checks_sequences: RefCell::new(HashMap::new()),
             pr_checks_calls: RefCell::new(Vec::new()),
             commit_checks_results: RefCell::new(HashMap::new()),
             commit_checks_calls: RefCell::new(Vec::new()),
@@ -4750,6 +4752,21 @@ impl FakeGhCli {
     /// configured" default as [`FakeGhCli::with_pr_state`].
     pub fn with_pr_checks(self, number: u64, result: Result<PrChecks, GhError>) -> Self {
         self.pr_checks_results.borrow_mut().insert(number, result);
+        self
+    }
+
+    /// Set the results successive `pr_checks` calls return for pull request
+    /// `number`, in order; the last one repeats once the rest are used up.
+    /// Takes precedence over [`FakeGhCli::with_pr_checks`]. Models checks
+    /// that move from pending to finished while `tm merge` polls them.
+    pub fn with_pr_checks_sequence(
+        self,
+        number: u64,
+        sequence: Vec<Result<PrChecks, GhError>>,
+    ) -> Self {
+        self.pr_checks_sequences
+            .borrow_mut()
+            .insert(number, sequence);
         self
     }
 
@@ -5281,6 +5298,15 @@ impl GhCli for FakeGhCli {
 
     fn pr_checks(&self, _dir: &Path, number: u64) -> Result<PrChecks, GhError> {
         self.pr_checks_calls.borrow_mut().push(number);
+        if let Some(sequence) = self.pr_checks_sequences.borrow_mut().get_mut(&number)
+            && let Some(first) = sequence.first()
+        {
+            return if sequence.len() > 1 {
+                sequence.remove(0)
+            } else {
+                first.clone()
+            };
+        }
         match self.pr_checks_results.borrow().get(&number) {
             Some(result) => result.clone(),
             None => Ok(PrChecks {
@@ -5940,6 +5966,22 @@ mod tests {
             fake.commit_checks_calls(),
             vec!["main".to_string(), "develop".to_string()]
         );
+    }
+
+    #[test]
+    fn fake_pr_checks_sequence_returns_each_result_then_repeats_the_last() {
+        let checks = |sha: &str| PrChecks {
+            lifecycle: PrLifecycle::Open,
+            head_sha: sha.to_string(),
+            checks: Vec::new(),
+        };
+        let fake =
+            FakeGhCli::new().with_pr_checks_sequence(3, vec![Ok(checks("a")), Ok(checks("b"))]);
+        let dir = Path::new(".");
+
+        assert_eq!(fake.pr_checks(dir, 3).unwrap().head_sha, "a");
+        assert_eq!(fake.pr_checks(dir, 3).unwrap().head_sha, "b");
+        assert_eq!(fake.pr_checks(dir, 3).unwrap().head_sha, "b");
     }
 
     #[test]
