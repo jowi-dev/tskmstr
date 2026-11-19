@@ -1762,6 +1762,67 @@ cadence. To turn it off:
 wake_on_chat_mail = false   # default true
 ```
 
+### Epic coordinators
+
+**An epic coordinator is one agent session that drives an epic's tickets to
+merged PRs**: it launches their lanes, talks to them over thatch chat, and
+merges the PRs it has verified (GitHub issue #209). The design is in
+`docs/plans/gh-209-epic-coordinator.md`.
+
+```
+tm work coordinator start GH-176   # run inside the repo
+tm work coordinator stop GH-176
+```
+
+`start` checks that the key is an epic, lists its children into the
+session's opening prompt, and opens a `coordinator` window in the epic's
+`tm-<scope>-<EPIC>` session, in the repo's checkout. The session is recorded
+as a run of kind `coordinator` on the epic, so it shows up in `tm runs`,
+`tm overview` and the chat panel like any run, counts against the memory
+budget, and is reaped, hibernated and woken for chat mail like any
+interactive run. A second `start` while one is live is refused, and so is
+one while the epic's coordinator is hibernated: attach to the epic's session
+to resume it, or `stop` it first. `stop` also finishes a hibernated
+coordinator, so a later attach does not wake it.
+
+**Chat wakes need autopilot on for the scope.** Wakes run in the dispatch
+tick, and the tick does nothing while autopilot is off, so with autopilot
+off the coordinator reads its mail only when you prompt it. But with
+autopilot on, autopilot also launches the scope's ready tickets, this
+epic's children included. It does not tell the coordinator, which treats a
+lane it did not launch as unsupervised. **Pick one per epic**: leave
+autopilot off and prompt the coordinator yourself, or turn it on only once
+every one of the epic's children is launched. A child that is not ready yet
+is not safe: autopilot launches it the moment it becomes ready, before the
+coordinator does.
+
+**tm is the coordinator's hands.** Its prompt lets it act on the epic only
+through `tm` commands: `tm ticket children`, `tm ready`, `tm work run
+--unattended`, `tm runs` and `tm merge`. Memory admission, the lane cap and
+the usage gate apply to its launches as they do to autopilot's. **The
+readiness check is in the prompt, not in tm**: the coordinator is told to
+launch only when `tm ready` returns 0 or 3, but `tm work run` itself does
+not run the full `tm ready` decision yet.
+
+**thatch chat is its voice.** It maps each lane's session id (from `tm runs
+show`) to a chat name with `thatch chat list --json --host-id`, and keeps
+the supervision discipline of thatch's `thatch-coordination` skill: one
+tracked entry per lane, reconcile every turn, and verify a lane's "done"
+before merging. thatch installs that skill for opencode only, so tm's
+prompt carries the discipline itself.
+
+`stop` kills the coordinator's window and marks its run interrupted. **The
+lanes it launched keep running.**
+
+```toml
+[work.coordinator]
+# prompt_file = ".tskmstr/prompts/coordinator.md"  # optional; see [work.audit]'s prompt_file
+# model = "opus"                                     # optional; falls back to [work] default_model
+```
+
+`prompt` or `prompt_file` replace the built-in prompt; `{epic}` becomes the
+epic key and `{children}` one `KEY  STATUS  SUMMARY` line per child ticket.
+
 ### Assigning a ticket from the board
 
 Pressing `A` on the board opens a floating picker for the selected card,

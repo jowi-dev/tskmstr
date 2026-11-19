@@ -177,6 +177,11 @@ pub enum WorkCliError {
     /// than saying so.
     #[error("no runs recorded for {0} — nothing to rebuild a session from")]
     NoRunsForTicket(String),
+
+    /// `tm work coordinator start|stop` refused or failed (GitHub issue
+    /// #209).
+    #[error(transparent)]
+    Coordinator(#[from] crate::work::coordinator::CoordinatorError),
 }
 
 /// How a run is hosted and whether the invoking process waits for it — the
@@ -1332,6 +1337,220 @@ impl fmt::Debug for WorkContext<'_> {
     }
 }
 
+/// What `tm work coordinator start <EPIC>` needs beyond the launch's own
+/// dependencies (GitHub issue #209).
+pub struct CoordinatorStartRequest<'a> {
+    /// Reads the epic and its children.
+    pub provider: &'a dyn crate::ticketing::provider::TicketProvider,
+    /// Validated `[work.coordinator]` config.
+    pub cfg: &'a crate::config::CoordinatorConfig,
+    /// The invoking user's home directory.
+    pub home: &'a Path,
+    /// The invoking repo's backend identity.
+    pub identity: &'a crate::config::BackendIdentity,
+    /// The epic key as typed.
+    pub epic: &'a str,
+    /// The invoking repo's checkout, where the coordinator runs.
+    pub repo_dir: &'a Path,
+}
+
+/// `tm work coordinator start <EPIC>`: checks that `EPIC` is an epic, lists
+/// its children into the opening prompt, and launches the coordinator via
+/// [`crate::work::coordinator::launch_coordinator`].
+///
+/// # Errors
+///
+/// [`WorkCliError::Coordinator`] for every refusal: not an epic, already
+/// running, admission, a bad prompt file, or a tracker, store or tmux
+/// failure.
+pub fn coordinator_start(
+    deps: &crate::work::coordinator::CoordinatorLaunchDeps<'_>,
+    req: &CoordinatorStartRequest<'_>,
+    out: &mut dyn Write,
+) -> Result<(), WorkCliError> {
+    let epic = req.epic.to_uppercase();
+    let children = crate::work::coordinator::epic_brief(req.provider, &epic)?;
+    let outcome = crate::work::coordinator::launch_coordinator(
+        deps,
+        &crate::work::coordinator::CoordinatorLaunchRequest {
+            cfg: req.cfg,
+            home: req.home,
+            identity: req.identity,
+            epic: &epic,
+            children: &children,
+            repo_dir: req.repo_dir,
+        },
+    )?;
+    writeln!(
+        out,
+        "started coordinator for {epic} (run {}) in {}:{}",
+        outcome.run_id, outcome.session_name, outcome.window_name
+    )?;
+    writeln!(out, "attach: tmux attach -t {}", outcome.session_name)?;
+    if let Some(warning) = outcome.warning {
+        writeln!(out, "warning: {warning}")?;
+    }
+    Ok(())
+}
+
+/// `tm work coordinator stop <EPIC>`: stops the epic's coordinator via
+/// [`crate::work::coordinator::stop_coordinator`]. Lanes it launched keep
+/// running.
+///
+/// # Errors
+///
+/// [`WorkCliError::Coordinator`] when nothing is running, or on a store or
+/// tmux failure.
+pub fn coordinator_stop(
+    store: &RunStore,
+    tmux: &dyn TmuxOps,
+    identity: &crate::config::BackendIdentity,
+    epic: &str,
+    out: &mut dyn Write,
+) -> Result<(), WorkCliError> {
+    let epic = epic.to_uppercase();
+    let stopped = crate::work::coordinator::stop_coordinator(store, tmux, identity, &epic)?;
+    match stopped.run_id {
+        Some(run_id) => writeln!(
+            out,
+            "stopped coordinator for {epic} (run {run_id} marked interrupted)"
+        )?,
+        None => writeln!(out, "stopped coordinator for {epic}")?,
+    }
+    writeln!(out, "its lanes keep running; see `tm runs`")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod coordinator_cli_tests {
+    use super::*;
+    use crate::agent::claude::ClaudeRunner;
+    use crate::config::{BackendIdentity, CoordinatorConfig};
+    use crate::jira::fake::FakeJiraClient;
+    use crate::ticketing::types::{Issue, IssueFields, Status, StatusCategory};
+    use crate::work::tmux::{FakeTmuxOps, TmuxWindow};
+    use tempfile::tempdir;
+
+    fn issue(key: &str) -> Issue {
+        Issue {
+            key: key.to_string(),
+            fields: IssueFields {
+                summary: "Part".to_string(),
+                status: Status {
+                    name: "To Do".to_string(),
+                    status_category: StatusCategory {
+                        key: "new".to_string(),
+                    },
+                },
+                description: None,
+                assignee: None,
+                issue_links: vec![],
+                parent: None,
+                labels: Vec::new(),
+                issue_type: None,
+            },
+        }
+    }
+
+    fn identity() -> BackendIdentity {
+        BackendIdentity::Jira {
+            base_url: "https://x.atlassian.net".to_string(),
+            project_key: "PROJ".to_string(),
+        }
+    }
+
+    fn start(
+        store: &RunStore,
+        tmux: &FakeTmuxOps,
+        jira: &FakeJiraClient,
+        epic: &str,
+    ) -> Result<String, WorkCliError> {
+        let repo = tempdir().unwrap();
+        let identity = identity();
+        let cfg = CoordinatorConfig::default();
+        let deps = crate::work::coordinator::CoordinatorLaunchDeps {
+            store,
+            tmux,
+            runner: &ClaudeRunner,
+            model_defaults: crate::work::model::ModelDefaults::none(),
+            admission: crate::work::admission::AdmissionDeps::off(),
+        };
+        let req = CoordinatorStartRequest {
+            provider: jira,
+            cfg: &cfg,
+            home: Path::new("/home/test"),
+            identity: &identity,
+            epic,
+            repo_dir: repo.path(),
+        };
+        let mut out = Vec::new();
+        coordinator_start(&deps, &req, &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn start_normalizes_the_key_and_says_where_to_attach() {
+        let db = tempdir().unwrap();
+        let store = RunStore::open(&db.path().join("runs.db")).unwrap();
+        let jira = FakeJiraClient::new()
+            .with_epic("PROJ-1", issue("PROJ-1"))
+            .with_issue("PROJ-2", issue("PROJ-2"))
+            .with_parent("PROJ-2", "PROJ-1");
+
+        let text = start(&store, &FakeTmuxOps::new(), &jira, "proj-1").unwrap();
+
+        let run = &store.list_runs().unwrap()[0];
+        assert_eq!(run.ticket, "PROJ-1");
+        assert_eq!(
+            text,
+            format!(
+                "started coordinator for PROJ-1 (run {}) in tm-proj-proj-1:coordinator\n\
+                 attach: tmux attach -t tm-proj-proj-1\n",
+                run.id
+            )
+        );
+    }
+
+    #[test]
+    fn start_refuses_a_ticket_that_is_not_an_epic_before_any_row() {
+        let db = tempdir().unwrap();
+        let store = RunStore::open(&db.path().join("runs.db")).unwrap();
+        let jira = FakeJiraClient::new().with_issue("PROJ-2", issue("PROJ-2"));
+        let tmux = FakeTmuxOps::new();
+
+        let err = start(&store, &tmux, &jira, "PROJ-2").unwrap_err();
+
+        assert_eq!(err.to_string(), "PROJ-2 is not an epic");
+        assert!(store.list_runs().unwrap().is_empty());
+        assert!(tmux.calls().is_empty());
+    }
+
+    #[test]
+    fn stop_reports_the_interrupted_run() {
+        let db = tempdir().unwrap();
+        let store = RunStore::open(&db.path().join("runs.db")).unwrap();
+        let jira = FakeJiraClient::new().with_epic("PROJ-1", issue("PROJ-1"));
+        start(&store, &FakeTmuxOps::new(), &jira, "PROJ-1").unwrap();
+        let run_id = store.list_runs().unwrap()[0].id;
+        let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![TmuxWindow {
+            session: "tm-proj-proj-1".to_string(),
+            name: "coordinator".to_string(),
+            dead: false,
+        }]));
+        let mut out = Vec::new();
+
+        coordinator_stop(&store, &tmux, &identity(), "proj-1", &mut out).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "stopped coordinator for PROJ-1 (run {run_id} marked interrupted)\n\
+                 its lanes keep running; see `tm runs`\n"
+            )
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1387,6 +1606,7 @@ mod tests {
             merge: crate::config::MergeConfig::default(),
             retro: crate::config::RetroConfig::default(),
             walkthrough: crate::config::WalkthroughConfig::default(),
+            coordinator: crate::config::CoordinatorConfig::default(),
             review_watch: crate::config::ReviewWatchConfig::default(),
             auto_review: crate::config::AutoReviewConfig::default(),
             manual: crate::config::ManualConfig::default(),
