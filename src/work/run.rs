@@ -2620,6 +2620,7 @@ mod tests {
             auto_review: crate::config::AutoReviewConfig::default(),
             manual: crate::config::ManualConfig::default(),
             memory: crate::config::MemoryConfig::default(),
+            shared_deps: Vec::new(),
         }
     }
 

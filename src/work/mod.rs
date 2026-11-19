@@ -35,6 +35,7 @@ pub mod runner;
 pub mod session;
 pub mod session_gc;
 pub mod setup_session;
+pub mod shared_deps;
 pub mod signal;
 pub mod thatch_chat;
 pub mod tmux;

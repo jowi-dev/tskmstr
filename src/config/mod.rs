@@ -579,6 +579,26 @@ pub struct RawWorkConfig {
     /// cleanup) waits for memory or usage admission before giving up
     /// (GitHub issue #149). Defaults to 60.
     pub admission_wait_mins: Option<u64>,
+    /// Dependency directories a new worktree links to the main checkout's
+    /// copy instead of building its own (GitHub issue #255), each guarded
+    /// by a lock file, e.g.
+    /// `shared_deps = [{ path = "deps", lock_file = "mix.lock" }]`. A repo
+    /// list replaces the global one as a whole. Unset or empty provisions
+    /// worktrees exactly as before. See [`crate::work::shared_deps`].
+    pub shared_deps: Option<Vec<SharedDep>>,
+}
+
+/// One `[work] shared_deps` entry: a dependency directory and the lock file
+/// that decides whether a worktree may share the main checkout's copy. Both
+/// paths are relative to the checkout root and may not leave it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SharedDep {
+    /// The dependency directory, e.g. `deps` or `assets/node_modules`.
+    pub path: String,
+    /// The lock file pinning what that directory holds, e.g. `mix.lock`.
+    /// While a worktree's copy matches the main checkout's byte for byte,
+    /// the directory stays shared.
+    pub lock_file: String,
 }
 
 /// Raw, partially-specified `[work.audit]` subsection as parsed directly from
@@ -1324,6 +1344,9 @@ pub struct WorkConfig {
     pub manual: ManualConfig,
     /// Validated memory-admission settings. See [`MemoryConfig`].
     pub memory: MemoryConfig,
+    /// See [`RawWorkConfig::shared_deps`]. Empty when unset in both global
+    /// and repo config.
+    pub shared_deps: Vec<SharedDep>,
 }
 
 /// Validated memory-admission settings from [`RawWorkConfig::memory_budget_gb`],
@@ -1823,6 +1846,16 @@ pub enum ConfigError {
     )]
     InvalidFixThreshold {
         /// The unrecognized value as written in config.
+        value: String,
+    },
+
+    /// A `[work] shared_deps` `path` or `lock_file` was empty, absolute,
+    /// or climbed out of the checkout with `..`.
+    #[error(
+        "invalid [work] shared_deps path `{value}`; expected a relative path inside the checkout"
+    )]
+    InvalidSharedDepPath {
+        /// The offending path.
         value: String,
     },
 
@@ -2720,6 +2753,16 @@ fn merge_work(
     let repo = repo.unwrap_or_default();
 
     let memory = merge_memory(&global, &repo)?;
+    let shared_deps = repo.shared_deps.or(global.shared_deps).unwrap_or_default();
+    for entry in &shared_deps {
+        for value in [&entry.path, &entry.lock_file] {
+            if !crate::work::shared_deps::is_contained_relative_path(value) {
+                return Err(ConfigError::InvalidSharedDepPath {
+                    value: value.clone(),
+                });
+            }
+        }
+    }
     let worktree_root = repo.worktree_root.or(global.worktree_root);
     let default_model = repo.default_model.or(global.default_model);
     let default_max_turns = repo.default_max_turns.or(global.default_max_turns);
@@ -2815,6 +2858,7 @@ fn merge_work(
         auto_review,
         manual,
         memory,
+        shared_deps,
     })
 }
 
@@ -5762,6 +5806,7 @@ mod tests {
             memory_budget_gb: None,
             lane_memory_estimate_gb: None,
             admission_wait_mins: None,
+            shared_deps: None,
         };
         let repo = RawWorkConfig {
             build_slots: None,
@@ -5784,6 +5829,7 @@ mod tests {
             memory_budget_gb: None,
             lane_memory_estimate_gb: None,
             admission_wait_mins: None,
+            shared_deps: None,
         };
         let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
         // Overridden field wins.
@@ -7059,6 +7105,66 @@ mod tests {
             global: global_path,
             repo: None,
         })
+    }
+
+    #[test]
+    fn shared_deps_is_empty_by_default() {
+        let cfg = load_global_work("").expect("should load");
+        assert!(cfg.work.shared_deps.is_empty());
+    }
+
+    #[test]
+    fn shared_deps_parses_path_and_lock_file_pairs() {
+        let cfg = load_global_work(
+            "shared_deps = [{ path = \"deps\", lock_file = \"mix.lock\" }, { path = \"assets/node_modules\", lock_file = \"assets/package-lock.json\" }]",
+        )
+        .expect("should load");
+        assert_eq!(
+            cfg.work.shared_deps,
+            vec![
+                SharedDep {
+                    path: "deps".to_string(),
+                    lock_file: "mix.lock".to_string(),
+                },
+                SharedDep {
+                    path: "assets/node_modules".to_string(),
+                    lock_file: "assets/package-lock.json".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_deps_rejects_paths_that_escape_the_worktree() {
+        for bad in [
+            "shared_deps = [{ path = \"../deps\", lock_file = \"mix.lock\" }]",
+            "shared_deps = [{ path = \"/deps\", lock_file = \"mix.lock\" }]",
+            "shared_deps = [{ path = \"deps\", lock_file = \"../mix.lock\" }]",
+            "shared_deps = [{ path = \"\", lock_file = \"mix.lock\" }]",
+        ] {
+            let err = load_global_work(bad).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidSharedDepPath { .. }),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_shared_deps_replace_global_as_a_whole_list() {
+        let global = RawWorkConfig {
+            shared_deps: Some(vec![SharedDep {
+                path: "deps".to_string(),
+                lock_file: "mix.lock".to_string(),
+            }]),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            shared_deps: Some(vec![]),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
+        assert!(cfg.shared_deps.is_empty());
     }
 
     #[test]
