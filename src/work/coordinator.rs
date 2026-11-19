@@ -59,8 +59,21 @@ pub enum CoordinatorError {
         window_name: String,
     },
 
-    /// [`stop_coordinator`] found neither a running coordinator row nor a
-    /// live coordinator window for the epic.
+    /// The epic's latest coordinator row is hibernated. Attaching to the
+    /// epic's session resumes it, so a fresh launch would leave two
+    /// coordinators on one epic.
+    #[error(
+        "{epic}'s coordinator is hibernated: attach to {session_name} to resume it, or stop it first"
+    )]
+    Hibernated {
+        /// The epic key.
+        epic: String,
+        /// Name of the epic's tmux session, which an attach wakes.
+        session_name: String,
+    },
+
+    /// [`stop_coordinator`] found neither a running or hibernated
+    /// coordinator row nor a live coordinator window for the epic.
     #[error("no coordinator is running for {epic}")]
     NotRunning {
         /// The epic key.
@@ -166,7 +179,9 @@ pub struct CoordinatorLaunchRequest<'a> {
 /// Launches (or refuses to launch) a coordinator session for `req.epic`.
 ///
 /// 1. Refuses with [`CoordinatorError::AlreadyRunning`] when a live
-///    [`COORDINATOR_WINDOW_NAME`] window exists in the epic's session.
+///    [`COORDINATOR_WINDOW_NAME`] window exists in the epic's session, and
+///    with [`CoordinatorError::Hibernated`] when the epic's latest
+///    coordinator row is hibernated.
 /// 2. Reads `prompt_file` (if set), then admits the launch as a human one,
 ///    both before any row exists.
 /// 3. Pre-registers a `coordinator` run row rooted at `req.repo_dir`, and
@@ -192,6 +207,17 @@ pub fn launch_coordinator(
         return Err(CoordinatorError::AlreadyRunning {
             session_name,
             window_name: COORDINATOR_WINDOW_NAME.to_string(),
+        });
+    }
+    let latest = deps.store.latest_run_for_ticket_kind(
+        Some(&req.identity.scope()),
+        req.epic,
+        Some(COORDINATOR_KIND),
+    )?;
+    if latest.is_some_and(|run| run.status == RunStatus::Hibernated) {
+        return Err(CoordinatorError::Hibernated {
+            epic: req.epic.to_string(),
+            session_name,
         });
     }
     let existing_windows = session_window_names(&windows, &session_name);
@@ -315,21 +341,22 @@ pub fn launch_coordinator(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopOutcome {
     /// The coordinator run row it finished as interrupted, if one was
-    /// running.
+    /// running or hibernated.
     pub run_id: Option<i64>,
     /// Whether it killed a live coordinator window.
     pub window_killed: bool,
 }
 
 /// Stops `epic`'s coordinator: kills the [`COORDINATOR_WINDOW_NAME`] window
-/// in the epic's session and finishes the epic's running `coordinator` row
-/// as [`RunStatus::Interrupted`]. Lanes the coordinator launched keep
+/// in the epic's session and finishes the epic's running or hibernated
+/// `coordinator` row as [`RunStatus::Interrupted`]. Finishing a hibernated
+/// row matters: otherwise the next attach to the epic's session wakes it. Lanes the coordinator launched keep
 /// running; they are ordinary lane runs.
 ///
 /// # Errors
 ///
-/// [`CoordinatorError::NotRunning`] when there is neither a running row nor
-/// a live window; otherwise a store or tmux failure.
+/// [`CoordinatorError::NotRunning`] when there is neither a running or
+/// hibernated row nor a live window; otherwise a store or tmux failure.
 pub fn stop_coordinator(
     store: &RunStore,
     tmux: &dyn TmuxOps,
@@ -341,7 +368,7 @@ pub fn stop_coordinator(
     let window_live = has_live_window(&windows, &session_name, COORDINATOR_WINDOW_NAME);
     let run = store
         .latest_run_for_ticket_kind(Some(&identity.scope()), epic, Some(COORDINATOR_KIND))?
-        .filter(|run| run.status == RunStatus::Running);
+        .filter(|run| matches!(run.status, RunStatus::Running | RunStatus::Hibernated));
     if !window_live && run.is_none() {
         return Err(CoordinatorError::NotRunning {
             epic: epic.to_string(),
@@ -670,6 +697,34 @@ mod tests {
     }
 
     #[test]
+    fn refuses_to_launch_over_a_hibernated_coordinator() {
+        let fx = fixture();
+        let first = launch(
+            &fx,
+            &FakeTmuxOps::new(),
+            crate::work::admission::AdmissionDeps::off(),
+        )
+        .unwrap();
+        assert!(fx.store.hibernate_run(first.run_id).unwrap());
+        let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![window("shell", false)]));
+
+        let err = launch(&fx, &tmux, crate::work::admission::AdmissionDeps::off()).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "PROJ-1's coordinator is hibernated: attach to {SESSION} to resume it, \
+                 or stop it first"
+            )
+        );
+        assert_eq!(fx.store.list_runs().unwrap().len(), 1);
+        assert!(!tmux.calls().iter().any(|c| matches!(
+            c,
+            TmuxCall::NewWindowWithCommand { .. } | TmuxCall::NewSessionWithCommand { .. }
+        )));
+    }
+
+    #[test]
     fn an_over_budget_launch_is_refused_before_its_row() {
         let fx = fixture();
         let tmux = FakeTmuxOps::new();
@@ -743,6 +798,25 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, TmuxCall::KillWindow { .. }))
         );
+    }
+
+    #[test]
+    fn stop_finishes_a_hibernated_row() {
+        let fx = fixture();
+        let outcome = launch(
+            &fx,
+            &FakeTmuxOps::new(),
+            crate::work::admission::AdmissionDeps::off(),
+        )
+        .unwrap();
+        assert!(fx.store.hibernate_run(outcome.run_id).unwrap());
+
+        let stopped =
+            stop_coordinator(&fx.store, &FakeTmuxOps::new(), test_identity(), "PROJ-1").unwrap();
+
+        assert_eq!(stopped.run_id, Some(outcome.run_id));
+        let run = fx.store.run_by_id(outcome.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Interrupted);
     }
 
     #[test]

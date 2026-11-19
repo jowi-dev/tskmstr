@@ -1780,7 +1780,10 @@ session's opening prompt, and opens a `coordinator` window in the epic's
 as a run of kind `coordinator` on the epic, so it shows up in `tm runs`,
 `tm overview` and the chat panel like any run, counts against the memory
 budget, and is reaped, hibernated and woken for chat mail like any
-interactive run. A second `start` while one is live is refused.
+interactive run. A second `start` while one is live is refused, and so is
+one while the epic's coordinator is hibernated: attach to the epic's session
+to resume it, or `stop` it first. `stop` also finishes a hibernated
+coordinator, so a later attach does not wake it.
 
 **tm is the coordinator's hands.** Its prompt lets it act on the epic only
 through `tm` commands: `tm ticket children`, `tm ready`, `tm work run
