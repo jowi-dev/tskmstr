@@ -462,9 +462,10 @@ pub fn conflict_prompt(
         .replace("{upstream_context}", upstream_context)
 }
 
-/// The most bytes the `{upstream_context}` placeholder carries, across every
-/// pull request (and, in a batch, every ticket). Bodies are trimmed to share
-/// it, the way [`crate::work::ci_fix::LOG_LIMIT_BYTES`] caps failure logs.
+/// The byte budget the upstream pull request bodies in `{upstream_context}`
+/// share, across every pull request (and, in a batch, every ticket). Bodies
+/// are trimmed to fit it, the way [`crate::work::ci_fix::LOG_LIMIT_BYTES`]
+/// caps failure logs. Titles, headers and trim markers come on top of it.
 pub const UPSTREAM_CONTEXT_LIMIT_BYTES: usize = 12_000;
 
 /// The `{upstream_context}` text when no upstream pull request touched the
