@@ -45,9 +45,9 @@
 //!    review is complete to the scope's merge queue, then starts one
 //!    detached `tm merge` for the highest queued ticket that can merge,
 //!    unless the scope already has a merge running. A merge is not a lane
-//!    either. This step alone also runs with autopilot off, for tickets
-//!    the operator queued by hand; the tick still reports
-//!    [`Skip::Disabled`].
+//!    either. This step also runs with autopilot off, for tickets the
+//!    operator queued by hand, followed by step 10's automerge-failure
+//!    notices only; the tick still reports [`Skip::Disabled`].
 //! 9. With `[work] wake_on_chat_mail` on (the default), runs the chat wake
 //!    ([`chat_wake::sweep`], GitHub issue #224): types a one-line prompt
 //!    into each idle Claude Code lane that has new unread thatch chat
@@ -590,12 +590,20 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
         return Ok(skipped(Skip::Locked));
     };
     if !deps.store.autopilot_enabled(cfg.scope)? {
-        // The operator's own queued merges drain with autopilot off.
+        // The operator's own queued merges drain with autopilot off, so a
+        // failed automerge still notifies; the other notices wait for
+        // autopilot.
         let mut report = skipped(Skip::Disabled);
         if let Some(merge) = deps.merge {
             let runs = deps.store.overview_runs()?;
             report.auto_merges = auto_merge::sweep(merge, &runs, cfg.scope, AutoMerge::Off)?;
         }
+        let runs = deps.store.overview_runs()?;
+        let notices: Vec<_> = notify::ticket_notices(&runs, cfg.scope, cfg.max_fix_rounds)
+            .into_iter()
+            .filter(|notice| notice.reason == notify::AUTO_MERGE_FAILED)
+            .collect();
+        report.notified = notify::send(deps.store, deps.notifier, cfg.scope, &notices)?;
         return Ok(report);
     }
     deps.store.stamp_autopilot_tick(cfg.scope)?;
@@ -1946,6 +1954,25 @@ mod tests {
         fx.tick(&[], &launcher);
 
         assert!(fx.notifier.0.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_disabled_scope_still_notifies_a_failed_automerge_once() {
+        let fx = Fixture::new();
+        fx.store.set_autopilot(SCOPE, false).unwrap();
+        awaiting_review(&fx.store);
+        let lane = start(&fx.store, "GH-1", "lane");
+        finish(&fx.store, lane, RunStatus::Done, Some("https://gh/pr/1"));
+        let merge = start(&fx.store, "GH-1", auto_merge::AUTO_MERGE_KIND);
+        finish(&fx.store, merge, RunStatus::Failed, None);
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let first = fx.tick(&[], &launcher);
+        let second = fx.tick(&[], &launcher);
+
+        assert_eq!(first.skipped, Some(Skip::Disabled));
+        assert_eq!(first.notified, vec!["tm: automerge of GH-1 did not land"]);
+        assert!(second.notified.is_empty());
     }
 
     #[test]

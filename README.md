@@ -1333,8 +1333,9 @@ it. A tick:
    Each of these fires once per transition, not once per tick. runs.db's
    `notifications` table remembers, per ticket and reason, the transition
    it last notified. A ticket that goes back to work and returns to the
-   same state notifies again. A tick sends nothing while the scope's
-   autopilot is off, and only tickets active in the last 7 days notify.
+   same state notifies again. While the scope's autopilot is off, a tick
+   sends only the automerge-failure notice, since queued tickets still
+   merge then. Only tickets active in the last 7 days notify.
 
    Notifications use `notify-send` on Linux and `osascript` on macOS. If
    the command is not installed, the tick sends nothing and carries on.
@@ -1400,7 +1401,8 @@ Turning autopilot on ticks at once. A tick reads the tracker, so it never
 runs on the thread that draws the screen. Each tick loads that repo's own
 config, so `max_lanes`, the lanes and the runners all come from it.
 
-A tick whose scope has autopilot off does nothing. Two open TUIs (or a TUI
+A tick whose scope has autopilot off only drains the merge queue and
+sends automerge-failure notices. Two open TUIs (or a TUI
 and `tm dispatch`) take the same per-scope lock, so they never launch the
 same ticket.
 
