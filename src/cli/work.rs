@@ -1196,10 +1196,11 @@ pub fn sweep(
             Some(reason) => format!("skip: {reason}"),
             None => "clean".to_string(),
         };
-        let worktree = candidate.worktree.as_ref().map_or_else(
-            || "(no worktree)".to_string(),
-            |wt| wt.display().to_string(),
-        );
+        let worktree = match &candidate.worktree {
+            None => "(no worktree)".to_string(),
+            Some(wt) if wt.exists() => wt.display().to_string(),
+            Some(wt) => format!("{} (gone)", wt.display()),
+        };
         let pr = candidate.pr.map_or_else(String::new, |pr| {
             format!("  PR #{} {}", pr.number, pr_lifecycle_word(pr.lifecycle))
         });
@@ -2958,6 +2959,45 @@ mod tests {
         let printed = out_string(&out);
         assert!(printed.contains("PROJ-2"), "{printed}");
         assert!(printed.contains("1 failed"), "{printed}");
+    }
+
+    #[test]
+    fn sweep_plan_flags_a_recorded_worktree_that_is_already_gone() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let config = clean_config(&tmp, &repo);
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let wt = sweep_lane_run(&tmp, &store, "PROJ-1");
+        std::fs::remove_dir_all(&wt).unwrap();
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_has_session(Ok(false));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let mut input: &[u8] = b"n\n";
+        let mut out = Vec::new();
+
+        sweep(
+            &ctx,
+            &store,
+            &FakeGhCli::new(),
+            compatible_test_identity(),
+            &sweep_keys(&["PROJ-1"]),
+            false,
+            &mut input,
+            &mut out,
+        )
+        .unwrap();
+
+        let printed = out_string(&out);
+        assert!(
+            printed.contains(&format!("{} (gone)", wt.display())),
+            "{printed}"
+        );
     }
 
     #[test]

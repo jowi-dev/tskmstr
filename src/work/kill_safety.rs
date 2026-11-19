@@ -124,7 +124,13 @@ pub fn classify_session(
     gh: &dyn GhCli,
     pid_alive: &dyn Fn(u32) -> bool,
 ) -> Result<KillSafetyVerdict, RunStoreError> {
-    classify_session_with(session, store, tmux, &mut |dir| gh.pr_list_all(dir).ok(), pid_alive)
+    classify_session_with(
+        session,
+        store,
+        tmux,
+        &mut |dir| gh.pr_list_all(dir).ok(),
+        pid_alive,
+    )
 }
 
 /// [`classify_session`] with the PR listing injected: `list_prs` is handed
