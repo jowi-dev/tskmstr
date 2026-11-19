@@ -518,6 +518,10 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             launcher: &merge_launcher,
         };
         let notifier = tskmstr::work::notify::DesktopNotifier::detect();
+        let wake = tskmstr::work::chat_wake::WakeDeps {
+            tmux: &tskmstr::work::tmux::ShellTmuxOps,
+            thatch: &tskmstr::work::thatch_chat::ShellThatchRunner,
+        };
         let deps = tskmstr::work::dispatch::TickDeps {
             store: self.store,
             lock: self.lock,
@@ -534,6 +538,7 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
                 bases: &bases,
             }),
             merge: Some(&merge),
+            chat_wake: Some(&wake),
         };
         let cfg = tskmstr::work::dispatch::TickConfig {
             scope,
@@ -543,6 +548,7 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             stall_notify_mins: config.dispatch.stall_notify_mins,
             fix_failing_ci: config.dispatch.fix_failing_ci,
             auto_merge: config.dispatch.auto_merge,
+            wake_on_chat_mail: config.work.wake_on_chat_mail,
             lanes: &lanes,
             runners: &runners,
             memory: &config.work.memory,
@@ -3310,6 +3316,10 @@ impl AutopilotTicker {
             launcher: &merge_launcher,
         };
         let notifier = tskmstr::work::notify::DesktopNotifier::detect();
+        let wake = tskmstr::work::chat_wake::WakeDeps {
+            tmux: &tskmstr::work::tmux::ShellTmuxOps,
+            thatch: &tskmstr::work::thatch_chat::ShellThatchRunner,
+        };
         let deps = dispatch::TickDeps {
             store: &store,
             lock: &lock,
@@ -3326,6 +3336,7 @@ impl AutopilotTicker {
                 bases: &bases,
             }),
             merge: Some(&merge),
+            chat_wake: Some(&wake),
         };
         let cfg = dispatch::TickConfig {
             scope: &scope,
@@ -3335,6 +3346,7 @@ impl AutopilotTicker {
             stall_notify_mins: config.dispatch.stall_notify_mins,
             fix_failing_ci: config.dispatch.fix_failing_ci,
             auto_merge: config.dispatch.auto_merge,
+            wake_on_chat_mail: config.work.wake_on_chat_mail,
             lanes: &lanes,
             runners: &runners,
             memory: &config.work.memory,

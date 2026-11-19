@@ -216,6 +216,10 @@ fn tick_json(scope: &str, outcome: &TickOutcome) -> serde_json::Value {
             "notified": report.notified,
             "ci_fixes": report.ci_fixes.iter().map(ci_fix_json).collect::<Vec<_>>(),
             "auto_merges": report.auto_merges.iter().map(auto_merge_json).collect::<Vec<_>>(),
+            "chat_wakes": report.chat_wakes.iter().map(|wake| json!({
+                "ticket": wake.ticket,
+                "run_id": wake.run_id,
+            })).collect::<Vec<_>>(),
             "error": null,
         }),
         TickOutcome::Failed(err) => json!({
@@ -227,6 +231,7 @@ fn tick_json(scope: &str, outcome: &TickOutcome) -> serde_json::Value {
             "notified": [],
             "ci_fixes": [],
             "auto_merges": [],
+            "chat_wakes": [],
             "error": err,
         }),
     }
@@ -348,6 +353,13 @@ fn write_tick_text(scope: &str, outcome: &TickOutcome, out: &mut dyn Write) -> i
     }
     for action in &report.auto_merges {
         writeln!(out, "{scope}: {}", auto_merge_text(action))?;
+    }
+    for wake in &report.chat_wakes {
+        writeln!(
+            out,
+            "{scope}: woke {} (run {}) for unread chat mail",
+            wake.ticket, wake.run_id
+        )?;
     }
     for title in &report.notified {
         writeln!(out, "{scope}: notified: {title}")?;
@@ -738,6 +750,10 @@ mod tests {
                     error: "rate limited".to_string(),
                 },
             ],
+            chat_wakes: vec![crate::work::chat_wake::ChatWake {
+                run_id: 41,
+                ticket: "GH-9".to_string(),
+            }],
         }
     }
 
@@ -783,6 +799,7 @@ mod tests {
              github:o/one: automerge GH-10 launch failed: no tm\n\
              github:o/one: automerge PRs unavailable: gh down\n\
              github:o/one: automerge GH-11 PR unavailable: rate limited\n\
+             github:o/one: woke GH-9 (run 41) for unread chat mail\n\
              github:o/one: notified: tm: GH-0 is awaiting your review\n\
              github:o/two: skipped: another host is ticking this scope\n\
              github:o/idle: nothing to launch\n\
@@ -860,6 +877,7 @@ mod tests {
                         {"ticket": null, "action": "prs_unavailable", "sha": null, "run_id": null, "error": "gh down"},
                         {"ticket": "GH-11", "action": "prs_unavailable", "sha": null, "run_id": null, "error": "rate limited"},
                     ],
+                    "chat_wakes": [{"ticket": "GH-9", "run_id": 41}],
                     "error": null,
                 },
                 {
@@ -871,6 +889,7 @@ mod tests {
                     "notified": [],
                     "ci_fixes": [],
                     "auto_merges": [],
+                    "chat_wakes": [],
                     "error": "no repo recorded for github:o/two; run `tm dispatch on` inside it once",
                 },
             ])
@@ -959,6 +978,7 @@ mod tests {
                 ci: None,
                 base_watch: None,
                 merge: None,
+                chat_wake: None,
             };
             let lanes = [LaneChoice {
                 name: "backend".to_string(),
@@ -974,6 +994,7 @@ mod tests {
                 stall_notify_mins: 30,
                 fix_failing_ci: false,
                 auto_merge: crate::config::AutoMerge::Off,
+                wake_on_chat_mail: false,
                 lanes: &lanes,
                 runners: &["claude"],
                 memory: &memory,

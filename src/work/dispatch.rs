@@ -44,7 +44,11 @@
 //!    ([`auto_merge::sweep`], GitHub issue #243): starts one detached
 //!    `tm merge` for a lane PR whose review is complete, unless the scope
 //!    already has a merge running. A merge is not a lane either.
-//! 9. Sends the desktop notifications the scope owes
+//! 9. With `[work] wake_on_chat_mail` on (the default), runs the chat wake
+//!    ([`chat_wake::sweep`], GitHub issue #224): types a one-line prompt
+//!    into each idle Claude Code lane that has new unread thatch chat
+//!    mail, so the agent reads it.
+//! 10. Sends the desktop notifications the scope owes
 //!    ([`crate::work::notify`]): tickets that entered awaiting review, hit
 //!    the fix-round cap, or had an automerge fail, a refusal streak older
 //!    than `stall_notify_mins`, and a lane base branch whose head commit has
@@ -72,6 +76,7 @@ use crate::work::admission::{
 };
 use crate::work::auto_merge::{self, AutoMergeAction};
 use crate::work::auto_review::RoundVerdict;
+use crate::work::chat_wake;
 use crate::work::ci_fix::{self, CiFixAction};
 use crate::work::detach::DetachSpawner;
 use crate::work::notify::{self, Notifier};
@@ -345,6 +350,8 @@ pub struct TickConfig<'a> {
     /// `[dispatch] auto_merge`: when the automerge sweep merges (GitHub
     /// issue #243).
     pub auto_merge: AutoMerge,
+    /// `[work] wake_on_chat_mail`: run the chat wake (GitHub issue #224).
+    pub wake_on_chat_mail: bool,
     /// `[dispatch] stall_notify_mins`: how long refusals for one reason
     /// last before a stall notification.
     pub stall_notify_mins: u64,
@@ -391,6 +398,10 @@ pub struct TickDeps<'a> {
     /// What the automerge sweep reads PRs with and launches through.
     /// `None` runs no sweep, whatever [`TickConfig::auto_merge`] says.
     pub merge: Option<&'a auto_merge::SweepDeps<'a>>,
+    /// What the chat wake types into panes with and reads mail through.
+    /// `None` wakes nothing, whatever [`TickConfig::wake_on_chat_mail`]
+    /// says.
+    pub chat_wake: Option<&'a chat_wake::WakeDeps<'a>>,
 }
 
 /// Why a tick did nothing at all.
@@ -541,6 +552,8 @@ pub struct TickReport {
     /// What the automerge sweep did: at most one started merge, or why
     /// it could not read or launch.
     pub auto_merges: Vec<AutoMergeAction>,
+    /// The idle lanes the chat wake typed a prompt into.
+    pub chat_wakes: Vec<chat_wake::ChatWake>,
 }
 
 /// Errors that stop a tick outright.
@@ -670,6 +683,10 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
         // closed PR since `runs` was taken.
         let runs = deps.store.overview_runs()?;
         report.auto_merges = auto_merge::sweep(merge, &runs, cfg.scope, cfg.auto_merge)?;
+    }
+
+    if let Some(wake) = deps.chat_wake.filter(|_| cfg.wake_on_chat_mail) {
+        report.chat_wakes = chat_wake::sweep(deps.store, wake.tmux, wake.thatch, &runs, cfg.scope)?;
     }
 
     let mut notices = notify::ticket_notices(&runs, cfg.scope, cfg.max_fix_rounds);
@@ -1040,6 +1057,9 @@ mod tests {
         gh: crate::github::gh_cli::FakeGhCli,
         /// The bases the red-base watch reads; empty runs no watch.
         bases: Vec<String>,
+        wake_on_chat_mail: bool,
+        tmux: crate::work::tmux::FakeTmuxOps,
+        thatch: crate::work::thatch_chat::FakeThatchRunner,
     }
 
     impl Fixture {
@@ -1068,6 +1088,9 @@ mod tests {
                 notifier: Recorder::default(),
                 gh: crate::github::gh_cli::FakeGhCli::new(),
                 bases: Vec::new(),
+                wake_on_chat_mail: true,
+                tmux: crate::work::tmux::FakeTmuxOps::new(),
+                thatch: crate::work::thatch_chat::FakeThatchRunner::missing(),
             }
         }
 
@@ -1130,6 +1153,10 @@ mod tests {
                 repo_dir: Path::new("/repo"),
                 bases: &self.bases,
             };
+            let wake = chat_wake::WakeDeps {
+                tmux: &self.tmux,
+                thatch: &self.thatch,
+            };
             let deps = TickDeps {
                 store: &self.store,
                 lock: &lock,
@@ -1142,6 +1169,7 @@ mod tests {
                 ci,
                 base_watch: (!self.bases.is_empty()).then_some(&watch),
                 merge,
+                chat_wake: Some(&wake),
             };
             let cfg = TickConfig {
                 scope: SCOPE,
@@ -1151,6 +1179,7 @@ mod tests {
                 stall_notify_mins: self.stall_notify_mins,
                 fix_failing_ci: self.fix_failing_ci,
                 auto_merge: self.auto_merge,
+                wake_on_chat_mail: self.wake_on_chat_mail,
                 lanes: &self.lanes,
                 runners: &self.runners,
                 memory: &self.memory,
@@ -1221,6 +1250,80 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    // --- Chat wake (GitHub issue #224) ---
+
+    /// A running lane for `ticket`, idle at its prompt in tmux session `s`
+    /// window `work`, registered as agent session `sess-1`.
+    fn idle_lane(store: &RunStore, ticket: &str) -> i64 {
+        let id = start(store, ticket, "lane");
+        crate::work::hibernate::record_launch(
+            store,
+            id,
+            &crate::work::hibernate::LaunchRecord {
+                window: "work".to_string(),
+                resume: crate::agent::ResumeSpec {
+                    program: "claude".to_string(),
+                    resume_flag: "--resume".to_string(),
+                    args: Vec::new(),
+                    env_remove: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        store.update_session_id(id, "sess-1").unwrap();
+        store.update_tmux_session(id, "s").unwrap();
+        store.add_event(id, "await", None).unwrap();
+        id
+    }
+
+    /// thatch reporting one unread message (id 3) for agent session `sess-1`.
+    fn mail_for_sess_1() -> crate::work::thatch_chat::FakeThatchRunner {
+        crate::work::thatch_chat::FakeThatchRunner::returning(concat!(
+            r#"{"name":"npc-1","session_id":"x","host_kind":"mcp","unread":1,"host_id":"sess-1"}"#,
+            "\n",
+            r#"{"event":"sent","at":"2026-11-19T00:00:00Z","id":3,"from":"boss","to":"npc-1","body":"hi"}"#,
+            "\n",
+        ))
+    }
+
+    #[test]
+    fn a_tick_wakes_an_idle_lane_with_unread_chat_mail() {
+        let mut fx = Fixture::new();
+        fx.thatch = mail_for_sess_1();
+        let id = idle_lane(&fx.store, "GH-1");
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let report = fx.tick(&[], &launcher);
+
+        assert_eq!(
+            report.chat_wakes,
+            vec![chat_wake::ChatWake {
+                run_id: id,
+                ticket: "GH-1".to_string(),
+            }]
+        );
+        assert!(fx.tmux.calls().iter().any(|call| matches!(
+            call,
+            crate::work::tmux::TmuxCall::SendKeys { name, window, .. }
+                if name == "s" && window == "work"
+        )));
+    }
+
+    #[test]
+    fn with_wake_on_chat_mail_off_thatch_is_never_asked() {
+        let mut fx = Fixture::new();
+        fx.thatch = mail_for_sess_1();
+        fx.wake_on_chat_mail = false;
+        idle_lane(&fx.store, "GH-1");
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let report = fx.tick(&[], &launcher);
+
+        assert!(report.chat_wakes.is_empty());
+        assert!(fx.thatch.calls.borrow().is_empty());
+        assert!(fx.tmux.calls().is_empty());
     }
 
     // --- CI-fix sweep (GitHub issue #226) ---
@@ -2408,6 +2511,8 @@ mod tests {
             auto_review_round: None,
             review_import: None,
             pr_closed: false,
+            session_id: None,
+            awaiting_reply: false,
         };
 
         assert!(in_hand(&[run], SCOPE).is_empty());
