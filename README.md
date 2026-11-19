@@ -1299,7 +1299,9 @@ it. A tick:
    lane PR whose checks finished red (see "Fixing failing CI" below). A
    fix pass is not a lane, so it counts against neither `max_lanes` nor
    `max_launches_per_day`.
-8. **Sends desktop notifications** (GitHub issue #121,
+8. **Wakes idle lanes with unread chat mail**, unless `[work]
+   wake_on_chat_mail = false`: see "Waking lanes for chat mail" below.
+9. **Sends desktop notifications** (GitHub issue #121,
    `src/work/notify.rs`) when:
    - a ticket enters "awaiting review": its PR is open, the bots have
      reviewed, and nothing is running;
@@ -1717,6 +1719,43 @@ each answer for 5 seconds so the views' half-second refresh doesn't spawn
 `thatch` every time. This view is read-only: it never sends a message. With
 no `thatch` on `PATH`, or a session that never joined chat, the panel and
 the badge simply don't appear.
+
+#### Waking lanes for chat mail
+
+**A Claude Code session reads its chat mail only when its next prompt
+arrives**: thatch prints the "unread mail" line from its `UserPromptSubmit`
+hook. An autonomous lane gets one prompt at launch and none after, so mail
+sent to it while it sits idle would wait until a human typed something.
+
+So **each dispatch tick types a fixed prompt into an idle lane that has new
+unread mail** (GitHub issue #224, `src/work/chat_wake.rs`):
+
+```
+You have unread thatch chat mail; read it and continue.
+```
+
+A lane is woken only when all of these hold:
+
+- it is running in the ticked repo and **idle at its prompt**: its latest
+  event is the `await` the session hooks write when the agent stops. **A
+  lane mid-turn is never typed into.**
+- thatch lists its session as an `mcp` (Claude Code) session with unread
+  mail. thatch's opencode plugin wakes opencode sessions itself, so tm
+  leaves those alone.
+- its newest unread message is not the one tm last woke it for. **One batch
+  of mail wakes a lane once**, even if the agent goes idle again without
+  reading it; a new message wakes it again.
+- its tmux window is known (recorded at launch).
+
+Each wake records a `chat_wake` event on the run, and `tm dispatch tick`
+prints `woke GH-9 (run 41) for unread chat mail`. Like the rest of the
+tick, waking needs autopilot on for the repo and happens at the tick's
+cadence. To turn it off:
+
+```toml
+[work]
+wake_on_chat_mail = false   # default true
+```
 
 ### Assigning a ticket from the board
 
