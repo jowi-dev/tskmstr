@@ -66,9 +66,10 @@ fn main() -> ExitCode {
     if let Command::Merge {
         keys,
         allow_red_base,
+        auto_merge_run,
     } = command
     {
-        return run_merge_cmd(keys, allow_red_base);
+        return run_merge_cmd(keys, allow_red_base, auto_merge_run);
     }
 
     // `tm review fix <KEY>` is special-cased the same way: it needs a
@@ -2495,12 +2496,24 @@ const MERGE_EXIT_CONFLICTS: u8 = 2;
 /// `2` conflicts or pending checks handed back — see [`MERGE_EXIT_CONFLICTS`]'s doc comment
 /// — `1` any other error) rather than `dispatch`'s uniform 0/1.
 ///
+/// With `auto_merge_run` (the automerge sweep's detached launch, GitHub
+/// issue #243), `keys` must be one key, and the outcome also ends that run
+/// row through [`tskmstr::work::auto_merge::finish`].
+///
 /// With two or more `keys`, runs [`tskmstr::work::merge::run_merge_batch`]
 /// instead and exits with
 /// [`tskmstr::work::merge::BatchMergeReport::exit_code`] (same three
 /// codes; a failure outranks a hand-back). A single key always takes the
 /// unchanged `run_merge` path.
-fn run_merge_cmd(keys: Vec<String>, allow_red_base: bool) -> ExitCode {
+fn run_merge_cmd(
+    keys: Vec<String>,
+    allow_red_base: bool,
+    auto_merge_run: Option<i64>,
+) -> ExitCode {
+    if auto_merge_run.is_some() && keys.len() != 1 {
+        eprintln!("--auto-merge-run takes exactly one ticket key");
+        return ExitCode::FAILURE;
+    }
     let paths = default_config_paths();
     let env_token = std::env::var("JIRA_API_TOKEN").ok();
     let keychain = MacosKeychain::new();
@@ -2580,7 +2593,14 @@ fn run_merge_cmd(keys: Vec<String>, allow_red_base: bool) -> ExitCode {
             }
         };
 
-        match tskmstr::work::merge::run_merge(&deps, &key, &mut stdout) {
+        let result = tskmstr::work::merge::run_merge(&deps, &key, &mut stdout);
+        if let Some(run_id) = auto_merge_run {
+            let reported = result.as_ref().copied().map_err(ToString::to_string);
+            if let Err(err) = tskmstr::work::auto_merge::finish(&run_store, run_id, &reported) {
+                eprintln!("could not record the automerge outcome on run {run_id}: {err}");
+            }
+        }
+        match result {
             Ok(tskmstr::work::merge::MergeFlowOutcome::Merged) => ExitCode::SUCCESS,
             Ok(tskmstr::work::merge::MergeFlowOutcome::ConflictsHandedBack) => {
                 eprintln!(

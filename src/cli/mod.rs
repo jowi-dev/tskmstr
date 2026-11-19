@@ -116,6 +116,13 @@ pub enum Command {
         /// check, e.g. to land the fix for a broken base.
         #[arg(long)]
         allow_red_base: bool,
+        /// The `auto-merge` run row this merge reports to: set by the
+        /// autopilot's automerge sweep (`[dispatch] auto_merge`, GitHub
+        /// issue #243), which spawns this command detached. The merge's
+        /// outcome ends that row, and a merge that does not land flags the
+        /// ticket's lane run for review. Takes exactly one key.
+        #[arg(long, hide = true, value_name = "RUN_ID")]
+        auto_merge_run: Option<i64>,
     },
     /// List tickets assigned to you that are ready to pick up, or check
     /// whether a specific ticket is ready.
@@ -2458,9 +2465,11 @@ mod tests {
             Some(Command::Merge {
                 keys,
                 allow_red_base,
+                auto_merge_run,
             }) => {
                 assert_eq!(keys, vec!["proj-20"]);
                 assert!(!allow_red_base);
+                assert_eq!(auto_merge_run, None);
             }
             other => panic!("expected Merge, got {other:?}"),
         }
@@ -2474,6 +2483,7 @@ mod tests {
             Some(Command::Merge {
                 keys,
                 allow_red_base,
+                ..
             }) => {
                 assert_eq!(keys, vec!["proj-20"]);
                 assert!(allow_red_base);
@@ -2489,6 +2499,23 @@ mod tests {
         match cli.command {
             Some(Command::Merge { keys, .. }) => {
                 assert_eq!(keys, vec!["proj-20", "PROJ-3", "proj-7"]);
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_merge_with_the_hidden_auto_merge_run_id() {
+        let cli = Cli::try_parse_from(["tm", "merge", "--auto-merge-run", "41", "GH-12"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Merge {
+                keys,
+                auto_merge_run,
+                ..
+            }) => {
+                assert_eq!(keys, vec!["GH-12"]);
+                assert_eq!(auto_merge_run, Some(41));
             }
             other => panic!("expected Merge, got {other:?}"),
         }
