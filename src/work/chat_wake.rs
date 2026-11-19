@@ -29,6 +29,8 @@
 //!   reading it.
 //! - **in a known pane**: it has a tmux session and a
 //!   [`crate::work::hibernate::LaunchRecord`] naming its window.
+//! - **unattended**: no tmux client is attached to its session, so no human
+//!   is mid-way through typing a prompt the wake would submit.
 //!
 //! Each wake records a [`WAKE_EVENT`] on the run, whose detail is the id of
 //! the newest unread message it was for. The event also replaces the
@@ -129,6 +131,12 @@ pub fn sweep(
         let Some(record) = launch_record(store, run.id)? else {
             continue;
         };
+        // A human attached to the lane may be typing into its prompt; the
+        // wake would append to their draft and submit it. Recording no
+        // wake lets the next tick try again once they detach.
+        if tmux.session_attached(&session).unwrap_or(true) {
+            continue;
+        }
         if tmux
             .send_keys(&session, &record.window, WAKE_PROMPT)
             .is_err()
@@ -396,6 +404,34 @@ mod tests {
             Some(&crate::work::thatch_chat::tail_args(Some((
                 "--to", "npc-1"
             ))))
+        );
+    }
+
+    #[test]
+    fn a_lane_a_human_is_attached_to_is_not_typed_into() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = lane(&store, SCOPE, "await");
+        let tmux = FakeTmuxOps::new().with_attached_session(SESSION);
+
+        let woken = sweep(
+            &store,
+            &tmux,
+            &thatch("mcp", &[7]),
+            &store.overview_runs().unwrap(),
+            SCOPE,
+        )
+        .unwrap();
+
+        assert!(woken.is_empty());
+        assert!(sent_keys(&tmux).is_empty());
+        assert!(
+            store
+                .events_for_run(id)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != WAKE_EVENT),
+            "no wake recorded, so the lane wakes once the human detaches"
         );
     }
 

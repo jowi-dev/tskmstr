@@ -1748,6 +1748,9 @@ A lane is woken only when all of these hold:
   of mail wakes a lane once**, even if the agent goes idle again without
   reading it; a new message wakes it again.
 - its tmux window is known (recorded at launch).
+- **nobody is attached to its tmux session.** You may be typing a reply
+  into the lane, and the wake would submit your draft with its prompt
+  added. tm wakes the lane on the first tick after you detach.
 
 Each wake records a `chat_wake` event on the run, and `tm dispatch tick`
 prints `woke GH-9 (run 41) for unread chat mail`. Like the rest of the
