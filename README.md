@@ -1497,6 +1497,37 @@ that already holds a slot, such as a build script calling cargo, also
 skips it. The slot pool is shared by every lane on the machine, whichever
 repo it belongs to.
 
+### Copying dependency directories into new worktrees (`[work] copy_dirs`)
+
+Every worktree normally downloads and builds its own dependencies, even
+though most lane runs never change them. List the directories a new
+worktree should start with instead:
+
+```toml
+[work]
+copy_dirs = ["deps", "assets/node_modules"]
+```
+
+When `tm work new` or `tm work run` creates a worktree, each listed
+directory is copied from the main checkout. On macOS the copy is an APFS
+copy-on-write clone (`cp -c`): it shares the original's disk blocks and
+uses new space only for files that are later rewritten, so an unchanged
+`deps` costs almost nothing. Elsewhere `cp` uses a reflink where the
+filesystem supports one, and a full copy where it doesn't.
+
+The copy belongs to the worktree. A dependency install there, such as
+`mix deps.get` after a lock file change, updates only the worktree's copy
+and never the main checkout's. A copy that no longer matches the lock file
+is just a head start for that install.
+
+- Paths are relative to the checkout root and may not be absolute or
+  contain `..`. A repo-local list replaces the global one.
+- A directory is skipped when the main checkout doesn't have it. A copy
+  that fails prints a warning and the worktree builds that directory itself.
+- Worktrees that already exist are not touched. With no `copy_dirs` set,
+  worktrees are created as before.
+- This saves disk, not memory.
+
 ### Interactive-session hooks (`tm work hooks install --user`)
 
 `tm work run`'s lane worktrees get tm's telemetry hooks deployed fresh on
