@@ -19,6 +19,7 @@ pub mod dispatch;
 pub mod drift;
 pub mod graph;
 pub mod init;
+pub mod merge_queue;
 pub mod pr;
 pub mod ready;
 pub mod review;
@@ -123,6 +124,16 @@ pub enum Command {
         /// ticket's lane run for review. Takes exactly one key.
         #[arg(long, hide = true, value_name = "RUN_ID")]
         auto_merge_run: Option<i64>,
+        /// Add the tickets to this repo's merge queue instead of merging
+        /// now (GitHub issue #247). The dispatch tick merges each one, in
+        /// queue order, once its PR is open with green checks, whether
+        /// autopilot is on or off.
+        #[arg(long, conflicts_with_all = ["unqueue", "auto_merge_run"])]
+        queue: bool,
+        /// Remove the tickets from this repo's merge queue. Exits 1 when a
+        /// ticket was not queued.
+        #[arg(long, conflicts_with = "auto_merge_run")]
+        unqueue: bool,
     },
     /// List tickets assigned to you that are ready to pick up, or check
     /// whether a specific ticket is ready.
@@ -2511,10 +2522,13 @@ mod tests {
                 keys,
                 allow_red_base,
                 auto_merge_run,
+                queue,
+                unqueue,
             }) => {
                 assert_eq!(keys, vec!["proj-20"]);
                 assert!(!allow_red_base);
                 assert_eq!(auto_merge_run, None);
+                assert!(!queue && !unqueue);
             }
             other => panic!("expected Merge, got {other:?}"),
         }
@@ -2564,6 +2578,25 @@ mod tests {
             }
             other => panic!("expected Merge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_merge_queue_and_unqueue() {
+        let cli =
+            Cli::try_parse_from(["tm", "merge", "--queue", "GH-1", "GH-2"]).expect("should parse");
+        match cli.command {
+            Some(Command::Merge { keys, queue, .. }) => {
+                assert!(queue);
+                assert_eq!(keys, vec!["GH-1", "GH-2"]);
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["tm", "merge", "--unqueue", "GH-1"]).expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Merge { unqueue: true, .. })
+        ));
+        assert!(Cli::try_parse_from(["tm", "merge", "--queue", "--unqueue", "GH-1"]).is_err());
     }
 
     #[test]

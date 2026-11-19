@@ -67,8 +67,13 @@ fn main() -> ExitCode {
         keys,
         allow_red_base,
         auto_merge_run,
+        queue,
+        unqueue,
     } = command
     {
+        if queue || unqueue {
+            return run_merge_queue_cmd(&keys, unqueue);
+        }
         return run_merge_cmd(keys, allow_red_base, auto_merge_run);
     }
 
@@ -2573,6 +2578,35 @@ fn run_ready_check(key: String) -> ExitCode {
 /// check` also use `2`, for their own distinct meanings unrelated to this
 /// one.
 const MERGE_EXIT_CONFLICTS: u8 = 2;
+
+/// `tm merge --queue KEY...` / `--unqueue KEY...` (GitHub issue #247):
+/// adds the keys to, or removes them from, the current repo's merge queue.
+/// Exits 1 outside a tskmstr repo, on a store failure, or when `--unqueue`
+/// named a ticket that was not queued.
+fn run_merge_queue_cmd(keys: &[String], unqueue: bool) -> ExitCode {
+    let Some(repo) = dispatch_current_repo() else {
+        eprintln!("not in a tskmstr repo: run `tm merge --queue` inside the repo");
+        return ExitCode::FAILURE;
+    };
+    let result = tskmstr::runs::RunStore::open(&resolve_run_db_path())
+        .map_err(tskmstr::cli::dispatch::DispatchCliError::from)
+        .and_then(|store| {
+            let mut stdout = std::io::stdout();
+            if unqueue {
+                tskmstr::cli::merge_queue::unqueue(&store, &repo.scope, keys, &mut stdout)
+            } else {
+                tskmstr::cli::merge_queue::queue(&store, &repo, keys, &mut stdout).map(|()| true)
+            }
+        });
+    match result {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 /// The keys of `epic`'s child tickets, for the automerge sweep's merge
 /// epic (GitHub issue #247).
