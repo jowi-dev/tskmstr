@@ -888,8 +888,8 @@ pub trait AgentRunner: Sync {
          find the archived memories of the branch that pull request merged. Then inspect the \
          conflicted files, resolve each conflict preserving the intent of both sides, `git add` \
          the resolved files, and run `git rebase --continue` until the rebase completes. \
-         Between commits, run only the tests scoped to the conflicted area; the full suite runs \
-         after the rebase. Do not push. Do not make unrelated changes. If a conflict cannot be \
+         Between commits, run only the tests scoped to the conflicted area, then run the full \
+         suite once after the rebase completes. Do not push. Do not make unrelated changes. If a conflict cannot be \
          resolved safely, run `git rebase --abort` and explain why."
     }
 
@@ -931,8 +931,8 @@ pub trait AgentRunner: Sync {
          order listed. Before resolving a ticket, learn why its base changed: for each pull \
          request listed for it, call thatch's memory_recall with includeArchived: true, \
          querying its number and title, to find the archived memories of the branch that pull \
-         request merged. Between commits, run only the tests scoped to the conflicted area; the \
-         full suite runs after the rebase. For each ticket, work in its checkout directory: \
+         request merged. Between commits, run only the tests scoped to the conflicted area, then \
+         run the full suite once after that rebase completes. For each ticket, work in its checkout directory: \
          inspect the conflicted files, resolve each conflict preserving the intent of both \
          sides, `git add` the resolved files, and run `git rebase --continue` until that \
          rebase completes, then move on to the next ticket. Do not push. Do not make unrelated changes. If a ticket's \
