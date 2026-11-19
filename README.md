@@ -1866,8 +1866,10 @@ off the coordinator reads its mail only when you prompt it. But with
 autopilot on, autopilot also launches the scope's ready tickets, this
 epic's children included. It does not tell the coordinator, which treats a
 lane it did not launch as unsupervised. **Pick one per epic**: leave
-autopilot off and prompt the coordinator yourself, or turn it on only when
-the epic's children are all launched or not yet ready.
+autopilot off and prompt the coordinator yourself, or turn it on only once
+every one of the epic's children is launched. A child that is not ready yet
+is not safe: autopilot launches it the moment it becomes ready, before the
+coordinator does.
 
 **tm is the coordinator's hands.** Its prompt lets it act on the epic only
 through `tm` commands: `tm ticket children`, `tm ready`, `tm work run
