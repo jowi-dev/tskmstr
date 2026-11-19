@@ -113,6 +113,11 @@ pub struct SweepCandidate {
     pub skip: Option<SkipReason>,
 }
 
+/// `clean`'s worktree guard as [`plan_sweep`] consumes it: given a
+/// ticket's runs (oldest first), the `(repo_root, worktree)` pair `clean`
+/// may remove, or `None`.
+pub type RemovableWorktree<'a> = dyn Fn(&[Run]) -> Option<(PathBuf, PathBuf)> + 'a;
+
 /// What [`plan_sweep`] reads.
 pub struct SweepPlanDeps<'a> {
     /// The run store: which tickets exist, and their worktrees and branches.
@@ -129,7 +134,7 @@ pub struct SweepPlanDeps<'a> {
     pub identity: &'a BackendIdentity,
     /// `clean`'s worktree guard: the `(repo_root, worktree)` it may remove
     /// for a ticket's runs (oldest first), or `None`.
-    pub removable: &'a dyn Fn(&[Run]) -> Option<(PathBuf, PathBuf)>,
+    pub removable: &'a RemovableWorktree<'a>,
 }
 
 /// Plan a sweep: one [`SweepCandidate`] per marked ticket, explicit keys
