@@ -279,7 +279,89 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE autopilot ADD COLUMN priority_epic TEXT;
     "#,
+    // GitHub issue #263: an empty scope used to match every scope, so a
+    // new GitHub-backend repo inherited other repos' `GH-N` runs and
+    // audits. Give every legacy row a real scope where runs.db itself can
+    // name one, and the `legacy:unscoped` sentinel (which matches nothing)
+    // where it can't; lookups no longer special-case `''`. A run whose
+    // `repo_root` matches exactly one scoped run's takes that scope. A
+    // Jira-style key whose prefix matches exactly one known
+    // `jira:<url>:<PREFIX>` scope takes it. Rows already scoped (including
+    // ones set to the sentinel by hand) are left alone. On a `ticket_rank`
+    // primary-key clash the already-scoped row wins and the legacy one
+    // falls to the sentinel; a legacy rank already in the sentinel wins
+    // over a second one, which is dropped.
+    r#"
+    CREATE TEMP TABLE legacy_known_scopes AS
+      SELECT scope FROM runs
+      UNION SELECT scope FROM ticket_audits
+      UNION SELECT scope FROM ticket_retros
+      UNION SELECT scope FROM ticket_rank
+      UNION SELECT scope FROM session_archives
+      UNION SELECT scope FROM autopilot;
+    DELETE FROM legacy_known_scopes WHERE scope IN ('', 'legacy:unscoped');
+    UPDATE runs SET scope = (
+        SELECT r.scope FROM runs r
+         WHERE r.repo_root = runs.repo_root AND r.scope NOT IN ('', 'legacy:unscoped'))
+     WHERE scope = '' AND repo_root IS NOT NULL
+       AND (SELECT COUNT(DISTINCT r.scope) FROM runs r
+             WHERE r.repo_root = runs.repo_root AND r.scope NOT IN ('', 'legacy:unscoped')) = 1;
+    UPDATE runs SET scope = (
+        SELECT k.scope FROM legacy_known_scopes k
+         WHERE k.scope LIKE 'jira:%'
+           AND substr(k.scope, -instr(runs.ticket, '-')) = ':' || substr(runs.ticket, 1, instr(runs.ticket, '-') - 1))
+     WHERE scope = '' AND instr(ticket, '-') > 1
+       AND (SELECT COUNT(*) FROM legacy_known_scopes k
+             WHERE k.scope LIKE 'jira:%'
+               AND substr(k.scope, -instr(runs.ticket, '-')) = ':' || substr(runs.ticket, 1, instr(runs.ticket, '-') - 1)) = 1;
+    UPDATE ticket_audits SET scope = (
+        SELECT k.scope FROM legacy_known_scopes k
+         WHERE k.scope LIKE 'jira:%'
+           AND substr(k.scope, -instr(ticket_audits.ticket_key, '-')) = ':' || substr(ticket_audits.ticket_key, 1, instr(ticket_audits.ticket_key, '-') - 1))
+     WHERE scope = '' AND instr(ticket_key, '-') > 1
+       AND (SELECT COUNT(*) FROM legacy_known_scopes k
+             WHERE k.scope LIKE 'jira:%'
+               AND substr(k.scope, -instr(ticket_audits.ticket_key, '-')) = ':' || substr(ticket_audits.ticket_key, 1, instr(ticket_audits.ticket_key, '-') - 1)) = 1;
+    UPDATE ticket_retros SET scope = (
+        SELECT k.scope FROM legacy_known_scopes k
+         WHERE k.scope LIKE 'jira:%'
+           AND substr(k.scope, -instr(ticket_retros.ticket_key, '-')) = ':' || substr(ticket_retros.ticket_key, 1, instr(ticket_retros.ticket_key, '-') - 1))
+     WHERE scope = '' AND instr(ticket_key, '-') > 1
+       AND (SELECT COUNT(*) FROM legacy_known_scopes k
+             WHERE k.scope LIKE 'jira:%'
+               AND substr(k.scope, -instr(ticket_retros.ticket_key, '-')) = ':' || substr(ticket_retros.ticket_key, 1, instr(ticket_retros.ticket_key, '-') - 1)) = 1;
+    UPDATE OR IGNORE ticket_rank SET scope = (
+        SELECT k.scope FROM legacy_known_scopes k
+         WHERE k.scope LIKE 'jira:%'
+           AND substr(k.scope, -instr(ticket_rank.ticket_key, '-')) = ':' || substr(ticket_rank.ticket_key, 1, instr(ticket_rank.ticket_key, '-') - 1))
+     WHERE scope = '' AND instr(ticket_key, '-') > 1
+       AND (SELECT COUNT(*) FROM legacy_known_scopes k
+             WHERE k.scope LIKE 'jira:%'
+               AND substr(k.scope, -instr(ticket_rank.ticket_key, '-')) = ':' || substr(ticket_rank.ticket_key, 1, instr(ticket_rank.ticket_key, '-') - 1)) = 1;
+    UPDATE session_archives SET scope = (
+        SELECT k.scope FROM legacy_known_scopes k
+         WHERE k.scope LIKE 'jira:%'
+           AND substr(k.scope, -instr(session_archives.ticket, '-')) = ':' || substr(session_archives.ticket, 1, instr(session_archives.ticket, '-') - 1))
+     WHERE scope = '' AND instr(ticket, '-') > 1
+       AND (SELECT COUNT(*) FROM legacy_known_scopes k
+             WHERE k.scope LIKE 'jira:%'
+               AND substr(k.scope, -instr(session_archives.ticket, '-')) = ':' || substr(session_archives.ticket, 1, instr(session_archives.ticket, '-') - 1)) = 1;
+    UPDATE runs SET scope = 'legacy:unscoped' WHERE scope = '';
+    UPDATE ticket_audits SET scope = 'legacy:unscoped' WHERE scope = '';
+    UPDATE ticket_retros SET scope = 'legacy:unscoped' WHERE scope = '';
+    UPDATE OR IGNORE ticket_rank SET scope = 'legacy:unscoped' WHERE scope = '';
+    DELETE FROM ticket_rank WHERE scope = '';
+    UPDATE session_archives SET scope = 'legacy:unscoped' WHERE scope = '';
+    DROP TABLE legacy_known_scopes;
+    "#,
 ];
+
+/// The scope of a row recorded before scoping existed (GitHub issue #10)
+/// whose real scope the migration to version 21 could not work out (GitHub
+/// issue #263). No [`crate::config::BackendIdentity::scope`] produces it, so
+/// such rows match no scope's lookups: their history is kept but hidden,
+/// rather than shared by every repo that reuses the ticket key.
+pub const LEGACY_UNSCOPED: &str = "legacy:unscoped";
 
 /// How many recent finished lane runs [`RunStore::lane_peak_estimate`] looks
 /// back over. Small enough that the estimate follows a repo whose builds got
@@ -4192,7 +4274,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_20() {
+    fn open_migrates_a_fresh_db_to_user_version_21() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -4200,7 +4282,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
@@ -4226,40 +4308,218 @@ mod tests {
     }
 
     #[test]
-    fn migration_to_9_preserves_pre_scope_rows_as_legacy_unscoped() {
+    fn pre_scope_rows_with_no_resolvable_scope_match_no_scope() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("runs.db");
         seed_version_8_db(&db_path);
 
         let store = RunStore::open(&db_path).unwrap();
 
-        // Legacy rows survive with an empty scope, and stay visible to a
-        // scoped lookup from any repo — the pre-#10 data all predates the
-        // second GitHub-backend repo, so it cannot actually be ambiguous.
-        let run = store
-            .latest_run_for_ticket(Some("github:jowi-dev/tskmstr"), "GH-3")
-            .unwrap()
-            .expect("legacy run should stay visible to a scoped lookup");
-        assert_eq!(run.scope, "");
-        assert_eq!(
+        // A pre-#10 `GH-3` row could belong to any GitHub-backend repo, so
+        // it lands in the sentinel scope and no repo's lookup sees it
+        // (GitHub issue #263).
+        let scope = Some("github:jowi-dev/tskmstr");
+        assert!(
             store
-                .latest_audit_for_ticket(Some("github:jowi-dev/tskmstr"), "GH-3")
+                .latest_run_for_ticket(scope, "GH-3")
                 .unwrap()
-                .map(|audit| audit.verdict),
-            Some("ready".to_string())
+                .is_none()
         );
-        assert_eq!(
+        assert!(
             store
-                .latest_retro_for_ticket(Some("github:jowi-dev/tskmstr"), "GH-3")
+                .latest_audit_for_ticket(scope, "GH-3")
                 .unwrap()
-                .map(|retro| retro.verdict),
-            Some(RetroVerdict::Clean)
+                .is_none()
+        );
+        assert!(
+            store
+                .latest_retro_for_ticket(scope, "GH-3")
+                .unwrap()
+                .is_none()
         );
         assert_eq!(
             store
                 .ticket_rank("github:jowi-dev/tskmstr", "GH-3")
                 .unwrap(),
-            Some(500.0)
+            None
+        );
+        let run = store
+            .latest_run_for_ticket(None, "GH-3")
+            .unwrap()
+            .expect("the legacy run is kept, just unscoped");
+        assert_eq!(run.scope, LEGACY_UNSCOPED);
+    }
+
+    /// Builds a database at schema version 20 (the last version that left
+    /// empty-scope rows in place) and runs `seed` against it, so tests can
+    /// assert what [`RunStore::open`]'s migration to 21 does to them.
+    fn seed_version_20_db(db_path: &Path, seed: &str) {
+        let conn = Connection::open(db_path).unwrap();
+        for migration in &MIGRATIONS[..20] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 20").unwrap();
+        conn.execute_batch(seed).unwrap();
+    }
+
+    /// Every `(table, ticket, scope)` row in the ticket-keyed tables,
+    /// sorted, for asserting a migration's outcome in one comparison.
+    fn scoped_rows(store: &RunStore) -> Vec<(String, String, String)> {
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT 'runs', ticket, scope FROM runs
+                 UNION ALL SELECT 'ticket_audits', ticket_key, scope FROM ticket_audits
+                 UNION ALL SELECT 'ticket_retros', ticket_key, scope FROM ticket_retros
+                 UNION ALL SELECT 'ticket_rank', ticket_key, scope FROM ticket_rank
+                 UNION ALL SELECT 'session_archives', ticket, scope FROM session_archives
+                 ORDER BY 1, 2, 3",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn row(table: &str, ticket: &str, scope: &str) -> (String, String, String) {
+        (table.to_string(), ticket.to_string(), scope.to_string())
+    }
+
+    const AX: &str = "jira:https://x.atlassian.net:AX";
+
+    #[test]
+    fn migration_to_21_scopes_legacy_jira_rows_by_their_key_prefix() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("runs.db");
+        seed_version_20_db(
+            &db_path,
+            &format!(
+                "INSERT INTO runs (ticket, lane, status, worktree, started_at, scope)
+                 VALUES ('AX-1', 'ax', 'done', '/wt/ax-1', '2026-08-01T00:00:00.000Z', '{AX}'),
+                        ('AX-2', 'ax', 'done', '/wt/ax-2', '2026-08-01T00:00:00.000Z', '');
+                 INSERT INTO ticket_audits (ticket_key, verdict, audited_at, scope)
+                 VALUES ('AX-2', 'ready', '2026-08-01T00:00:00.000Z', '');
+                 INSERT INTO ticket_retros (ticket_key, verdict, recorded_at, scope)
+                 VALUES ('AX-2', 'clean', '2026-08-01T00:00:00.000Z', '');
+                 INSERT INTO ticket_rank (scope, ticket_key, rank) VALUES ('', 'AX-2', 1.0);
+                 INSERT INTO session_archives (scope, ticket, session, window, path, captured_at)
+                 VALUES ('', 'AX-2', 's', 'w', '/p', '2026-08-01T00:00:00.000Z');"
+            ),
+        );
+
+        let store = RunStore::open(&db_path).unwrap();
+
+        assert_eq!(
+            scoped_rows(&store),
+            vec![
+                row("runs", "AX-1", AX),
+                row("runs", "AX-2", AX),
+                row("session_archives", "AX-2", AX),
+                row("ticket_audits", "AX-2", AX),
+                row("ticket_rank", "AX-2", AX),
+                row("ticket_retros", "AX-2", AX),
+            ]
+        );
+    }
+
+    #[test]
+    fn migration_to_21_scopes_a_legacy_run_by_its_repo_root() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("runs.db");
+        seed_version_20_db(
+            &db_path,
+            "INSERT INTO runs (ticket, lane, status, worktree, started_at, scope, repo_root)
+             VALUES ('GH-1', 'a', 'done', '/wt/1', '2026-08-01T00:00:00.000Z', 'github:o/a', '/src/a'),
+                    ('GH-3', 'a', 'done', '/wt/3', '2026-08-01T00:00:00.000Z', '', '/src/a'),
+                    ('GH-4', 'b', 'done', '/wt/4', '2026-08-01T00:00:00.000Z', '', '/src/b');",
+        );
+
+        let store = RunStore::open(&db_path).unwrap();
+
+        assert_eq!(
+            scoped_rows(&store),
+            vec![
+                row("runs", "GH-1", "github:o/a"),
+                row("runs", "GH-3", "github:o/a"),
+                row("runs", "GH-4", LEGACY_UNSCOPED),
+            ]
+        );
+    }
+
+    #[test]
+    fn migration_to_21_leaves_an_ambiguous_jira_prefix_unscoped() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("runs.db");
+        seed_version_20_db(
+            &db_path,
+            "INSERT INTO ticket_audits (ticket_key, verdict, audited_at, scope)
+             VALUES ('AX-1', 'ready', '2026-08-01T00:00:00.000Z', 'jira:https://a:AX'),
+                    ('AX-2', 'ready', '2026-08-01T00:00:00.000Z', 'jira:https://b:AX'),
+                    ('AX-3', 'ready', '2026-08-01T00:00:00.000Z', '');",
+        );
+
+        let store = RunStore::open(&db_path).unwrap();
+
+        assert_eq!(
+            scoped_rows(&store),
+            vec![
+                row("ticket_audits", "AX-1", "jira:https://a:AX"),
+                row("ticket_audits", "AX-2", "jira:https://b:AX"),
+                row("ticket_audits", "AX-3", LEGACY_UNSCOPED),
+            ]
+        );
+    }
+
+    #[test]
+    fn migration_to_21_leaves_already_scoped_rows_alone() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("runs.db");
+        seed_version_20_db(
+            &db_path,
+            &format!(
+                "INSERT INTO runs (ticket, lane, status, worktree, started_at, scope)
+                 VALUES ('GH-3', 'a', 'done', '/wt/3', '2026-08-01T00:00:00.000Z', 'legacy:unscoped'),
+                        ('AX-9', 'a', 'done', '/wt/9', '2026-08-01T00:00:00.000Z', 'legacy:unscoped'),
+                        ('AX-1', 'a', 'done', '/wt/1', '2026-08-01T00:00:00.000Z', '{AX}');"
+            ),
+        );
+
+        let store = RunStore::open(&db_path).unwrap();
+
+        assert_eq!(
+            scoped_rows(&store),
+            vec![
+                row("runs", "AX-1", AX),
+                row("runs", "AX-9", LEGACY_UNSCOPED),
+                row("runs", "GH-3", LEGACY_UNSCOPED),
+            ]
+        );
+    }
+
+    #[test]
+    fn migration_to_21_keeps_the_scoped_rank_when_a_legacy_one_clashes() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("runs.db");
+        seed_version_20_db(
+            &db_path,
+            &format!(
+                "INSERT INTO ticket_rank (scope, ticket_key, rank)
+                 VALUES ('{AX}', 'AX-1', 1.0), ('', 'AX-1', 2.0),
+                        ('legacy:unscoped', 'GH-3', 3.0), ('', 'GH-3', 4.0);"
+            ),
+        );
+
+        let store = RunStore::open(&db_path).unwrap();
+
+        assert_eq!(store.ticket_rank(AX, "AX-1").unwrap(), Some(1.0));
+        assert_eq!(
+            scoped_rows(&store),
+            vec![
+                row("ticket_rank", "AX-1", AX),
+                row("ticket_rank", "AX-1", LEGACY_UNSCOPED),
+                row("ticket_rank", "GH-3", LEGACY_UNSCOPED),
+            ]
         );
     }
 
@@ -4354,31 +4614,29 @@ mod tests {
     }
 
     #[test]
-    fn ticket_rank_prefers_scoped_row_over_legacy() {
+    fn ticket_rank_ignores_a_legacy_rank() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("runs.db");
-        seed_version_8_db(&db_path);
+        seed_version_8_db(&db_path); // legacy GH-3 @ 500.0
         let store = RunStore::open(&db_path).unwrap();
 
+        assert_eq!(
+            store.ticket_rank("github:jowi-dev/other", "GH-3").unwrap(),
+            None
+        );
         store
             .set_ticket_rank("github:jowi-dev/tskmstr", "GH-3", 250.0)
             .unwrap();
-
         assert_eq!(
             store
                 .ticket_rank("github:jowi-dev/tskmstr", "GH-3")
                 .unwrap(),
             Some(250.0)
         );
-        // The other repo still sees the legacy rank, not this repo's.
-        assert_eq!(
-            store.ticket_rank("github:jowi-dev/other", "GH-3").unwrap(),
-            Some(500.0)
-        );
     }
 
     #[test]
-    fn all_ticket_ranks_merges_legacy_rows_unless_shadowed() {
+    fn all_ticket_ranks_lists_only_the_scope_s_own_rows() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("runs.db");
         seed_version_8_db(&db_path); // legacy GH-3 @ 500.0
@@ -4393,20 +4651,11 @@ mod tests {
 
         assert_eq!(
             store.all_ticket_ranks("github:jowi-dev/tskmstr").unwrap(),
-            vec![("GH-1".to_string(), 100.0), ("GH-3".to_string(), 500.0)]
-        );
-
-        // A scoped rank for GH-3 shadows the legacy row for that scope only.
-        store
-            .set_ticket_rank("github:jowi-dev/tskmstr", "GH-3", 50.0)
-            .unwrap();
-        assert_eq!(
-            store.all_ticket_ranks("github:jowi-dev/tskmstr").unwrap(),
-            vec![("GH-3".to_string(), 50.0), ("GH-1".to_string(), 100.0)]
+            vec![("GH-1".to_string(), 100.0)]
         );
         assert_eq!(
             store.all_ticket_ranks("github:jowi-dev/other").unwrap(),
-            vec![("GH-2".to_string(), 200.0), ("GH-3".to_string(), 500.0)]
+            vec![("GH-2".to_string(), 200.0)]
         );
     }
 
