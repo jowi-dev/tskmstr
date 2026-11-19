@@ -675,12 +675,43 @@ pub enum WorkCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Start or stop an epic coordinator: one interactive agent session per
+    /// epic that launches the epic's lanes through `tm ready`/`tm work run`,
+    /// supervises them over thatch chat, and merges verified PRs with `tm
+    /// merge` (GitHub issue #209). It runs in a `coordinator` window of the
+    /// epic's `tm-<scope>-<EPIC>` session. See
+    /// `docs/plans/gh-209-epic-coordinator.md`.
+    Coordinator {
+        /// Which coordinator action to perform.
+        #[command(subcommand)]
+        cmd: CoordinatorCmd,
+    },
     /// Install/maintain tm's hook scripts outside a lane worktree (see
     /// `tskmstr::agent::claude::hooks_install`).
     Hooks {
         /// Which hooks action to perform.
         #[command(subcommand)]
         cmd: HooksCmd,
+    },
+}
+
+/// `tm work coordinator` subcommands (GitHub issue #209).
+#[derive(Subcommand, Debug)]
+pub enum CoordinatorCmd {
+    /// Start a coordinator for an epic, in the current repo's checkout.
+    ///
+    /// Refuses a ticket that is not an epic, and a second coordinator while
+    /// one is live. The session's opening prompt lists the epic's tickets;
+    /// `[work.coordinator]` overrides the prompt and model.
+    Start {
+        /// Epic key, e.g. `GH-176` (case-insensitive).
+        epic: String,
+    },
+    /// Stop an epic's coordinator: kill its window and mark its run
+    /// interrupted. Lanes it launched keep running.
+    Stop {
+        /// Epic key, e.g. `GH-176` (case-insensitive).
+        epic: String,
     },
 }
 
@@ -3497,6 +3528,36 @@ mod tests {
                 cmd: WorkCmd::Restore
             })
         ));
+    }
+
+    #[test]
+    fn parses_work_coordinator_start() {
+        let cli = Cli::try_parse_from(["tm", "work", "coordinator", "start", "GH-176"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd:
+                    WorkCmd::Coordinator {
+                        cmd: CoordinatorCmd::Start { epic },
+                    },
+            }) => assert_eq!(epic, "GH-176"),
+            other => panic!("expected Work Coordinator Start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_coordinator_stop() {
+        let cli = Cli::try_parse_from(["tm", "work", "coordinator", "stop", "GH-176"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd:
+                    WorkCmd::Coordinator {
+                        cmd: CoordinatorCmd::Stop { epic },
+                    },
+            }) => assert_eq!(epic, "GH-176"),
+            other => panic!("expected Work Coordinator Stop, got {other:?}"),
+        }
     }
 
     #[test]
