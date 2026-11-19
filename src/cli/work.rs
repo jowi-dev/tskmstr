@@ -127,6 +127,17 @@ pub enum WorkCliError {
     #[error(transparent)]
     RunStore(#[from] RunStoreError),
 
+    /// The ready gate refused an unattended launch (GitHub issue #254):
+    /// `tm ready <KEY>` would not launch the ticket. `reason` is the
+    /// gate's own message (blocked, needs audit, a lookup failure).
+    #[error("refusing to launch {key} unattended: {reason}")]
+    NotReady { key: String, reason: String },
+
+    /// An unattended launch carried no ticket key (GitHub issue #254), so
+    /// there is nothing to check readiness for.
+    #[error("an unattended lane run needs a ticket key to check readiness")]
+    UnattendedWithoutTicket,
+
     /// Memory-budget admission refused the lane (GitHub issue #66): the
     /// estimate would exceed `[work] memory_budget_gb`, or the kernel
     /// reports memory pressure. Checked before anything is provisioned.
@@ -439,7 +450,17 @@ pub struct RunDeps<'a> {
     /// for a manual run, [`crate::work::admission::UsageGateMode::Enforce`] for
     /// `--unattended` (the autopilot dispatcher, GitHub issue #115).
     pub usage_gate: crate::work::admission::UsageGateMode,
+    /// The `tm ready <KEY>` decision for `--unattended` launches (GitHub
+    /// issue #254): `Ok(())` when the ticket is ready or stackable,
+    /// otherwise why not. `None` (manual launches) skips the check.
+    /// [`run`] calls it first, before admission and provisioning, so a
+    /// refusal leaves no worktree, branch, run row or window behind.
+    /// Production builds it from [`crate::cli::ready::check`].
+    pub ready_gate: Option<&'a ReadyGate<'a>>,
 }
+
+/// A `tm ready <KEY>` decision, see [`RunDeps::ready_gate`].
+pub type ReadyGate<'a> = dyn Fn(&str) -> Result<(), String> + 'a;
 
 impl From<crate::work::admission::AdmissionError> for WorkCliError {
     fn from(err: crate::work::admission::AdmissionError) -> Self {
@@ -580,6 +601,11 @@ fn admit_run<'d>(
 /// hand-off path has an equivalent "did it fail" signal at hand-off time —
 /// `tm runs watch`/`tm runs show` are how that outcome is observed later —
 /// so both always return `Ok(true)`.
+///
+/// When `deps.ready_gate` is set (`--unattended`), the gate runs before
+/// anything else and a ticket it refuses fails with
+/// [`WorkCliError::NotReady`] with nothing admitted or provisioned (GitHub
+/// issue #254).
 pub fn run(
     ctx: &WorkContext<'_>,
     deps: &RunDeps<'_>,
@@ -593,6 +619,13 @@ pub fn run(
         state_dir: ctx.home.join(".local/state/tskmstr/work"),
         hooks_deploy_dir: ctx.home.join(".local/share/tskmstr/hooks"),
     };
+    if let Some(gate) = deps.ready_gate {
+        let key = request
+            .ticket
+            .clone()
+            .ok_or(WorkCliError::UnattendedWithoutTicket)?;
+        gate(&key).map_err(|reason| WorkCliError::NotReady { key, reason })?;
+    }
     let (runner, fallback_runners, admitted) = admit_run(ctx, deps, lane, out)?;
     let run_deps = crate::work::run::RunLaneDeps {
         git: ctx.git,
@@ -3266,6 +3299,46 @@ mod tests {
         String,
         Vec<String>,
     ) {
+        let launched = run_with_ready_gate(
+            memory,
+            pressure,
+            seed,
+            usage_gate,
+            fallback_runners,
+            usage,
+            None,
+            Some("PROJ-1"),
+        );
+        (
+            launched.result,
+            launched.runs,
+            launched.out,
+            launched.programs,
+        )
+    }
+
+    /// What [`run_with_ready_gate`] observed.
+    struct Launched {
+        result: Result<bool, WorkCliError>,
+        runs: Vec<crate::runs::RunSummary>,
+        out: String,
+        programs: Vec<String>,
+        provisioned: usize,
+    }
+
+    /// [`run_with_routing`] with a `ready_gate` and the request's `ticket`,
+    /// also counting the worktrees provisioned.
+    #[allow(clippy::too_many_arguments)]
+    fn run_with_ready_gate(
+        memory: crate::config::MemoryConfig,
+        pressure: &dyn Fn() -> crate::runs::footprint::MemoryPressure,
+        seed: &dyn Fn(&RunStore),
+        usage_gate: crate::work::admission::UsageGateMode,
+        fallback_runners: Vec<&dyn AgentRunner>,
+        usage: &crate::config::UsageConfig,
+        ready_gate: Option<&ReadyGate<'_>>,
+        ticket: Option<&str>,
+    ) -> Launched {
         let (tmp, home, repo_root, prompt_path) = run_setup();
         // A routed run reads the routed runner's own default lane prompt.
         let opencode_prompt = home.join(".config/opencode/prompts/mylane.md");
@@ -3322,9 +3395,10 @@ mod tests {
             usage,
             usage_prober: &NoUsageProbe,
             usage_gate,
+            ready_gate,
         };
         let request = RunLaneRequest {
-            ticket: Some("PROJ-1".to_string()),
+            ticket: ticket.map(str::to_string),
             ..Default::default()
         };
         let mut out = Vec::new();
@@ -3344,12 +3418,13 @@ mod tests {
             .iter()
             .map(|spawn| spawn.program.clone())
             .collect();
-        (
+        Launched {
             result,
-            run_store.list_runs().unwrap(),
-            String::from_utf8(out).unwrap(),
+            runs: run_store.list_runs().unwrap(),
+            out: String::from_utf8(out).unwrap(),
             programs,
-        )
+            provisioned: git.provision_worktree_calls().len(),
+        }
     }
 
     fn one_gig_budget() -> crate::config::MemoryConfig {
@@ -3434,6 +3509,78 @@ mod tests {
             "{err:?}"
         );
         assert!(runs.is_empty(), "no run row may be left behind: {runs:?}");
+    }
+
+    fn run_gated(gate: &dyn Fn(&str) -> Result<(), String>, ticket: Option<&str>) -> Launched {
+        run_with_ready_gate(
+            crate::config::MemoryConfig::default(),
+            &normal_pressure,
+            &|_| {},
+            crate::work::admission::UsageGateMode::Enforce,
+            Vec::new(),
+            &crate::config::UsageConfig::default(),
+            Some(gate),
+            ticket,
+        )
+    }
+
+    #[test]
+    fn a_refusing_ready_gate_stops_the_launch_before_anything_is_created() {
+        let launched = run_gated(
+            &|_| Err("PROJ-1 needs audit (not audited)".to_string()),
+            Some("PROJ-1"),
+        );
+
+        let err = launched.result.expect_err("a not-ready ticket is refused");
+        assert!(
+            matches!(
+                &err,
+                WorkCliError::NotReady { key, reason }
+                    if key == "PROJ-1" && reason == "PROJ-1 needs audit (not audited)"
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("PROJ-1"), "{err}");
+        assert!(err.to_string().contains("needs audit"), "{err}");
+        assert!(launched.runs.is_empty(), "{:?}", launched.runs);
+        assert!(launched.programs.is_empty(), "{:?}", launched.programs);
+        assert_eq!(launched.provisioned, 0);
+    }
+
+    #[test]
+    fn a_passing_ready_gate_launches_as_usual() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let launched = run_gated(
+            &|key| {
+                seen.borrow_mut().push(key.to_string());
+                Ok(())
+            },
+            Some("PROJ-1"),
+        );
+
+        assert!(launched.result.is_ok(), "{:?}", launched.result);
+        assert_eq!(launched.runs.len(), 1);
+        assert_eq!(*seen.borrow(), vec!["PROJ-1".to_string()]);
+    }
+
+    #[test]
+    fn a_ready_gate_without_a_ticket_refuses_and_never_runs() {
+        let called = std::cell::Cell::new(false);
+        let launched = run_gated(
+            &|_| {
+                called.set(true);
+                Ok(())
+            },
+            None,
+        );
+
+        assert!(
+            matches!(launched.result, Err(WorkCliError::UnattendedWithoutTicket)),
+            "{:?}",
+            launched.result
+        );
+        assert!(!called.get());
+        assert!(launched.runs.is_empty());
     }
 
     fn claude_over_ceiling(store: &RunStore) {
@@ -3572,6 +3719,7 @@ mod tests {
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
             usage_gate: crate::work::admission::UsageGateMode::Warn,
+            ready_gate: None,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -3708,6 +3856,7 @@ mod tests {
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
             usage_gate: crate::work::admission::UsageGateMode::Enforce,
+            ready_gate: None,
             inherit_epic_blockers: true,
         };
         let request = RunLaneRequest {
@@ -3878,6 +4027,7 @@ mod tests {
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
             usage_gate: crate::work::admission::UsageGateMode::Warn,
+            ready_gate: None,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -3956,6 +4106,7 @@ mod tests {
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
             usage_gate: crate::work::admission::UsageGateMode::Warn,
+            ready_gate: None,
         };
         let mut out = Vec::new();
 
@@ -4125,6 +4276,7 @@ mod tests {
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
             usage_gate: crate::work::admission::UsageGateMode::Warn,
+            ready_gate: None,
         };
         let mut out = Vec::new();
 
@@ -4209,6 +4361,7 @@ mod tests {
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
             usage_gate: crate::work::admission::UsageGateMode::Warn,
+            ready_gate: None,
         };
         let mut out = Vec::new();
 
@@ -4279,6 +4432,7 @@ mod tests {
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
             usage_gate: crate::work::admission::UsageGateMode::Warn,
+            ready_gate: None,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -4402,6 +4556,7 @@ mod tests {
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
             usage_gate: crate::work::admission::UsageGateMode::Warn,
+            ready_gate: None,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -4473,6 +4628,7 @@ mod tests {
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
             usage_gate: crate::work::admission::UsageGateMode::Warn,
+            ready_gate: None,
         };
         let mut out = Vec::new();
 
