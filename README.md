@@ -300,6 +300,7 @@ tm auth status
 | `tm work clean <KEY>` | Finish with `<KEY>`: archive each window's scrollback, then one `kill-session` on `tm-<scope>-<key>`, plus one worktree removal. Only a path under the configured worktree root is ever removed, so an audit run's `[work.audit].dir` is never touched |
 | `tm work start [<dir>]` | Attach to (or create) the tmux session for `<dir>`, defaulting to `cwd` |
 | `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<scope>-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
+| `tm work deps unshare` | Replace this worktree's `[work] shared_deps` links with private copies before changing dependencies (see below) |
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
 | `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch. The agent triages the comments with `thatch-review-response`, fixes the ones that hold up, declines the rest with a one-line reason, and posts nothing to GitHub; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
 | `tm review auto <KEY> [--foreground]` | Run thatch auto-review rounds over `<KEY>`'s lane-run branch: each round is an interactive `auto-review` run in a `review` window of the ticket's `tm-<scope>-<key>` session (`review-2` for round 2). Its confirmed findings are appended to the worktree's vdiff comment store, and findings at or above `[work.auto_review].fix_threshold` start an interactive `tm review fix` pass in a `fix` / `fix-N` window. The loop waits for each step's signal file for up to `round_timeout_mins` and leaves the windows open. Stops on a clean round, or flags the round for review at `max_review_rounds` or when a step never signals. Detaches by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`; see "Auto-review" below |
@@ -1496,6 +1497,51 @@ blocks them. That covers `fmt`, `metadata`, `tree`, `clean`, `add`,
 that already holds a slot, such as a build script calling cargo, also
 skips it. The slot pool is shared by every lane on the machine, whichever
 repo it belongs to.
+
+### Sharing dependency directories (`[work] shared_deps`)
+
+Every worktree normally downloads its own copy of its dependencies, even
+though most lane runs never change them. List the dependency directories
+worth sharing, each with the lock file that pins it:
+
+```toml
+[work]
+shared_deps = [
+  { path = "deps", lock_file = "mix.lock" },
+  { path = "assets/node_modules", lock_file = "assets/package-lock.json" },
+]
+```
+
+- **A new worktree links instead of copying.** When `tm work new` or
+  `tm work run` provisions a worktree, each listed `path` becomes a
+  symlink to the main checkout's directory, as long as the main checkout
+  has that directory and both lock files are byte-for-byte identical.
+  tm also adds `/<path>` to the repository's `.git/info/exclude`, because
+  an ignore rule like `/deps/` matches only real directories and the link
+  would otherwise make the worktree look dirty.
+- **A shared directory must be unshared before it changes.** A dependency
+  install run through the link would rewrite the main checkout's copy
+  under every other worktree. `tm work deps unshare`, run anywhere inside
+  the worktree, replaces each link with a private copy. While a path is
+  linked, `tm work run` adds a note to the lane's prompt telling the agent
+  to run it before changing dependencies.
+- **A changed lock file is caught at lane start.** After cutting the run's
+  branch, `tm work run` unshares any linked path whose lock file no longer
+  matches the main checkout's, before the agent starts.
+- **Private copies are cheap on macOS.** The copy is an APFS
+  copy-on-write clone (`cp -c`), which uses no extra disk until a file is
+  rewritten. Elsewhere `cp` uses a reflink where the filesystem supports
+  one, and a full copy where it doesn't.
+- **Removing a worktree is safe.** `tm work remove` deletes the link, never
+  the main checkout's directory.
+
+`path` and `lock_file` are relative to the checkout root and may not be
+absolute or contain `..`. A repo-local list replaces the global one. With
+no `shared_deps` set, worktrees are provisioned as before, and worktrees
+that already exist are not converted.
+
+This saves disk, not memory. Build output such as `_build` or `target` is
+not a good fit, since it depends on the branch's code.
 
 ### Interactive-session hooks (`tm work hooks install --user`)
 
